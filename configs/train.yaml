@@ -1,0 +1,58 @@
+task_prefix: surpass
+logging_dir: logs
+seed: 42
+deterministic: false
+epochs: 10
+checkpoint_interval: 1
+ckpt_dir: null
+load_model_only: false
+
+data:
+  root_dir: pdb_metadata
+  cluster_tsv_path: tests/verified_heterodimers.clustered.tsv
+  batch_size: 1
+  num_workers: 0
+  pin_memory: true
+  center_coordinates: true
+  random_rotation: true
+  test_fraction: 0.2
+  distance_bin_start: 2.0
+  distance_bin_width: 0.5
+  distance_bin_count: 36
+  contact_threshold: 8.0
+
+model:
+  n_layers: 3
+  dim_token: 256
+  dim_pair: 128
+  n_heads: 8
+  residual_mha: true
+  residual_transition: true
+  use_attn_pair_bias: true
+  use_qkln: true
+  dropout: 0.0
+  expansion_factor: 2
+  plm_in_dim: 1280
+  plm_out_dim: 256
+  r_max: 32
+  xt_pair_dist_min: 1
+  xt_pair_dist_max: 33
+  xt_pair_dist_dim: 64
+  idx_emb_dim: 128
+  num_classes: 36
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.999
+  use_adamw: true
+  lr_scheduler: constant
+  warmup_steps: 1000
+  decay_every_n_steps: 50000
+  decay_factor: 0.95
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+
+performance:
+  empty_cache_each_step: false

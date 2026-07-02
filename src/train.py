@@ -1,20 +1,20 @@
+import datetime
 import os
 import warnings
-import datetime
+from typing import Any
 
-import pandas as pd
+import hydra
 import torch
 import torch.distributed as dist
+from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-import hydra
-from omegaconf import DictConfig, OmegaConf
 
-from src.data.dataset import PepoDataset, collate_fn, get_dataloader
-from src.model.loss import MaskedBinnedBCELoss, CrossEntropyLoss
+from src.data.dataset import PepoTrainDataset, collate_fn, get_dataloader
+from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
-from src.model.optimizer import get_optimizer, get_lr_scheduler
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 
 try:
@@ -32,96 +32,249 @@ def log_info(message: str):
 
 def _cfg_get(cfg: DictConfig, *paths: str, default=None):
     for path in paths:
-        cur = cfg
-        found = True
-        for key in path.split("."):
-            if hasattr(cur, key):
-                cur = getattr(cur, key)
-            elif isinstance(cur, dict) and key in cur:
-                cur = cur[key]
-            else:
-                found = False
-                break
-        if found:
-            return cur
+        selected = OmegaConf.select(cfg, path, default=None)
+        if selected is not None:
+            return selected
     return default
 
 
-def _split_train_val_metadata(
-    full_metadata: pd.DataFrame,
-    val_ratio: float,
-    seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if len(full_metadata) < 2:
-        raise ValueError("Need at least 2 samples to create a train/validation split.")
-    if not (0.0 < val_ratio < 1.0):
-        raise ValueError(f"`val_ratio` must be in (0, 1), got {val_ratio}.")
-
-    shuffled = full_metadata.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    n_val = max(1, int(round(len(shuffled) * val_ratio)))
-    val_metadata = shuffled.iloc[:n_val].reset_index(drop=True)
-    train_metadata = shuffled.iloc[n_val:].reset_index(drop=True)
-
-    if "total_length" in train_metadata.columns:
-        train_metadata = train_metadata.sort_values(by="total_length", ascending=False)
-        val_metadata = val_metadata.sort_values(by="total_length", ascending=False)
-    return train_metadata, val_metadata
-
-
-def _masked_bin_rows(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pred_bin = logits.detach().argmax(dim=-1).reshape(-1)
-    true_bin = target.detach().argmax(dim=-1).reshape(-1)
-    valid = mask.detach().reshape(-1).to(dtype=torch.bool, device=pred_bin.device)
-    return pred_bin[valid].unsqueeze(-1), true_bin[valid].unsqueeze(-1)
-
-
-def _gather_tensor_rows(tensor: torch.Tensor) -> torch.Tensor:
-    if DIST_WRAPPER.world_size <= 1:
-        return tensor
-
-    local_rows = torch.tensor([tensor.shape[0]], device=tensor.device, dtype=torch.long)
-    row_counts = [torch.zeros_like(local_rows) for _ in range(DIST_WRAPPER.world_size)]
-    dist.all_gather(row_counts, local_rows)
-    max_rows = int(max(x.item() for x in row_counts))
-
-    if tensor.shape[0] < max_rows:
-        pad_shape = (max_rows - tensor.shape[0], *tensor.shape[1:])
-        pad = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
-        padded = torch.cat([tensor, pad], dim=0)
+def to_device(obj, device):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                to_device(value, device)
+            elif isinstance(value, torch.Tensor):
+                obj[key] = value.to(device)
+    elif isinstance(obj, torch.Tensor):
+        obj = obj.to(device)
     else:
-        padded = tensor
+        try:
+            obj = obj.to(device)
+        except Exception as exc:
+            raise TypeError(f"Unsupported type for to_device: {type(obj)}") from exc
+    return obj
 
-    gathered = [torch.zeros_like(padded) for _ in range(DIST_WRAPPER.world_size)]
-    dist.all_gather(gathered, padded)
-    trimmed = [chunk[: int(count.item())] for chunk, count in zip(gathered, row_counts)]
-    return torch.cat(trimmed, dim=0)
+
+def split_dataset(
+    dataset: Dataset,
+    test_fraction: float = 0.2,
+    seed: int = 42,
+) -> tuple[Dataset, Dataset]:
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be between 0 and 1.")
+    if len(dataset) == 0:
+        raise ValueError("Cannot split an empty dataset.")
+    if len(dataset) == 1:
+        return dataset, dataset
+
+    test_len = max(1, int(round(len(dataset) * test_fraction)))
+    train_len = len(dataset) - test_len
+    if train_len == 0:
+        train_len, test_len = 1, len(dataset) - 1
+    generator = torch.Generator().manual_seed(seed)
+    return random_split(dataset, [train_len, test_len], generator=generator)
 
 
-def _binned_metrics(pred_bin: torch.Tensor, true_bin: torch.Tensor) -> dict[str, float]:
-    pred = pred_bin.detach().flatten().to(dtype=torch.float32).cpu()
-    true = true_bin.detach().flatten().to(dtype=torch.float32).cpu()
-    if pred.numel() == 0:
-        return {"acc": float("nan"), "mae": float("nan")}
-    acc = (pred == true).to(dtype=torch.float32).mean().item()
-    mae = torch.abs(pred - true).mean().item()
-    return {"acc": float(acc), "mae": float(mae)}
+def contact_bin_count(
+    contact_threshold: float,
+    distance_bin_start: float,
+    distance_bin_width: float,
+    distance_bin_count: int,
+) -> int:
+    count = int((contact_threshold - distance_bin_start) / distance_bin_width)
+    return max(1, min(count, distance_bin_count))
+
+
+def masked_cross_entropy(
+    logits: torch.Tensor,
+    target_bins: torch.Tensor,
+    mask: torch.Tensor,
+    loss_fn: torch.nn.Module,
+) -> torch.Tensor:
+    if logits.shape[:-1] != target_bins.shape:
+        raise ValueError(
+            f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
+            f"target={tuple(target_bins.shape)}"
+        )
+    loss = loss_fn(logits.permute(0, 3, 1, 2), target_bins.long())
+    mask_float = mask.to(dtype=loss.dtype)
+    return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
+
+
+def _binary_classification_metrics(
+    scores: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, float]:
+    scores = scores.detach().flatten().to(dtype=torch.float32).cpu()
+    target_bool = target.detach().flatten().to(dtype=torch.bool).cpu()
+    pos_count = int(target_bool.sum().item())
+    neg_count = int((~target_bool).sum().item())
+    if pos_count == 0 or neg_count == 0:
+        return {"auroc": float("nan"), "auprc": float("nan")}
+
+    order = torch.argsort(scores, descending=True)
+    y_sorted = target_bool[order].to(dtype=torch.float32)
+    tps = torch.cumsum(y_sorted, dim=0)
+    fps = torch.cumsum(1.0 - y_sorted, dim=0)
+
+    tpr = torch.cat([torch.tensor([0.0]), tps / pos_count, torch.tensor([1.0])])
+    fpr = torch.cat([torch.tensor([0.0]), fps / neg_count, torch.tensor([1.0])])
+    auroc = torch.trapz(tpr, fpr).item()
+
+    precision_curve = tps / torch.arange(1, len(y_sorted) + 1, dtype=torch.float32)
+    recall_curve = tps / pos_count
+    recall_curve = torch.cat([torch.tensor([0.0]), recall_curve])
+    precision_curve = torch.cat([torch.tensor([1.0]), precision_curve])
+    auprc = torch.sum(
+        (recall_curve[1:] - recall_curve[:-1]) * precision_curve[1:]
+    ).item()
+
+    return {"auroc": float(auroc), "auprc": float(auprc)}
+
+
+def _contact_scores_and_targets(
+    logits: torch.Tensor,
+    target_bins: torch.Tensor,
+    mask: torch.Tensor,
+    contact_bins: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = mask.to(dtype=torch.bool)
+    probs = torch.softmax(logits, dim=-1)[..., :contact_bins].sum(dim=-1)
+    contacts = target_bins < contact_bins
+    return probs[valid], contacts[valid]
+
+
+def _unpack_batch(step_batch, device):
+    p1_batch, p2_batch, labels = step_batch
+    p1_batch = to_device(p1_batch, device)
+    p2_batch = to_device(p2_batch, device)
+    labels = to_device(labels, device)
+    return p1_batch, p2_batch, labels
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: torch.nn.Module,
+    device: torch.device,
+    max_grad_norm: float = 0.0,
+    grad_accum_steps: int = 1,
+    scheduler: Any | None = None,
+    max_batches: int | None = None,
+) -> float:
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    total_loss = 0.0
+    num_steps = 0
+
+    for step, step_batch in enumerate(loader):
+        if max_batches is not None and step >= max_batches:
+            break
+        p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
+        logits, pair_mask = model(p1_batch, p2_batch)
+        valid_mask = pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
+        raw_loss = masked_cross_entropy(
+            logits,
+            labels["label_2d_bins"],
+            valid_mask,
+            loss_fn,
+        )
+        loss = raw_loss / max(1, grad_accum_steps)
+        loss.backward()
+
+        should_step = ((step + 1) % max(1, grad_accum_steps) == 0) or (
+            step + 1 == len(loader)
+        )
+        if should_step:
+            if max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss += raw_loss.item()
+        num_steps += 1
+
+    return total_loss / max(num_steps, 1)
+
+
+def evaluate_epoch(
+    model: torch.nn.Module,
+    loader,
+    loss_fn: torch.nn.Module,
+    device: torch.device,
+    contact_threshold: float,
+    distance_bin_start: float,
+    distance_bin_width: float,
+    distance_bin_count: int = 36,
+    max_batches: int | None = None,
+) -> dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    num_steps = 0
+    score_rows = []
+    target_rows = []
+    n_contact_bins = contact_bin_count(
+        contact_threshold,
+        distance_bin_start,
+        distance_bin_width,
+        distance_bin_count,
+    )
+
+    with torch.no_grad():
+        for step, step_batch in enumerate(loader):
+            if max_batches is not None and step >= max_batches:
+                break
+            p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
+            logits, pair_mask = model(p1_batch, p2_batch)
+            valid_mask = (
+                pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
+            )
+            loss = masked_cross_entropy(
+                logits,
+                labels["label_2d_bins"],
+                valid_mask,
+                loss_fn,
+            )
+            scores, targets = _contact_scores_and_targets(
+                logits,
+                labels["label_2d_bins"],
+                valid_mask,
+                n_contact_bins,
+            )
+            total_loss += loss.item()
+            num_steps += 1
+            score_rows.append(scores.detach().cpu())
+            target_rows.append(targets.detach().cpu())
+
+    if score_rows:
+        metrics = _binary_classification_metrics(
+            torch.cat(score_rows, dim=0),
+            torch.cat(target_rows, dim=0),
+        )
+    else:
+        metrics = {"auroc": float("nan"), "auprc": float("nan")}
+
+    return {
+        "test_loss": total_loss / max(num_steps, 1),
+        "test_auroc": metrics["auroc"],
+        "test_auprc": metrics["auprc"],
+    }
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
 def main(args: DictConfig):
     logging_dir = os.path.join(
         args.logging_dir,
-        f"{args.task_prefix}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+        f"{str(args.task_prefix).upper()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
     )
     if DIST_WRAPPER.rank == 0:
         os.makedirs(args.logging_dir, exist_ok=True)
         os.makedirs(logging_dir, exist_ok=True)
         os.makedirs(os.path.join(logging_dir, "checkpoints"), exist_ok=True)
-        with open(f"{logging_dir}/config.yaml", "w") as f:
+        with open(f"{logging_dir}/config.yaml", "w", encoding="utf-8") as f:
             OmegaConf.save(args, f)
 
     use_cuda = torch.cuda.device_count() > 0
@@ -144,48 +297,27 @@ def main(args: DictConfig):
             )
         timeout_seconds = int(os.environ.get("NCCL_TIMEOUT_SECOND", 600))
         dist.init_process_group(
-            backend="hccl", timeout=datetime.timedelta(seconds=timeout_seconds)
+            backend="nccl", timeout=datetime.timedelta(seconds=timeout_seconds)
         )
 
     seed_everything(seed=args.seed, deterministic=args.deterministic)
 
-    train_csv_path = _cfg_get(
-        args, "data.train_csv_path", "data.train_csv", "train_csv_path", "train_csv"
+    full_dataset = PepoTrainDataset(
+        root_dir=args.data.root_dir,
+        cluster_tsv_path=args.data.cluster_tsv_path,
+        center_coordinates=args.data.center_coordinates,
+        random_rotation=args.data.random_rotation,
+        distance_bin_start=args.data.distance_bin_start,
+        distance_bin_width=args.data.distance_bin_width,
+        distance_bin_count=args.data.distance_bin_count,
     )
-    if train_csv_path is None:
-        raise ValueError("A training csv path must be provided in config.")
-
-    batch_size = int(_cfg_get(args, "data.batch_size", "batch_size", default=1))
-    num_workers = int(_cfg_get(args, "data.num_workers", "num_workers", default=4))
-    val_ratio = float(_cfg_get(args, "data.val_ratio", "val_ratio", default=0.05))
-    split_seed = int(_cfg_get(args, "data.split_seed", "split_seed", default=args.seed))
-    center_coordinates = bool(
-        _cfg_get(args, "data.center_coordinates", "center_coordinates", default=True)
-    )
-    random_rotation = bool(
-        _cfg_get(args, "data.random_rotation", "random_rotation", default=True)
-    )
-
-    full_metadata = pd.read_csv(train_csv_path)
-    train_metadata, val_metadata = _split_train_val_metadata(
-        full_metadata=full_metadata,
-        val_ratio=val_ratio,
-        seed=split_seed,
+    train_dataset, test_dataset = split_dataset(
+        full_dataset,
+        test_fraction=args.data.test_fraction,
+        seed=args.seed,
     )
     log_info(
-        f"Split dataset from {train_csv_path}: train={len(train_metadata)} "
-        f"val={len(val_metadata)} ratio={val_ratio:.3f}"
-    )
-
-    train_dataset = PepoDataset(
-        metadata=train_metadata,
-        center_coordinates=center_coordinates,
-        random_rotation=random_rotation,
-    )
-    val_dataset = PepoDataset(
-        metadata=val_metadata,
-        center_coordinates=center_coordinates,
-        random_rotation=False,
+        f"Loaded {len(full_dataset)} clusters: {len(train_dataset)} train, {len(test_dataset)} test"
     )
 
     train_sampler = (
@@ -193,14 +325,14 @@ def main(args: DictConfig):
             train_dataset,
             num_replicas=DIST_WRAPPER.world_size,
             rank=DIST_WRAPPER.rank,
-            shuffle=False,
+            shuffle=True,
         )
         if DIST_WRAPPER.world_size > 1
         else None
     )
-    val_sampler = (
+    test_sampler = (
         DistributedSampler(
-            val_dataset,
+            test_dataset,
             num_replicas=DIST_WRAPPER.world_size,
             rank=DIST_WRAPPER.rank,
             shuffle=False,
@@ -212,24 +344,28 @@ def main(args: DictConfig):
     train_loader = get_dataloader(
         train_dataset,
         collate_fn=collate_fn,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
+        batch_size=args.data.batch_size,
+        shuffle=train_sampler is None,
+        num_workers=args.data.num_workers,
         sampler=train_sampler,
+        pin_memory=args.data.pin_memory,
     )
-    val_loader = get_dataloader(
-        val_dataset,
+    test_loader = get_dataloader(
+        test_dataset,
         collate_fn=collate_fn,
-        batch_size=batch_size,
+        batch_size=args.data.batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        sampler=val_sampler,
+        num_workers=args.data.num_workers,
+        sampler=test_sampler,
+        pin_memory=args.data.pin_memory,
     )
 
     model_kwargs = _cfg_get(args, "model", default={})
     if isinstance(model_kwargs, DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
-    model = ResOnly(**(model_kwargs or {})).to(device)
+    model_kwargs = dict(model_kwargs or {})
+    model_kwargs.setdefault("num_classes", args.data.distance_bin_count)
+    model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = DDP(
             model,
@@ -241,64 +377,7 @@ def main(args: DictConfig):
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
 
-    pair_loss_fn = MaskedBinnedBCELoss().to(device)
-    pair_loss_weight = float(_cfg_get(args, "pair_loss_weight", default=1.0))
-    empty_cache_each_step = bool(
-        _cfg_get(args, "performance.empty_cache_each_step", "empty_cache_each_step", default=False)
-    )
-    grad_accum_steps = max(
-        1, int(_cfg_get(args, "optimizer.grad_accum_steps", "grad_accum_steps", default=1))
-    )
-    max_grad_norm = float(
-        _cfg_get(args, "optimizer.max_grad_norm", "max_grad_norm", default=0.0)
-    )
-    if use_cuda and (not args.deterministic):
-        torch.backends.cudnn.benchmark = True
-
-    def run_forward(
-        step_batch,
-        loss_weight=1.0,
-        collect_eval=False,
-    ):
-        protein_batch, peptide_batch, labels = step_batch
-        protein_batch = to_device(protein_batch, device)
-        peptide_batch = to_device(peptide_batch, device)
-        labels = to_device(labels, device)
-
-        pairwise_logits, model_pair_mask = model(
-            p1_batch=protein_batch["residue_features"],
-            p2_batch=peptide_batch["residue_features"],
-        )
-        pair_target = labels["label_2d_bins"].to(dtype=torch.float32)
-        pair_label_mask = labels["label_2d_mask"].to(dtype=torch.bool)
-
-        if pairwise_logits.shape != pair_target.shape:
-            raise ValueError(
-                f"Logit/target shape mismatch: logits={tuple(pairwise_logits.shape)} "
-                f"target={tuple(pair_target.shape)}"
-            )
-        if tuple(pair_label_mask.shape) != tuple(pairwise_logits.shape[:3]):
-            raise ValueError(
-                f"Mask/logit shape mismatch: mask={tuple(pair_label_mask.shape)} "
-                f"logits={tuple(pairwise_logits.shape)}"
-            )
-
-        pair_mask = pair_label_mask & model_pair_mask.to(dtype=torch.bool)
-        pair_loss = pair_loss_fn(pairwise_logits, pair_target, pair_mask)
-        loss = loss_weight * pair_loss
-        loss_dict = {"pair_bin_loss": f"{loss.item():.3f}"}
-        if not collect_eval:
-            return loss, loss_dict, None
-
-        pred_rows, true_rows = _masked_bin_rows(
-            logits=pairwise_logits,
-            target=pair_target,
-            mask=pair_mask,
-        )
-        return loss, loss_dict, (pred_rows, true_rows)
-
-    if empty_cache_each_step and use_cuda:
-        torch.cuda.empty_cache()
+    loss_fn = torch.nn.CrossEntropyLoss(reduction="none").to(device)
     optimizer = get_optimizer(
         model,
         lr=args.optimizer.lr,
@@ -319,35 +398,17 @@ def main(args: DictConfig):
     start_epoch = 1
     if args.ckpt_dir is not None:
         checkpoint = torch.load(args.ckpt_dir, map_location=device)
-        if DIST_WRAPPER.world_size > 1:
-            model.module.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            model.load_state_dict(checkpoint["model_state_dict"])
+        target_model = model.module if DIST_WRAPPER.world_size > 1 else model
+        target_model.load_state_dict(checkpoint["model_state_dict"])
         if not args.load_model_only:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             start_epoch = checkpoint["epoch"] + 1
         del checkpoint
 
-    if empty_cache_each_step and use_cuda:
-        torch.cuda.empty_cache()
-    model.eval()
-    with torch.no_grad():
-        for check_iter, check_dict in enumerate(val_loader):
-            if empty_cache_each_step and use_cuda:
-                torch.cuda.empty_cache()
-            _, _, _ = run_forward(
-                check_dict,
-                loss_weight=pair_loss_weight,
-                collect_eval=False,
-            )
-            if check_iter >= 2:
-                break
-    log_info("Sanity check done")
-
     if DIST_WRAPPER.rank == 0:
-        with open(f"{logging_dir}/loss.csv", "w") as f:
-            f.write("Epoch,Loss,Val Loss,pair_bin_acc,pair_bin_mae\n")
+        with open(f"{logging_dir}/loss.csv", "w", encoding="utf-8") as f:
+            f.write("Epoch,Train Loss,Test Loss,Test AUROC,Test AUPRC\n")
 
     epoch_progress = (
         tqdm(total=args.epochs, leave=False, position=0)
@@ -359,104 +420,64 @@ def main(args: DictConfig):
         if train_sampler is not None:
             train_sampler.set_epoch(crt_epoch)
 
-        epoch_loss, epoch_val_loss = 0.0, 0.0
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-
-        train_iter = enumerate(train_loader)
+        train_iter = train_loader
         if DIST_WRAPPER.rank == 0:
             train_iter = tqdm(
-                train_iter,
-                desc="Step",
+                train_loader,
+                desc="Train",
                 total=len(train_loader),
                 leave=True,
                 position=1,
             )
+        train_loss = train_epoch(
+            model=model,
+            loader=train_iter,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            device=device,
+            max_grad_norm=float(args.optimizer.max_grad_norm),
+            grad_accum_steps=max(1, int(args.optimizer.grad_accum_steps)),
+            scheduler=scheduler,
+        )
 
-        crt_step, crt_val_step = 0, 0
-        for crt_step, train_dict in train_iter:
-            if empty_cache_each_step and use_cuda:
-                torch.cuda.empty_cache()
-
-            loss, loss_dict, _ = run_forward(
-                train_dict,
-                loss_weight=pair_loss_weight,
-                collect_eval=False,
+        test_iter = test_loader
+        if DIST_WRAPPER.rank == 0:
+            test_iter = tqdm(
+                test_loader,
+                desc="Test",
+                total=len(test_loader),
+                leave=True,
+                position=1,
             )
-            raw_loss = loss
-            if grad_accum_steps > 1:
-                loss = loss / grad_accum_steps
-            loss.backward()
-
-            should_step = ((crt_step + 1) % grad_accum_steps == 0) or (
-                (crt_step + 1) == len(train_loader)
-            )
-            if should_step:
-                if max_grad_norm > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            step_loss = raw_loss.item()
-            epoch_loss += step_loss
-            if DIST_WRAPPER.rank == 0:
-                train_iter.set_postfix(step_loss=f"{step_loss:.3f}", **loss_dict)
-
-        epoch_loss /= (crt_step + 1)
-
-        model.eval()
-        pred_rows_all = []
-        true_rows_all = []
-        with torch.no_grad():
-            val_iter = enumerate(val_loader)
-            if DIST_WRAPPER.rank == 0:
-                val_iter = tqdm(
-                    val_iter,
-                    desc="Validation",
-                    total=len(val_loader),
-                    leave=True,
-                    position=1,
-                )
-
-            for crt_val_step, val_dict in val_iter:
-                if empty_cache_each_step and use_cuda:
-                    torch.cuda.empty_cache()
-
-                val_loss, val_loss_dict, val_rows = run_forward(
-                    val_dict,
-                    loss_weight=pair_loss_weight,
-                    collect_eval=True,
-                )
-                pred_rows_all.append(val_rows[0])
-                true_rows_all.append(val_rows[1])
-
-                step_val_loss = val_loss.item()
-                epoch_val_loss += step_val_loss
-                if DIST_WRAPPER.rank == 0:
-                    val_iter.set_postfix(val_loss=f"{step_val_loss:.3f}", **val_loss_dict)
-
-        epoch_val_loss /= (crt_val_step + 1)
-
-        pred_rows = torch.cat(pred_rows_all, dim=0)
-        true_rows = torch.cat(true_rows_all, dim=0)
-        pred_rows = _gather_tensor_rows(pred_rows)
-        true_rows = _gather_tensor_rows(true_rows)
-        metrics = _binned_metrics(pred_rows, true_rows)
+        metrics = evaluate_epoch(
+            model=model,
+            loader=test_iter,
+            loss_fn=loss_fn,
+            device=device,
+            contact_threshold=args.data.contact_threshold,
+            distance_bin_start=args.data.distance_bin_start,
+            distance_bin_width=args.data.distance_bin_width,
+            distance_bin_count=args.data.distance_bin_count,
+        )
 
         if DIST_WRAPPER.rank == 0 and epoch_progress is not None:
-            epoch_progress.set_postfix(loss=f"{epoch_loss:.3f}", val_loss=f"{epoch_val_loss:.3f}")
+            epoch_progress.set_postfix(
+                loss=f"{train_loss:.3f}",
+                test_loss=f"{metrics['test_loss']:.3f}",
+                auroc=f"{metrics['test_auroc']:.4f}",
+                auprc=f"{metrics['test_auprc']:.4f}",
+            )
             epoch_progress.update()
-
-            with open(f"{logging_dir}/loss.csv", "a") as f:
+            with open(f"{logging_dir}/loss.csv", "a", encoding="utf-8") as f:
                 f.write(
-                    f"{crt_epoch},{epoch_loss},{epoch_val_loss},"
-                    f"{metrics['acc']},{metrics['mae']}\n"
+                    f"{crt_epoch},{train_loss},{metrics['test_loss']},"
+                    f"{metrics['test_auroc']},{metrics['test_auprc']}\n"
                 )
-
             log_info(
-                f"[val-metrics][epoch={crt_epoch}] "
-                f"[pair-bin] ACC={metrics['acc']:.4f} MAE={metrics['mae']:.4f}"
+                f"[test-metrics][epoch={crt_epoch}] "
+                f"loss={metrics['test_loss']:.4f} "
+                f"auroc={metrics['test_auroc']:.4f} "
+                f"auprc={metrics['test_auprc']:.4f}"
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:
@@ -475,28 +496,8 @@ def main(args: DictConfig):
                     checkpoint_path,
                 )
 
-        if empty_cache_each_step and use_cuda:
-            torch.cuda.empty_cache()
-
     if DIST_WRAPPER.world_size > 1:
         dist.destroy_process_group()
-
-
-def to_device(obj, device):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, dict):
-                to_device(v, device)
-            elif isinstance(v, torch.Tensor):
-                obj[k] = obj[k].to(device)
-    elif isinstance(obj, torch.Tensor):
-        obj = obj.to(device)
-    else:
-        try:
-            obj = obj.to(device)
-        except Exception as exc:
-            raise Exception(f"type {type(obj)} not supported") from exc
-    return obj
 
 
 if __name__ == "__main__":

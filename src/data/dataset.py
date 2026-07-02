@@ -1,95 +1,28 @@
-import copy
-import os
+import pickle
+import random
 from math import prod
 from pathlib import Path
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as Scipy_Rotation
 from torch.utils.data import DataLoader, Dataset
 
 DISTANCE_BIN_START_A = 2.0
-DISTANCE_BIN_END_A = 20.0
+DISTANCE_BIN_WIDTH_A = 0.5
 DISTANCE_BIN_NUM = 36
 ATOM14_CA_INDEX = 1
 ATOM14_CB_INDEX = 4
 
 
-def _resolve_atom14_tensors(complex_features: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    atom_features = complex_features["atom_features"]
-    atom_position = atom_features.get("atom14_position", atom_features.get("atom_position"))
-    atom_mask = atom_features.get("atom14_mask", atom_features.get("mask"))
-    if atom_position is None or atom_mask is None:
-        raise KeyError("atom14_position/atom14_mask (or atom_position/mask) are required.")
-    return atom_position, atom_mask
-
-
-def _representative_cb_or_ca(
-    atom14_position: torch.Tensor,
-    atom14_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    atom14_position = atom14_position.to(dtype=torch.float32)
-    atom14_mask = atom14_mask.to(dtype=torch.bool)
-
-    cb_pos = atom14_position[:, ATOM14_CB_INDEX, :]
-    ca_pos = atom14_position[:, ATOM14_CA_INDEX, :]
-    cb_mask = atom14_mask[:, ATOM14_CB_INDEX]
-    ca_mask = atom14_mask[:, ATOM14_CA_INDEX]
-
-    # Use CB when present; fallback to CA (e.g. GLY or missing CB).
-    rep_pos = torch.where(cb_mask[:, None], cb_pos, ca_pos)
-    rep_mask = cb_mask | ca_mask
-    return rep_pos, rep_mask
-
-
-def build_pair_distance_label(
-    protein_features: dict,
-    peptide_features: dict,
-) -> dict:
-    protein_atom14_position, protein_atom14_mask = _resolve_atom14_tensors(protein_features)
-    peptide_atom14_position, peptide_atom14_mask = _resolve_atom14_tensors(peptide_features)
-
-    protein_rep_pos, protein_rep_mask = _representative_cb_or_ca(
-        protein_atom14_position, protein_atom14_mask
-    )
-    peptide_rep_pos, peptide_rep_mask = _representative_cb_or_ca(
-        peptide_atom14_position, peptide_atom14_mask
-    )
-
-    n_protein = int(protein_rep_pos.shape[0])
-    n_peptide = int(peptide_rep_pos.shape[0])
-    total_len = n_protein + n_peptide
-
-    cross_mask = protein_rep_mask[:, None] & peptide_rep_mask[None, :]
-
-    if n_protein == 0 or n_peptide == 0:
-        cross_bins = protein_rep_pos.new_zeros((n_protein, n_peptide, DISTANCE_BIN_NUM))
-    else:
-        dist = torch.cdist(protein_rep_pos, peptide_rep_pos, p=2)
-        bin_edges = torch.linspace(
-            DISTANCE_BIN_START_A,
-            DISTANCE_BIN_END_A,
-            DISTANCE_BIN_NUM + 1,
-            dtype=dist.dtype,
-            device=dist.device,
-        )
-        bin_index = torch.bucketize(dist, bin_edges[1:-1])
-        cross_bins = F.one_hot(bin_index, num_classes=DISTANCE_BIN_NUM).to(dtype=dist.dtype)
-        cross_bins = cross_bins * cross_mask[..., None].to(dtype=dist.dtype)
-
-    full_bins = cross_bins.new_zeros((total_len, total_len, DISTANCE_BIN_NUM))
-    full_mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=cross_mask.device)
-
-    full_bins[:n_protein, n_protein:, :] = cross_bins
-    full_bins[n_protein:, :n_protein, :] = cross_bins.transpose(0, 1)
-    full_mask[:n_protein, n_protein:] = cross_mask
-    full_mask[n_protein:, :n_protein] = cross_mask.transpose(0, 1)
-
-    return {
-        "pair_distance_bins_2d": full_bins.to(dtype=torch.float32),
-        "pair_distance_mask_2d": full_mask,
-    }
+def distance_to_bins(
+    distance: torch.Tensor,
+    bin_start: float = DISTANCE_BIN_START_A,
+    bin_width: float = DISTANCE_BIN_WIDTH_A,
+    bin_count: int = DISTANCE_BIN_NUM,
+) -> torch.Tensor:
+    bin_index = torch.floor((distance.to(dtype=torch.float32) - bin_start) / bin_width)
+    return bin_index.clamp(min=0, max=bin_count - 1).to(dtype=torch.long)
 
 
 def collate_fn(batch):
@@ -118,24 +51,21 @@ def collate_fn(batch):
         return out
 
     def _collate_complex(samples: list[dict]) -> dict:
-        batch_out = {}
-        feature_samples = [s["residue_features"] for s in samples]
         feature_batch = {}
-        for key in feature_samples[0].keys():
-            values = [fs[key] for fs in feature_samples]
+        for key in samples[0].keys():
+            values = [sample[key] for sample in samples]
             if not isinstance(values[0], torch.Tensor):
                 feature_batch[key] = values
                 continue
             feature_batch[key] = _pad_first_dim(values)
-        batch_out["residue_features"] = feature_batch
-        return batch_out
+        return feature_batch
 
     proteins, peptides, labels_2d_bins, labels_2d_mask = zip(*batch)
     protein_batch = _collate_complex(list(proteins))
     peptide_batch = _collate_complex(list(peptides))
 
     label_batch = {
-        "label_2d_bins": _pad_first_two_dims([x.to(dtype=torch.float32) for x in labels_2d_bins]),
+        "label_2d_bins": _pad_first_two_dims([x.to(dtype=torch.long) for x in labels_2d_bins]),
         "label_2d_mask": _pad_first_two_dims([x.to(dtype=torch.bool) for x in labels_2d_mask]),
     }
     return protein_batch, peptide_batch, label_batch
@@ -166,128 +96,123 @@ def get_dataloader(
 class PepoTrainDataset(Dataset):
     def __init__(
         self,
-        cluster_csv_path=None,
+        root_dir: str,
+        cluster_tsv_path=None,
         transform=None,
         center_coordinates: bool = True,
         random_rotation: bool = True,
+        distance_bin_start: float = DISTANCE_BIN_START_A,
+        distance_bin_width: float = DISTANCE_BIN_WIDTH_A,
+        distance_bin_count: int = DISTANCE_BIN_NUM,
     ):
-        if metadata is None:
-            if csv_path is None:
-                raise ValueError("Either `csv_path` or `metadata` must be provided.")
-            self.metadata = pd.read_csv(csv_path)
-        else:
-            self.metadata = metadata.reset_index(drop=True).copy()
-
+        self.root_dir = Path(root_dir)
+        self.cluster_tsv_path = Path(cluster_tsv_path)
         self.transform = transform
         self.center_coordinates = center_coordinates
         self.random_rotation = random_rotation
+        self.distance_bin_start = float(distance_bin_start)
+        self.distance_bin_width = float(distance_bin_width)
+        self.distance_bin_count = int(distance_bin_count)
 
-        if "protein_path" in self.metadata.columns:
-            self.protein_path_column = "protein_path"
-        elif "receptor_path" in self.metadata.columns:
-            self.protein_path_column = "receptor_path"
-        else:
-            raise KeyError("CSV must contain either `protein_path` or `receptor_path`.")
+        if self.distance_bin_count <= 0:
+            raise ValueError("distance_bin_count must be positive.")
 
-        if "peptide_path" not in self.metadata.columns:
-            raise KeyError("CSV must contain `peptide_path`.")
-        self.peptide_path_column = "peptide_path"
-
-        self.items = [
-            (protein_path, peptide_path)
-            for protein_path, peptide_path in zip(
-                self.metadata[self.protein_path_column],
-                self.metadata[self.peptide_path_column],
+        self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
+        required_columns = {"chain1", "chain2", "label_path", "ppi_cluster_id"}
+        missing_columns = required_columns.difference(self.metadata.columns)
+        if missing_columns:
+            raise ValueError(
+                f"Cluster TSV is missing required columns: {sorted(missing_columns)}"
             )
-        ]
+
+        self.items = sorted(self.metadata["ppi_cluster_id"].dropna().unique().tolist())
+        self.cluster_to_rows = {
+            cluster_id: group.reset_index(drop=True)
+            for cluster_id, group in self.metadata.groupby("ppi_cluster_id", sort=False)
+        }
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        protein_path, peptide_path = self.items[idx]
-        protein = torch.load(protein_path)
-        peptide = torch.load(peptide_path)
-        label_2d_bins, label_2d_mask = self._ensure_pair_distance_label_file(
-            protein_path=protein_path,
-            peptide_path=peptide_path,
-            protein_features=protein,
-            peptide_features=peptide,
+        cluster_id = self.items[idx]
+        cluster_rows = self.cluster_to_rows[cluster_id]
+        row = cluster_rows.iloc[random.randrange(len(cluster_rows))]
+
+        p1_features = self._process_complex(self._load_chain_features(row["chain1"]))
+        p2_features = self._process_complex(self._load_chain_features(row["chain2"]))
+        label_path = self.root_dir / "labels" / Path(row["label_path"]).name
+        label_bins, label_mask = self._load_pair_labels(
+            label_path, p1_features["mask"].shape[0], p2_features["mask"].shape[0]
         )
 
-        protein = self._process_complex(protein)
-        peptide = self._process_complex(peptide)
-
-        item = (protein, peptide, label_2d_bins, label_2d_mask)
+        sample = (p1_features, p2_features, label_bins, label_mask)
         if self.transform is not None:
-            item = self.transform(item)
-        return item
+            sample = self.transform(sample)
+        return sample
 
     @staticmethod
-    def _infer_label_path(
-        protein_path: str | Path,
-        peptide_path: str | Path,
-    ) -> Path | None:
-        protein_parent = Path(protein_path).parent
-        peptide_parent = Path(peptide_path).parent
-        if protein_parent == peptide_parent:
-            return protein_parent / "label.pt"
-        return None
+    def _to_tensor(value, dtype=None) -> torch.Tensor:
+        tensor = torch.as_tensor(value)
+        return tensor.to(dtype=dtype) if dtype is not None else tensor
 
     @staticmethod
-    def _safe_save_label(label_path: Path, label_data: dict) -> None:
-        label_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = label_path.with_suffix(label_path.suffix + ".tmp")
-        torch.save(label_data, tmp_path)
-        os.replace(tmp_path, label_path)
+    def _encode_chain_index(chain_index) -> torch.Tensor:
+        if isinstance(chain_index, torch.Tensor):
+            if chain_index.dtype.is_floating_point:
+                return chain_index.to(dtype=torch.long)
+            return chain_index.long()
 
-    @staticmethod
-    def _is_label_shape_consistent(
+        values = list(chain_index)
+        mapping = {value: i for i, value in enumerate(sorted(set(values)))}
+        return torch.tensor([mapping[value] for value in values], dtype=torch.long)
+
+    def _load_pickle(self, path: Path) -> dict:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def _load_chain_features(self, chain_name: str) -> dict:
+        path = self.root_dir / "processed" / f"{chain_name}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing chain feature pickle: {path}")
+        return self._load_pickle(path)
+
+    def _load_pair_labels(
+        self,
+        label_path: str,
         protein_len: int,
         peptide_len: int,
-        pair_distance_bins_2d: torch.Tensor,
-        pair_distance_mask_2d: torch.Tensor,
-    ) -> bool:
-        total_len = protein_len + peptide_len
-        return (
-            tuple(pair_distance_bins_2d.shape) == (total_len, total_len, DISTANCE_BIN_NUM)
-            and tuple(pair_distance_mask_2d.shape) == (total_len, total_len)
-        )
-
-    def _ensure_pair_distance_label_file(
-        self,
-        protein_path: str | Path,
-        peptide_path: str | Path,
-        protein_features: dict,
-        peptide_features: dict,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        label_path = self._infer_label_path(
-            protein_path=protein_path,
-            peptide_path=peptide_path,
+        label_data = self._load_pickle(label_path)
+        pairwise_dist = self._to_tensor(label_data["pairwise_dist"], dtype=torch.float32)
+        pairwise_mask = self._to_tensor(label_data["pairwise_mask"], dtype=torch.bool)
+        expected_shape = (protein_len, peptide_len)
+        if tuple(pairwise_dist.shape) != expected_shape:
+            raise ValueError(
+                f"pairwise_dist shape {tuple(pairwise_dist.shape)} does not match "
+                f"feature lengths {expected_shape}."
+            )
+        if tuple(pairwise_mask.shape) != expected_shape:
+            raise ValueError(
+                f"pairwise_mask shape {tuple(pairwise_mask.shape)} does not match "
+                f"feature lengths {expected_shape}."
+            )
+
+        cross_bins = distance_to_bins(
+            pairwise_dist,
+            bin_start=self.distance_bin_start,
+            bin_width=self.distance_bin_width,
+            bin_count=self.distance_bin_count,
         )
 
-        protein_len = int(_resolve_atom14_tensors(protein_features)[0].shape[0])
-        peptide_len = int(_resolve_atom14_tensors(peptide_features)[0].shape[0])
-
-        if label_path is not None and label_path.exists():
-            label_dict = torch.load(label_path)
-            bins_key = "pair_distance_bins_2d"
-            mask_key = "pair_distance_mask_2d"
-            if bins_key in label_dict and mask_key in label_dict:
-                pair_distance_bins_2d = label_dict[bins_key]
-                pair_distance_mask_2d = label_dict[mask_key]
-                if self._is_label_shape_consistent(
-                    protein_len,
-                    peptide_len,
-                    pair_distance_bins_2d,
-                    pair_distance_mask_2d,
-                ):
-                    return pair_distance_bins_2d, pair_distance_mask_2d
-
-        label_data = build_pair_distance_label(protein_features, peptide_features)
-        if label_path is not None:
-            self._safe_save_label(label_path, label_data)
-        return label_data["pair_distance_bins_2d"], label_data["pair_distance_mask_2d"]
+        total_len = protein_len + peptide_len
+        full_bins = torch.zeros((total_len, total_len), dtype=torch.long)
+        full_mask = torch.zeros((total_len, total_len), dtype=torch.bool)
+        full_bins[:protein_len, protein_len:] = cross_bins
+        full_bins[protein_len:, :protein_len] = cross_bins.T
+        full_mask[:protein_len, protein_len:] = pairwise_mask
+        full_mask[protein_len:, :protein_len] = pairwise_mask.T
+        return full_bins, full_mask
 
     @staticmethod
     def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
@@ -315,6 +240,32 @@ class PepoTrainDataset(Dataset):
         return torch.matmul(shifted, rot)
 
     def _process_complex(self, residue_features: dict) -> dict:
+        residue_features = {
+            key: value.copy() if hasattr(value, "copy") else value
+            for key, value in residue_features.items()
+        }
+        residue_features["atom14_positions"] = self._to_tensor(
+            residue_features["atom14_positions"], dtype=torch.float32
+        )
+        residue_features["atom14_mask"] = self._to_tensor(
+            residue_features["atom14_mask"], dtype=torch.bool
+        )
+        residue_features["cb_positions"] = self._to_tensor(
+            residue_features["cb_positions"], dtype=torch.float32
+        )
+        residue_features["cb_mask"] = self._to_tensor(
+            residue_features["cb_mask"], dtype=torch.bool
+        )
+        residue_features["residue_type"] = self._to_tensor(
+            residue_features["residue_type"], dtype=torch.long
+        )
+        residue_features["residue_index"] = self._to_tensor(
+            residue_features["residue_index"], dtype=torch.long
+        )
+        residue_features["chain_index"] = self._encode_chain_index(
+            residue_features["chain_index"]
+        )
+
         # use CA to center the proteins
         residue_position = residue_features["atom14_positions"][:, 1, :]
         residue_mask = residue_features["atom14_mask"][:, 1]
@@ -332,5 +283,24 @@ class PepoTrainDataset(Dataset):
         else:
             rot = torch.eye(3, dtype=residue_position.dtype, device=residue_position.device)
 
-        # apply rigid transform
-        return residue_features
+        residue_features["atom14_positions"] = self._apply_rigid(
+            residue_features["atom14_positions"], center, rot
+        )
+        residue_features["cb_positions"] = self._apply_rigid(
+            residue_features["cb_positions"], center, rot
+        )
+
+        return {
+            "plm_emb": torch.zeros(
+                residue_features["residue_type"].shape[0],
+                1280,
+                dtype=torch.float32,
+            ),
+            "residue_type": residue_features["residue_type"],
+            "residue_index": residue_features["residue_index"],
+            "residue_position": residue_features["cb_positions"],
+            "chain_index": residue_features["chain_index"],
+            "mask": residue_features["cb_mask"],
+            "atom14_positions": residue_features["atom14_positions"],
+            "atom14_mask": residue_features["atom14_mask"],
+        }
