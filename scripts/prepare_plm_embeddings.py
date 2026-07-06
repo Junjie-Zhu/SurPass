@@ -1,10 +1,9 @@
 
 import os
 import pickle
-import uuid
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,6 +12,15 @@ from tqdm.auto import tqdm
 
 from E1.batch_preparer import E1BatchPreparer
 from E1.modeling import E1ForMaskedLM
+
+FEATURE_DTYPES = {
+    "atom14_positions": torch.float32,
+    "atom14_mask": torch.bool,
+    "cb_positions": torch.float32,
+    "cb_mask": torch.bool,
+    "residue_type": torch.long,
+    "residue_index": torch.long,
+}
 
 
 def main():
@@ -33,8 +41,7 @@ def main():
     embedding_path.mkdir(parents=True, exist_ok=True)
 
     stats = {
-        "requested": len(all_chains),
-        "verified": len(verified_seqs),
+        "verified": len(all_chains),
         "saved": 0,
         "missing_features": 0,
         "failed": 0,
@@ -57,10 +64,9 @@ def main():
             with open(feature_file, "rb") as f:
                 feature_dict = pickle.load(f)
             seq = feature_dict["resseq"]
+
             plm_emb = generate_embeddings_from_request(
-                request_payload={
-                    "chain_requests": [{"chain_id": chain_id, "sequence": seq}]
-                },
+                request_payload={"chain_id": chain_id, "sequence": seq},
                 model=model,
                 device=device,
                 msa_directory="",
@@ -76,7 +82,7 @@ def main():
                     f"feature length {feature_len} does not match embedding length {plm_emb.shape[0]}"
                 )
 
-            torch.save(plm_emb, output_file)
+            torch.save(features, output_file)
             stats["saved"] += 1
             stats["residues"] += int(plm_emb.shape[0])
             stats["embedding_dim"] = int(plm_emb.shape[-1])
@@ -85,7 +91,6 @@ def main():
             errors.append(f"{chain_id}: {type(exc).__name__}: {exc}")
 
     print("\nEmbedding extraction summary")
-    print(f"requested chains: {stats['requested']}")
     print(f"verified chains with sequences: {stats['verified']}")
     print(f"saved chains: {stats['saved']}")
     print(f"missing feature files: {stats['missing_features']}")
@@ -100,11 +105,50 @@ def main():
 
 
 def tensorize_feature_dict(feature_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    return {
-        key: torch.from_numpy(value) if isinstance(value, np.ndarray) else value
-        for key, value in feature_dict.items()
-        if isinstance(value, (np.ndarray, torch.Tensor))
-    }
+    features = {}
+    for key, value in feature_dict.items():
+        tensor = _to_feature_tensor(key, value)
+        if tensor is not None:
+            features[key] = tensor
+    return features
+
+
+def _to_feature_tensor(key: str, value: Any) -> Optional[torch.Tensor]:
+    if key == "chain_index":
+        return _encode_chain_index(value)
+
+    if isinstance(value, np.ndarray):
+        tensor = torch.from_numpy(value)
+    elif isinstance(value, torch.Tensor):
+        tensor = value
+    else:
+        return None
+
+    dtype = FEATURE_DTYPES.get(key)
+    return tensor.to(dtype=dtype) if dtype is not None else tensor
+
+
+def _encode_chain_index(chain_index: Any) -> torch.Tensor:
+    if isinstance(chain_index, torch.Tensor):
+        return chain_index.long()
+
+    values = chain_index.tolist() if isinstance(chain_index, np.ndarray) else list(chain_index)
+    mapping = {value: i for i, value in enumerate(sorted(set(values)))}
+    return torch.tensor([mapping[value] for value in values], dtype=torch.long)
+
+
+def _batched(items, batch_size: int):
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def _infer_feature_length(features: Dict[str, torch.Tensor]) -> Optional[int]:

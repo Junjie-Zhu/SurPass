@@ -103,31 +103,87 @@ class ResOnly(nn.Module):
         # prediction head
         self.pair_out_layernorm = nn.LayerNorm(dim_pair)
         self.pair_out_linear = nn.Linear(dim_pair, kwargs.get('num_classes', 1))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for parameter in self.parameters():
+            nn.init.zeros_(parameter)
 
     def forward(
         self,
         p1_batch: Dict[str, torch.Tensor],
         p2_batch: Dict[str, torch.Tensor],
+        self_conditioning_bins: torch.Tensor | None = None,
+        recycle_rounds: int = 1,
     ):
-        # featurize
-        p1_single_repr, p1_pair_repr, p1_mask = self.residue_embedder(**p1_batch)
-        p2_single_repr, p2_pair_repr, p2_mask = self.residue_embedder(**p2_batch)
+        recycle_rounds = max(1, int(recycle_rounds))
+        if self_conditioning_bins is None:
+            self_conditioning_bins = self._zero_self_conditioning(p1_batch, p2_batch)
 
-        # prepare full representation
-        batch_size = p1_single_repr.shape[0]
-        p1_length = p1_single_repr.shape[1]
-        p2_length = p2_single_repr.shape[1]
-        single_repr = torch.cat([p1_single_repr, p2_single_repr], dim=-2)
-        pair_repr = p1_pair_repr.new_zeros(
-            batch_size,
-            p1_length + p2_length,
-            p1_length + p2_length,
-            self.dim_pair,
+        recycled_bins = self_conditioning_bins
+        for _ in range(recycle_rounds - 1):
+            with torch.no_grad():
+                logits, _ = self._forward_once(p1_batch, p2_batch, recycled_bins)
+                recycled_bins = torch.softmax(logits, dim=-1).detach()
+
+        return self._forward_once(p1_batch, p2_batch, recycled_bins)
+
+    def _zero_self_conditioning(
+        self,
+        p1_batch: Dict[str, torch.Tensor],
+        p2_batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        p1_mask = p1_batch["mask"]
+        p2_mask = p2_batch["mask"]
+        total_length = p1_mask.shape[1] + p2_mask.shape[1]
+        return p1_mask.new_zeros(
+            p1_mask.shape[0],
+            total_length,
+            total_length,
+            self.pair_out_linear.out_features,
+            dtype=torch.float32,
         )
-        pair_repr[..., :p1_length, :p1_length, :] = p1_pair_repr
-        pair_repr[..., p1_length:, p1_length:, :] = p2_pair_repr
 
-        mask = torch.cat([p1_mask, p2_mask], dim=-1)
+    @staticmethod
+    def _concat_batches(
+        p1_batch: Dict[str, torch.Tensor],
+        p2_batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        concat_batch = {}
+        for key, p1_value in p1_batch.items():
+            p2_value = p2_batch[key]
+            if key == "chain_index":
+                p1_chain_index = p1_value.long()
+                p2_chain_index = p2_value.long() + p1_chain_index.amax(dim=1, keepdim=True) + 1
+                concat_batch[key] = torch.cat([p1_chain_index, p2_chain_index], dim=1)
+            else:
+                concat_batch[key] = torch.cat([p1_value, p2_value], dim=1)
+        return concat_batch
+
+    def _forward_once(
+        self,
+        p1_batch: Dict[str, torch.Tensor],
+        p2_batch: Dict[str, torch.Tensor],
+        self_conditioning_bins: torch.Tensor,
+    ):
+        residue_batch = self._concat_batches(p1_batch, p2_batch)
+        expected_shape = (
+            residue_batch["mask"].shape[0],
+            residue_batch["mask"].shape[1],
+            residue_batch["mask"].shape[1],
+            self.residue_embedder.xt_pair_dist_dim,
+        )
+        if tuple(self_conditioning_bins.shape) != expected_shape:
+            raise ValueError(
+                f"self_conditioning_bins shape {tuple(self_conditioning_bins.shape)} "
+                f"does not match expected shape {expected_shape}."
+            )
+
+        single_repr, pair_repr, mask = self.residue_embedder(
+            **residue_batch,
+            pairwise_dist_bins=self_conditioning_bins,
+        )
+
         pair_mask = mask[:, :, None] * mask[:, None, :]
 
         # main trunk
@@ -152,5 +208,9 @@ class ResOnly(nn.Module):
 
         # output head
         pair_logits = self.pair_out_linear(self.pair_out_layernorm(pair_repr))
+        
+        # add transposed pair_logits to ensure symmetry
+        pair_logits = pair_logits + pair_logits.transpose(-1, -2)
+        pair_mask = pair_mask | pair_mask.transpose(-1, -2)
         return pair_logits, pair_mask
 

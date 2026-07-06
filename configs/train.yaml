@@ -6,6 +6,8 @@ epochs: 10
 checkpoint_interval: 1
 ckpt_dir: null
 load_model_only: false
+recycle_rounds: 2
+self_conditioning_probability: 0.5
 
 data:
   root_dir: pdb_metadata
@@ -18,9 +20,10 @@ data:
   test_fraction: 0.2
   negative_ratio: 1
   distance_bin_start: 2.0
-  distance_bin_width: 0.5
-  distance_bin_count: 36
+  distance_bin_end: 22.0
+  distance_bin_count: 64
   contact_threshold: 8.0
+  crop_size: 256
 
 model:
   n_layers: 3
@@ -36,11 +39,11 @@ model:
   plm_in_dim: 1280
   plm_out_dim: 256
   r_max: 32
-  xt_pair_dist_min: 1
-  xt_pair_dist_max: 33
+  xt_pair_dist_min: 2.0
+  xt_pair_dist_max: 22.0
   xt_pair_dist_dim: 64
   idx_emb_dim: 128
-  num_classes: 36
+  num_classes: 64
 
 optimizer:
   lr: 0.0001

@@ -119,11 +119,34 @@ def create_balanced_split_datasets(
 def contact_bin_count(
     contact_threshold: float,
     distance_bin_start: float,
-    distance_bin_width: float,
+    distance_bin_end: float,
     distance_bin_count: int,
 ) -> int:
-    count = int((contact_threshold - distance_bin_start) / distance_bin_width)
-    return max(1, min(count, distance_bin_count))
+    bin_limits = torch.linspace(
+        float(distance_bin_start),
+        float(distance_bin_end),
+        int(distance_bin_count) - 1,
+    )
+    count = int(torch.bucketize(torch.tensor(float(contact_threshold)), bin_limits).item())
+    return max(1, min(count, int(distance_bin_count)))
+
+
+def resolve_train_recycle_rounds(
+    recycle_rounds: int,
+    self_conditioning_probability: float,
+    random_value: float | None = None,
+) -> int:
+    recycle_rounds = max(1, int(recycle_rounds))
+    if recycle_rounds <= 1:
+        return 1
+
+    probability = max(0.0, min(1.0, float(self_conditioning_probability)))
+    if probability <= 0.0:
+        return 1
+
+    if random_value is None:
+        random_value = float(torch.rand(()).item())
+    return recycle_rounds if float(random_value) < probability else 1
 
 
 def masked_cross_entropy(
@@ -203,6 +226,8 @@ def train_epoch(
     grad_accum_steps: int = 1,
     scheduler: Any | None = None,
     max_batches: int | None = None,
+    recycle_rounds: int = 2,
+    self_conditioning_probability: float = 0.5,
 ) -> float:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -213,7 +238,16 @@ def train_epoch(
         if max_batches is not None and step >= max_batches:
             break
         p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
-        logits, pair_mask = model(p1_batch, p2_batch)
+
+        step_recycle_rounds = resolve_train_recycle_rounds(
+            recycle_rounds=recycle_rounds,
+            self_conditioning_probability=self_conditioning_probability,
+        )
+        logits, pair_mask = model(
+            p1_batch,
+            p2_batch,
+            recycle_rounds=step_recycle_rounds,
+        )
         valid_mask = pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
         raw_loss = masked_cross_entropy(
             logits,
@@ -248,9 +282,10 @@ def evaluate_epoch(
     device: torch.device,
     contact_threshold: float,
     distance_bin_start: float,
-    distance_bin_width: float,
-    distance_bin_count: int = 36,
+    distance_bin_end: float,
+    distance_bin_count: int = 64,
     max_batches: int | None = None,
+    recycle_rounds: int = 2,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -260,7 +295,7 @@ def evaluate_epoch(
     n_contact_bins = contact_bin_count(
         contact_threshold,
         distance_bin_start,
-        distance_bin_width,
+        distance_bin_end,
         distance_bin_count,
     )
 
@@ -269,7 +304,11 @@ def evaluate_epoch(
             if max_batches is not None and step >= max_batches:
                 break
             p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
-            logits, pair_mask = model(p1_batch, p2_batch)
+            logits, pair_mask = model(
+                p1_batch,
+                p2_batch,
+                recycle_rounds=max(1, int(recycle_rounds)),
+            )
             valid_mask = (
                 pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
             )
@@ -349,8 +388,10 @@ def main(args: DictConfig):
         center_coordinates=args.data.center_coordinates,
         random_rotation=args.data.random_rotation,
         distance_bin_start=args.data.distance_bin_start,
-        distance_bin_width=args.data.distance_bin_width,
+        distance_bin_end=args.data.distance_bin_end,
         distance_bin_count=args.data.distance_bin_count,
+        crop_size=args.data.crop_size,
+        contact_threshold=args.data.contact_threshold,
     )
     train_dataset, test_dataset = create_balanced_split_datasets(
         full_dataset,
@@ -481,6 +522,8 @@ def main(args: DictConfig):
             max_grad_norm=float(args.optimizer.max_grad_norm),
             grad_accum_steps=max(1, int(args.optimizer.grad_accum_steps)),
             scheduler=scheduler,
+            recycle_rounds=int(args.recycle_rounds),
+            self_conditioning_probability=float(args.self_conditioning_probability),
         )
 
         test_iter = test_loader
@@ -499,8 +542,9 @@ def main(args: DictConfig):
             device=device,
             contact_threshold=args.data.contact_threshold,
             distance_bin_start=args.data.distance_bin_start,
-            distance_bin_width=args.data.distance_bin_width,
+            distance_bin_end=args.data.distance_bin_end,
             distance_bin_count=args.data.distance_bin_count,
+            recycle_rounds=int(args.recycle_rounds),
         )
 
         if DIST_WRAPPER.rank == 0 and epoch_progress is not None:

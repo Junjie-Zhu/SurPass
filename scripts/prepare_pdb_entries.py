@@ -306,7 +306,12 @@ class PDBDataSelector:
         if self.worst_resolution is not None:
             resolution_map = self._parse_resolution_map()
             df["resolution"] = df["pdb"].map(resolution_map)
-            df = df.loc[df["resolution"].notna() & (df["resolution"] <= self.worst_resolution)]
+            resolution_mask = df["resolution"].notna() & (df["resolution"] <= self.worst_resolution)
+            if "experiment_type" in df.columns:
+                nmr_mask = df["experiment_type"].eq("nmr")
+                df = df.loc[resolution_mask | nmr_mask]
+            else:
+                df = df.loc[resolution_mask]
 
         if self.remove_pdb_unavailable:
             unavailable = self._parse_unavailable_pdbs()
@@ -530,15 +535,11 @@ def load_uniprot_fasta_by_accession(path: str) -> Dict[str, str]:
     return fasta_by_accession
 
 
-def extract_pdb_features(pdb_path: str, min_chain_length: int = 30, max_chain_length: int = 1024):
-    # only retain the first model
-    structure = strucio.load_structure(pdb_path)
-    try:
-        struc_depth = structure.stack_depth()
-        structure = structure[0]
-    except AttributeError:
-        struc_depth = 1
-
+def _extract_pdb_features_from_model(
+    structure,
+    min_chain_length: int = 30,
+    max_chain_length: int = 1024,
+):
     atom14_positions = []
     atom14_mask = []
     residue_index = []
@@ -613,6 +614,48 @@ def extract_pdb_features(pdb_path: str, min_chain_length: int = 30, max_chain_le
     return pdb_dict
 
 
+def extract_pdb_features(
+    pdb_path: str,
+    min_chain_length: int = 30,
+    max_chain_length: int = 1024,
+    process_all_model: bool = False,
+):
+    structure = strucio.load_structure(pdb_path)
+    try:
+        struc_depth = structure.stack_depth()
+    except AttributeError:
+        struc_depth = 1
+        if process_all_model:
+            return {
+                1: _extract_pdb_features_from_model(
+                    structure,
+                    min_chain_length=min_chain_length,
+                    max_chain_length=max_chain_length,
+                )
+            }
+        return _extract_pdb_features_from_model(
+            structure,
+            min_chain_length=min_chain_length,
+            max_chain_length=max_chain_length,
+        )
+
+    if process_all_model:
+        return {
+            model_idx + 1: _extract_pdb_features_from_model(
+                structure[model_idx],
+                min_chain_length=min_chain_length,
+                max_chain_length=max_chain_length,
+            )
+            for model_idx in range(struc_depth)
+        }
+
+    return _extract_pdb_features_from_model(
+        structure[0],
+        min_chain_length=min_chain_length,
+        max_chain_length=max_chain_length,
+    )
+
+
 def identify_interacting_chains(
     pdb_dict: Dict[str, Dict[str, np.ndarray]],
 ):
@@ -673,6 +716,7 @@ class PDBVerifier:
         num_workers: int = 32,
         chunksize: int = 32,
         overwrite: bool = False,
+        process_all_model: bool = True,
     ):
         self.root_dir = Path(root_dir)
         self.num_workers = num_workers
@@ -680,6 +724,7 @@ class PDBVerifier:
         self.max_chain_length = max_chain_length
         self.chunksize = chunksize
         self.overwrite = overwrite
+        self.process_all_model = process_all_model
         if format == "pdb":
             self.base_url = "https://files.rcsb.org/download/"
             self.extension = ".pdb"
@@ -738,7 +783,7 @@ class PDBVerifier:
 
     def verify_multiple_pdbs(self, pdb_ids: List[str]):
         os.makedirs(self.root_dir / "processed", exist_ok=True)  # save processed chain features
-        os.makedirs(self.root_dir / "labels_full", exist_ok=True)  # save pairwise labels as separate files
+        os.makedirs(self.root_dir / "labels", exist_ok=True)  # save pairwise labels as separate files
         pair_records: List[Dict[str, str]] = []
         error_records: List[Dict[str, str]] = []
         chain_fasta_records: Dict[str, str] = {}
@@ -804,47 +849,67 @@ class PDBVerifier:
             return None
 
         try:
-            pdb_dict = extract_pdb_features(pdb_path, min_chain_length=self.min_chain_length, max_chain_length=self.max_chain_length)
-            valid_combinations = identify_interacting_chains(pdb_dict)
-            required_chains = np.unique(np.array(valid_combinations["chain1"] + valid_combinations["chain2"]))
+            extracted_features = extract_pdb_features(
+                pdb_path,
+                min_chain_length=self.min_chain_length,
+                max_chain_length=self.max_chain_length,
+                process_all_model=self.process_all_model,
+            )
             chain_fasta_records: List[Tuple[str, str]] = []
-            for chain_id in required_chains:
-                # save chain dict to pickle
-                chain_dict = pdb_dict[chain_id]
-                chain_name = f"{pdb_id}_{chain_id}"
-                with open(self.root_dir / "processed" / f"{chain_name}.pkl", "wb") as f:
-                    pickle.dump(chain_dict, f)
-                chain_fasta_records.append((chain_name, chain_dict["resseq"]))
-
-            # save pairwise labels and gather verified combinations
             verified_pairs: List[Dict[str, str]] = []
-            for chain1, chain2, pairwise_dist, pairwise_mask in zip(
-                valid_combinations["chain1"],
-                valid_combinations["chain2"],
-                valid_combinations["pairwise_dist"],
-                valid_combinations["pairwise_mask"],
-            ):
-                chain1_name = f"{pdb_id}_{chain1}"
-                chain2_name = f"{pdb_id}_{chain2}"
-                pair_name = f"{chain1_name}__{chain2_name}"
-                label_path = self.root_dir / "labels" / f"{pair_name}.pkl"
-                with open(label_path, "wb") as f:
-                    pickle.dump(
-                        {
-                            "pairwise_dist": pairwise_dist.astype(np.float32),
-                            "pairwise_mask": pairwise_mask.astype(bool),
-                        },
-                        f,
-                    )
 
-                verified_pairs.append(
-                    {
+            if self.process_all_model:
+                model_feature_items = extracted_features.items()
+            else:
+                model_feature_items = [(1, extracted_features)]
+
+            for model_id, pdb_dict in model_feature_items:
+                valid_combinations = identify_interacting_chains(pdb_dict)
+                required_chains = np.unique(np.array(valid_combinations["chain1"] + valid_combinations["chain2"]))
+                for chain_id in required_chains:
+                    # save chain dict to pickle
+                    chain_dict = pdb_dict[chain_id]
+                    if self.process_all_model:
+                        chain_name = f"{pdb_id}_{model_id}_{chain_id}"
+                    else:
+                        chain_name = f"{pdb_id}_{chain_id}"
+                    with open(self.root_dir / "processed" / f"{chain_name}.pkl", "wb") as f:
+                        pickle.dump(chain_dict, f)
+                    chain_fasta_records.append((chain_name, chain_dict["resseq"]))
+
+                # save pairwise labels and gather verified combinations
+                for chain1, chain2, pairwise_dist, pairwise_mask in zip(
+                    valid_combinations["chain1"],
+                    valid_combinations["chain2"],
+                    valid_combinations["pairwise_dist"],
+                    valid_combinations["pairwise_mask"],
+                ):
+                    if self.process_all_model:
+                        chain1_name = f"{pdb_id}_{model_id}_{chain1}"
+                        chain2_name = f"{pdb_id}_{model_id}_{chain2}"
+                    else:
+                        chain1_name = f"{pdb_id}_{chain1}"
+                        chain2_name = f"{pdb_id}_{chain2}"
+                    pair_name = f"{chain1_name}__{chain2_name}"
+                    label_path = self.root_dir / "labels" / f"{pair_name}.pkl"
+                    with open(label_path, "wb") as f:
+                        pickle.dump(
+                            {
+                                "pairwise_dist": pairwise_dist.astype(np.float32),
+                                "pairwise_mask": pairwise_mask.astype(bool),
+                            },
+                            f,
+                        )
+
+                    pair_record = {
                         "pdb": pdb_id,
                         "chain1": chain1_name,
                         "chain2": chain2_name,
                         "label_path": str(label_path),
                     }
-                )
+                    if self.process_all_model:
+                        pair_record["model_id"] = model_id
+                    verified_pairs.append(pair_record)
             return {
                 "pairs": verified_pairs,
                 "chain_fasta_records": chain_fasta_records,
@@ -1021,10 +1086,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-e",
         "--experiment-types",
-        default="diffraction,EM",
-        help="Comma-separated experiment types, e.g. diffraction,EM.",
+        default="diffraction,EM,NMR",
+        help="Comma-separated experiment types, e.g. diffraction,EM,NMR.",
     )
     parser.add_argument("-R", "--worst-resolution", type=float, default=5.0, help="Maximum allowed resolution.")
+    parser.add_argument(
+        "--first-model-only",
+        dest="process_all_model",
+        action="store_false",
+        help="Only process the first structure model and keep legacy chain names.",
+    )
+    parser.set_defaults(process_all_model=True)
     parser.add_argument("-c", "--coverage", type=float, default=0.8, help="MMSeqs2 coverage.")
     parser.add_argument(
         "-t",
@@ -1047,90 +1119,90 @@ def main(args: argparse.Namespace):
     root_dir = Path(args.root_dir)
     experiment_types = _parse_experiment_types(args.experiment_types)
 
-    # # first retrieve metadata
-    # retriever = DataRetriever(root_dir=str(root_dir), num_workers=args.workers)
-    # retriever.download_metadata()
-    # retriever.unzip_metadata()
+    # first retrieve metadata
+    retriever = DataRetriever(root_dir=str(root_dir), num_workers=args.workers)
+    retriever.download_metadata()
+    retriever.unzip_metadata()
 
-    # # next process test set ppi
-    # test_set_data = pd.read_csv(args.benchmark_tsv, sep="\t")
-    # test_set_pairs = [pair.split("_") for pair in test_set_data["Protein pairs"]]
-    # test_set_labels = test_set_data["Category"].tolist()
-    # unique_uniprot_ids = np.unique(np.array(test_set_pairs).flatten())
-    # print(f"Number of unique uniprot ids in test set: {len(unique_uniprot_ids)}")
+    # next process test set ppi
+    test_set_data = pd.read_csv(args.benchmark_tsv, sep="\t")
+    test_set_pairs = [pair.split("_") for pair in test_set_data["Protein pairs"]]
+    test_set_labels = test_set_data["Category"].tolist()
+    unique_uniprot_ids = np.unique(np.array(test_set_pairs).flatten())
+    print(f"Number of unique uniprot ids in test set: {len(unique_uniprot_ids)}")
 
-    # # step 3: get fasta for test set uniprot ids
-    # test_set_fasta_path = root_dir / "test_set.fasta"
-    # raw_uniprot_fasta = load_uniprot_fasta_by_accession(args.uniprot_fasta)
-    # test_set_fasta: Dict[str, str] = {}
-    # for uniprot_id in unique_uniprot_ids:
-    #     query_id = str(uniprot_id).strip()
-    #     sequence = raw_uniprot_fasta.get(query_id, "")
-    #     if not sequence and "-" in query_id:
-    #         sequence = raw_uniprot_fasta.get(query_id.split("-", maxsplit=1)[0], "")
-    #     test_set_fasta[query_id] = sequence
+    # step 3: get fasta for test set uniprot ids
+    test_set_fasta_path = root_dir / "test_set.fasta"
+    raw_uniprot_fasta = load_uniprot_fasta_by_accession(args.uniprot_fasta)
+    test_set_fasta: Dict[str, str] = {}
+    for uniprot_id in unique_uniprot_ids:
+        query_id = str(uniprot_id).strip()
+        sequence = raw_uniprot_fasta.get(query_id, "")
+        if not sequence and "-" in query_id:
+            sequence = raw_uniprot_fasta.get(query_id.split("-", maxsplit=1)[0], "")
+        test_set_fasta[query_id] = sequence
 
-    # missing_items = []
-    # with open(test_set_fasta_path, "w") as f:
-    #     for uniprot_id, sequence in tqdm(test_set_fasta.items(), desc="Writing test set FASTA", unit="sequence"):
-    #         if sequence:
-    #             f.write(f">{uniprot_id}\n{sequence}\n")
-    #         else:
-    #             missing_items.append(uniprot_id)
-    # print(f"Number of missing items in test set: {len(missing_items)}")
-    # print(f"Test set FASTA written: {test_set_fasta_path}")
+    missing_items = []
+    with open(test_set_fasta_path, "w") as f:
+        for uniprot_id, sequence in tqdm(test_set_fasta.items(), desc="Writing test set FASTA", unit="sequence"):
+            if sequence:
+                f.write(f">{uniprot_id}\n{sequence}\n")
+            else:
+                missing_items.append(uniprot_id)
+    print(f"Number of missing items in test set: {len(missing_items)}")
+    print(f"Test set FASTA written: {test_set_fasta_path}")
 
-    # # remove unavailable pairs from test_set_pairs and save
-    # missing_pair_indices = []
-    # for i, pair in enumerate(test_set_pairs):
-    #     if pair[0] in missing_items or pair[1] in missing_items:
-    #         missing_pair_indices.append(i)
-    # test_set_pairs = ["_".join(pair) for i, pair in enumerate(test_set_pairs) if i not in missing_pair_indices]
-    # test_set_labels = [label.strip() == "positive" for i, label in enumerate(test_set_labels) if i not in missing_pair_indices]
-    # test_set_data = pd.DataFrame({"Protein pairs": test_set_pairs, "Category": test_set_labels})
-    # test_set_data.to_csv(root_dir / "test_set.tsv", sep="\t", index=False)
-    # print(f"Test set data written: {root_dir / 'test_set.tsv'} ({len(test_set_data)} pairs)")
+    # remove unavailable pairs from test_set_pairs and save
+    missing_pair_indices = []
+    for i, pair in enumerate(test_set_pairs):
+        if pair[0] in missing_items or pair[1] in missing_items:
+            missing_pair_indices.append(i)
+    test_set_pairs = ["_".join(pair) for i, pair in enumerate(test_set_pairs) if i not in missing_pair_indices]
+    test_set_labels = [label.strip() == "positive" for i, label in enumerate(test_set_labels) if i not in missing_pair_indices]
+    test_set_data = pd.DataFrame({"Protein pairs": test_set_pairs, "Category": test_set_labels})
+    test_set_data.to_csv(root_dir / "test_set.tsv", sep="\t", index=False)
+    print(f"Test set data written: {root_dir / 'test_set.tsv'} ({len(test_set_data)} pairs)")
 
-    # # step 4: process pdb chain sequences
-    # selector = PDBDataSelector(
-    #     root_dir=str(root_dir),
-    #     min_length=args.min_chain_len,
-    #     max_length=args.max_chain_len,
-    #     molecule_type="protein",
-    #     experiment_types=experiment_types,
-    #     oligomeric_min=2,  # at least 2 chains
-    #     worst_resolution=args.worst_resolution,
-    #     num_workers=args.workers,
-    # )
-    # _, pdb_subset_table_path, pdb_subset_fasta_path = selector.process_pdb_chain_sequences(
-    #     seqres_filename="pdb_seqres.txt",
-    #     output_table_filename="pdb_seqres.subset.txt",
-    #     output_fasta_filename="pdb_seqres.subset.fasta",
-    # )
+    # step 4: process pdb chain sequences
+    selector = PDBDataSelector(
+        root_dir=str(root_dir),
+        min_length=args.min_chain_len,
+        max_length=args.max_chain_len,
+        molecule_type="protein",
+        experiment_types=experiment_types,
+        oligomeric_min=2,  # at least 2 chains
+        worst_resolution=args.worst_resolution,
+        num_workers=args.workers,
+    )
+    _, pdb_subset_table_path, pdb_subset_fasta_path = selector.process_pdb_chain_sequences(
+        seqres_filename="pdb_seqres.txt",
+        output_table_filename="pdb_seqres.subset.txt",
+        output_fasta_filename="pdb_seqres.subset.fasta",
+    )
 
-    # # step 5: run MMSeqs2 search (test set -> pdb subset)
-    # mmseqs_result_path = selector.run_mmseqs_cross_set_search(
-    #     query_fasta=str(test_set_fasta_path),
-    #     target_fasta=pdb_subset_fasta_path,
-    #     output_prefix=args.mmseqs_prefix,
-    #     min_seq_id=args.identity_threshold,
-    #     coverage=args.coverage,
-    # )
+    # step 5: run MMSeqs2 search (test set -> pdb subset)
+    mmseqs_result_path = selector.run_mmseqs_cross_set_search(
+        query_fasta=str(test_set_fasta_path),
+        target_fasta=pdb_subset_fasta_path,
+        output_prefix=args.mmseqs_prefix,
+        min_seq_id=args.identity_threshold,
+        coverage=args.coverage,
+    )
 
-    # # step 6: filter out pdb chains of high similarity against test set
-    # _, dissimilar_table_path, _ = selector.filter_dissimilar_pdb_chains(
-    #     pdb_subset_table=pdb_subset_table_path,
-    #     mmseqs_tsv=mmseqs_result_path,
-    #     identity_threshold=args.identity_threshold,
-    #     output_table_filename="pdb_seqres.dissimilar.txt",
-    #     output_fasta_filename="pdb_seqres.dissimilar.fasta",
-    # )
+    # step 6: filter out pdb chains of high similarity against test set
+    _, dissimilar_table_path, _ = selector.filter_dissimilar_pdb_chains(
+        pdb_subset_table=pdb_subset_table_path,
+        mmseqs_tsv=mmseqs_result_path,
+        identity_threshold=args.identity_threshold,
+        output_table_filename="pdb_seqres.dissimilar.txt",
+        output_fasta_filename="pdb_seqres.dissimilar.fasta",
+    )
 
-    # # step 7: gather potential ppi (same pdb id, same taxon source)
-    # ppi_pairs, _ = selector.gather_potential_ppi(
-    #     pdb_chain_table=dissimilar_table_path,
-    #     output_filename="pdb_seqres.potential_ppi.tsv",
-    # )
+    # step 7: gather potential ppi (same pdb id, same taxon source)
+    ppi_pairs, _ = selector.gather_potential_ppi(
+        pdb_chain_table=dissimilar_table_path,
+        output_filename="pdb_seqres.potential_ppi.tsv",
+    )
 
     ppi_pairs = pd.read_csv(root_dir / "pdb_seqres.potential_ppi.tsv", sep="\t")
 
@@ -1143,71 +1215,72 @@ def main(args: argparse.Namespace):
         num_workers=args.workers,
         chunksize=args.chunksize,
         overwrite=args.overwrite_pdb,
+        process_all_model=args.process_all_model,
     )
     pdb_id_unique = ppi_pairs["pdb"].unique().tolist()
-    # pdb_downloader.download_multiple_pdbs(pdb_id_unique)
+    pdb_downloader.download_multiple_pdbs(pdb_id_unique)
 
     # step 9: verify true positive pairs from pdb
     verified_pairs, verified_pairs_path = pdb_downloader.verify_multiple_pdbs(pdb_id_unique)
     print(f"Step 9 complete: {len(verified_pairs)} verified PPI pairs saved to {verified_pairs_path}")
 
-    # # step 10: cluster processed training protein chains
-    # cluster_fasta_path = root_dir / "processed_chains.fasta"
-    # verified_pairs_path = root_dir / "verified_pdb_pairs.tsv"
-    # if not cluster_fasta_path.exists():
-    #     raise FileNotFoundError(f"Cannot find training FASTA for step 10: {cluster_fasta_path}")
-    # if not verified_pairs_path.exists():
-    #     raise FileNotFoundError(f"Cannot find verified pair table for step 10: {verified_pairs_path}")
+    # step 10: cluster processed training protein chains
+    cluster_fasta_path = root_dir / "processed_chains.fasta"
+    verified_pairs_path = root_dir / "verified_pdb_pairs.tsv"
+    if not cluster_fasta_path.exists():
+        raise FileNotFoundError(f"Cannot find training FASTA for step 10: {cluster_fasta_path}")
+    if not verified_pairs_path.exists():
+        raise FileNotFoundError(f"Cannot find verified pair table for step 10: {verified_pairs_path}")
 
-    # cluster90_outputs = run_mmseqs_cluster(
-    #     fasta_path=str(cluster_fasta_path),
-    #     output_prefix="processed_chains_c90_cov90",
-    #     min_seq_id=0.9,
-    #     coverage=0.9,
-    #     cov_mode=0,
-    #     threads=32,
-    #     overwrite=False,
-    # )
-    # cluster30_outputs = run_mmseqs_cluster(
-    #     fasta_path=str(cluster_fasta_path),
-    #     output_prefix="processed_chains_c30",
-    #     min_seq_id=0.3,
-    #     coverage=0.0,
-    #     cov_mode=0,
-    #     threads=32,
-    #     overwrite=False,
-    # )
+    cluster90_outputs = run_mmseqs_cluster(
+        fasta_path=str(cluster_fasta_path),
+        output_prefix="processed_chains_c90_cov90",
+        min_seq_id=0.9,
+        coverage=0.9,
+        cov_mode=0,
+        threads=32,
+        overwrite=False,
+    )
+    cluster30_outputs = run_mmseqs_cluster(
+        fasta_path=str(cluster_fasta_path),
+        output_prefix="processed_chains_c30",
+        min_seq_id=0.3,
+        coverage=0.0,
+        cov_mode=0,
+        threads=32,
+        overwrite=False,
+    )
 
-    # member_to_rep90, _ = parse_mmseqs_cluster_tsv(cluster90_outputs["cluster_tsv"])
-    # member_to_rep30, _ = parse_mmseqs_cluster_tsv(cluster30_outputs["cluster_tsv"])
+    member_to_rep90, _ = parse_mmseqs_cluster_tsv(cluster90_outputs["cluster_tsv"])
+    member_to_rep30, _ = parse_mmseqs_cluster_tsv(cluster30_outputs["cluster_tsv"])
 
-    # homodimer_path = root_dir / "verified_homodimers.tsv"
-    # heterodimer_path = root_dir / "verified_heterodimers.tsv"
-    # df_homo, df_hetero = split_homodimer_heterodimer_pairs(
-    #     verified_pairs_tsv=str(verified_pairs_path),
-    #     member_to_rep90=member_to_rep90,
-    #     output_homo_tsv=str(homodimer_path),
-    #     output_hetero_tsv=str(heterodimer_path),
-    # )
+    homodimer_path = root_dir / "verified_homodimers.tsv"
+    heterodimer_path = root_dir / "verified_heterodimers.tsv"
+    df_homo, df_hetero = split_homodimer_heterodimer_pairs(
+        verified_pairs_tsv=str(verified_pairs_path),
+        member_to_rep90=member_to_rep90,
+        output_homo_tsv=str(homodimer_path),
+        output_hetero_tsv=str(heterodimer_path),
+    )
 
-    # heterodimer_clustered_path = root_dir / "verified_heterodimers.clustered.tsv"
-    # heterodimer_duplicate_path = root_dir / "verified_heterodimers.duplicate.tsv"
-    # df_hetero_clustered = cluster_heterodimer_ppi_pairs(
-    #     heterodimer_tsv=str(heterodimer_path),
-    #     member_to_rep30=member_to_rep30,
-    #     output_clustered_tsv=str(heterodimer_clustered_path),
-    # )
-    # df_hetero_duplicate = cluster_heterodimer_ppi_pairs(
-    #     heterodimer_tsv=str(heterodimer_path),
-    #     member_to_rep30=member_to_rep90,
-    #     output_clustered_tsv=str(heterodimer_duplicate_path),
-    # )
-    # print(
-    #     "Step 10 complete: "
-    #     f"{len(df_homo)} homodimers, {len(df_hetero)} heterodimers, "
-    #     f"{df_hetero_clustered['ppi_cluster_id'].nunique() if not df_hetero_clustered.empty else 0} heterodimer clusters."
-    #     f"{df_hetero_duplicate['ppi_cluster_id'].nunique() if not df_hetero_duplicate.empty else 0} heterodimer duplicate clusters."
-    # )
+    heterodimer_clustered_path = root_dir / "verified_heterodimers.clustered.tsv"
+    heterodimer_duplicate_path = root_dir / "verified_heterodimers.duplicate.tsv"
+    df_hetero_clustered = cluster_heterodimer_ppi_pairs(
+        heterodimer_tsv=str(heterodimer_path),
+        member_to_rep30=member_to_rep30,
+        output_clustered_tsv=str(heterodimer_clustered_path),
+    )
+    df_hetero_duplicate = cluster_heterodimer_ppi_pairs(
+        heterodimer_tsv=str(heterodimer_path),
+        member_to_rep30=member_to_rep90,
+        output_clustered_tsv=str(heterodimer_duplicate_path),
+    )
+    print(
+        "Step 10 complete: "
+        f"{len(df_homo)} homodimers, {len(df_hetero)} heterodimers, "
+        f"{df_hetero_clustered['ppi_cluster_id'].nunique() if not df_hetero_clustered.empty else 0} heterodimer clusters."
+        f"{df_hetero_duplicate['ppi_cluster_id'].nunique() if not df_hetero_duplicate.empty else 0} heterodimer duplicate clusters."
+    )
 
 if __name__ == "__main__":
     main(build_arg_parser().parse_args())

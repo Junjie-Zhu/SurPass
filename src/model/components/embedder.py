@@ -146,6 +146,7 @@ class ResidueEmbedder(nn.Module):
         residue_position: torch.Tensor,
         chain_index: torch.Tensor,
         mask: torch.Tensor,
+        pairwise_dist_bins: torch.Tensor | None = None,
         **kwargs,
     ):
         plm_emb = self.plm_embedder(plm_emb)
@@ -163,11 +164,24 @@ class ResidueEmbedder(nn.Module):
         rel_pos_emb = relative_position_encoding(
             token_index, residue_index, chain_index, mask, self.r_max
         )
-        pairwise_dist_emb = bin_pairwise_distances(
-            residue_position, 
-            self.xt_pair_dist_min,
-            self.xt_pair_dist_max, 
-            self.xt_pair_dist_dim)
+        if pairwise_dist_bins is None:
+            pairwise_dist_emb = bin_pairwise_distances(
+                residue_position,
+                self.xt_pair_dist_min,
+                self.xt_pair_dist_max,
+                self.xt_pair_dist_dim,
+            )
+        else:
+            expected_shape = (*residue_position.shape[:2], residue_position.shape[1], self.xt_pair_dist_dim)
+            if tuple(pairwise_dist_bins.shape) != expected_shape:
+                raise ValueError(
+                    f"pairwise_dist_bins shape {tuple(pairwise_dist_bins.shape)} "
+                    f"does not match expected shape {expected_shape}."
+                )
+            pairwise_dist_emb = pairwise_dist_bins.to(
+                device=residue_position.device,
+                dtype=residue_position.dtype,
+            )
 
         single_repr = self.single_out(
             torch.cat([plm_emb, residue_type_emb, residue_index_emb, chain_break_emb], dim=-1)
