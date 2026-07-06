@@ -2,6 +2,7 @@ import pickle
 import random
 from math import prod
 from pathlib import Path
+from typing import Sequence
 
 import pandas as pd
 import torch
@@ -135,17 +136,48 @@ class PepoTrainDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
+        return self.get_positive_item(idx)
+
+    def _sample_row(self, idx):
         cluster_id = self.items[idx]
         cluster_rows = self.cluster_to_rows[cluster_id]
-        row = cluster_rows.iloc[random.randrange(len(cluster_rows))]
+        return cluster_rows.iloc[random.randrange(len(cluster_rows))]
 
+    def _load_pair_features(self, row) -> tuple[dict, dict]:
         p1_features = self._process_complex(self._load_chain_features(row["chain1"]))
         p2_features = self._process_complex(self._load_chain_features(row["chain2"]))
+        return p1_features, p2_features
+
+    def get_positive_item(self, idx):
+        row = self._sample_row(idx)
+        p1_features, p2_features = self._load_pair_features(row)
         label_path = self.root_dir / "labels" / Path(row["label_path"]).name
         label_bins, label_mask = self._load_pair_labels(
             label_path, p1_features["mask"].shape[0], p2_features["mask"].shape[0]
         )
 
+        sample = (p1_features, p2_features, label_bins, label_mask)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
+
+    def get_negative_item(self, p1_idx: int, p2_idx: int):
+        if self.items[p1_idx] == self.items[p2_idx]:
+            raise ValueError("Negative samples must use chains from different PPI clusters.")
+
+        p1_row = self._sample_row(p1_idx)
+        p2_row = self._sample_row(p2_idx)
+        p1_features = self._process_complex(self._load_chain_features(p1_row["chain1"]))
+        p2_features = self._process_complex(self._load_chain_features(p2_row["chain2"]))
+
+        label_mask = p1_features["mask"][:, None].to(dtype=torch.bool) & p2_features[
+            "mask"
+        ][None, :].to(dtype=torch.bool)
+        label_bins = torch.full(
+            label_mask.shape,
+            fill_value=self.distance_bin_count - 1,
+            dtype=torch.long,
+        )
         sample = (p1_features, p2_features, label_bins, label_mask)
         if self.transform is not None:
             sample = self.transform(sample)
@@ -205,14 +237,7 @@ class PepoTrainDataset(Dataset):
             bin_count=self.distance_bin_count,
         )
 
-        total_len = protein_len + peptide_len
-        full_bins = torch.zeros((total_len, total_len), dtype=torch.long)
-        full_mask = torch.zeros((total_len, total_len), dtype=torch.bool)
-        full_bins[:protein_len, protein_len:] = cross_bins
-        full_bins[protein_len:, :protein_len] = cross_bins.T
-        full_mask[:protein_len, protein_len:] = pairwise_mask
-        full_mask[protein_len:, :protein_len] = pairwise_mask.T
-        return full_bins, full_mask
+        return cross_bins, pairwise_mask
 
     @staticmethod
     def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
@@ -304,3 +329,36 @@ class PepoTrainDataset(Dataset):
             "atom14_positions": residue_features["atom14_positions"],
             "atom14_mask": residue_features["atom14_mask"],
         }
+
+
+class BalancedClusterDataset(Dataset):
+    def __init__(
+        self,
+        dataset: PepoTrainDataset,
+        indices: Sequence[int] | None = None,
+        distance_bin_count: int = DISTANCE_BIN_NUM,
+        negative_ratio: int = 1,
+    ):
+        self.dataset = dataset
+        self.indices = list(range(len(dataset))) if indices is None else list(indices)
+        self.distance_bin_count = int(distance_bin_count)
+        self.negative_ratio = int(negative_ratio)
+        if self.negative_ratio < 0:
+            raise ValueError("negative_ratio must be non-negative.")
+        if self.negative_ratio > 0 and len(self.indices) < 2:
+            raise ValueError("At least two PPI clusters are required to create negatives.")
+
+    def __len__(self):
+        return len(self.indices) * (1 + self.negative_ratio)
+
+    def __getitem__(self, idx):
+        positive_count = len(self.indices)
+        if idx < positive_count:
+            return self.dataset[self.indices[idx]]
+
+        negative_idx = idx - positive_count
+        source_pos = negative_idx % positive_count
+        source_idx = self.indices[source_pos]
+        candidate_indices = [i for i in self.indices if i != source_idx]
+        target_idx = random.choice(candidate_indices)
+        return self.dataset.get_negative_item(source_idx, target_idx)

@@ -646,6 +646,15 @@ def identify_interacting_chains(
         if pdist_min > 8.0:
             continue
 
+        # get the full pairwise distance map
+        cb_pos = np.concatenate([chain1_cb_pos, chain2_cb_pos], axis=0)
+        cb_mask = np.concatenate([chain1_cb_mask, chain2_cb_mask], axis=0)
+        pairwise_dist = np.linalg.norm(
+            cb_pos[:, None, :] - cb_pos[None, :, :], 
+            axis=2
+        )
+        pairwise_mask = cb_mask[:, None] & cb_mask[None, :]
+
         valid_combinations["chain1"].append(chain1)
         valid_combinations["chain2"].append(chain2)
         valid_combinations["pairwise_dist"].append(pairwise_dist)  # save the full pairwise distance map
@@ -729,7 +738,7 @@ class PDBVerifier:
 
     def verify_multiple_pdbs(self, pdb_ids: List[str]):
         os.makedirs(self.root_dir / "processed", exist_ok=True)  # save processed chain features
-        os.makedirs(self.root_dir / "labels", exist_ok=True)  # save pairwise labels as separate files
+        os.makedirs(self.root_dir / "labels_full", exist_ok=True)  # save pairwise labels as separate files
         pair_records: List[Dict[str, str]] = []
         error_records: List[Dict[str, str]] = []
         chain_fasta_records: Dict[str, str] = {}
@@ -1123,82 +1132,82 @@ def main(args: argparse.Namespace):
     #     output_filename="pdb_seqres.potential_ppi.tsv",
     # )
 
-    # ppi_pairs = pd.read_csv(root_dir / "pdb_seqres.potential_ppi.tsv", sep="\t")
+    ppi_pairs = pd.read_csv(root_dir / "pdb_seqres.potential_ppi.tsv", sep="\t")
 
-    # # step 8: download unique pdb files
-    # pdb_downloader = PDBVerifier(
-    #     root_dir=str(root_dir),
-    #     format=args.pdb_format,
-    #     min_chain_length=args.min_chain_len,
-    #     max_chain_length=args.max_chain_len,
-    #     num_workers=args.workers,
-    #     chunksize=args.chunksize,
-    #     overwrite=args.overwrite_pdb,
+    # step 8: download unique pdb files
+    pdb_downloader = PDBVerifier(
+        root_dir=str(root_dir),
+        format=args.pdb_format,
+        min_chain_length=args.min_chain_len,
+        max_chain_length=args.max_chain_len,
+        num_workers=args.workers,
+        chunksize=args.chunksize,
+        overwrite=args.overwrite_pdb,
+    )
+    pdb_id_unique = ppi_pairs["pdb"].unique().tolist()
+    # pdb_downloader.download_multiple_pdbs(pdb_id_unique)
+
+    # step 9: verify true positive pairs from pdb
+    verified_pairs, verified_pairs_path = pdb_downloader.verify_multiple_pdbs(pdb_id_unique)
+    print(f"Step 9 complete: {len(verified_pairs)} verified PPI pairs saved to {verified_pairs_path}")
+
+    # # step 10: cluster processed training protein chains
+    # cluster_fasta_path = root_dir / "processed_chains.fasta"
+    # verified_pairs_path = root_dir / "verified_pdb_pairs.tsv"
+    # if not cluster_fasta_path.exists():
+    #     raise FileNotFoundError(f"Cannot find training FASTA for step 10: {cluster_fasta_path}")
+    # if not verified_pairs_path.exists():
+    #     raise FileNotFoundError(f"Cannot find verified pair table for step 10: {verified_pairs_path}")
+
+    # cluster90_outputs = run_mmseqs_cluster(
+    #     fasta_path=str(cluster_fasta_path),
+    #     output_prefix="processed_chains_c90_cov90",
+    #     min_seq_id=0.9,
+    #     coverage=0.9,
+    #     cov_mode=0,
+    #     threads=32,
+    #     overwrite=False,
     # )
-    # pdb_id_unique = ppi_pairs["pdb"].unique().tolist()
-    # # pdb_downloader.download_multiple_pdbs(pdb_id_unique)
+    # cluster30_outputs = run_mmseqs_cluster(
+    #     fasta_path=str(cluster_fasta_path),
+    #     output_prefix="processed_chains_c30",
+    #     min_seq_id=0.3,
+    #     coverage=0.0,
+    #     cov_mode=0,
+    #     threads=32,
+    #     overwrite=False,
+    # )
 
-    # # step 9: verify true positive pairs from pdb
-    # verified_pairs, verified_pairs_path = pdb_downloader.verify_multiple_pdbs(pdb_id_unique)
-    # print(f"Step 9 complete: {len(verified_pairs)} verified PPI pairs saved to {verified_pairs_path}")
+    # member_to_rep90, _ = parse_mmseqs_cluster_tsv(cluster90_outputs["cluster_tsv"])
+    # member_to_rep30, _ = parse_mmseqs_cluster_tsv(cluster30_outputs["cluster_tsv"])
 
-    # step 10: cluster processed training protein chains
-    cluster_fasta_path = root_dir / "processed_chains.fasta"
-    verified_pairs_path = root_dir / "verified_pdb_pairs.tsv"
-    if not cluster_fasta_path.exists():
-        raise FileNotFoundError(f"Cannot find training FASTA for step 10: {cluster_fasta_path}")
-    if not verified_pairs_path.exists():
-        raise FileNotFoundError(f"Cannot find verified pair table for step 10: {verified_pairs_path}")
+    # homodimer_path = root_dir / "verified_homodimers.tsv"
+    # heterodimer_path = root_dir / "verified_heterodimers.tsv"
+    # df_homo, df_hetero = split_homodimer_heterodimer_pairs(
+    #     verified_pairs_tsv=str(verified_pairs_path),
+    #     member_to_rep90=member_to_rep90,
+    #     output_homo_tsv=str(homodimer_path),
+    #     output_hetero_tsv=str(heterodimer_path),
+    # )
 
-    cluster90_outputs = run_mmseqs_cluster(
-        fasta_path=str(cluster_fasta_path),
-        output_prefix="processed_chains_c90_cov90",
-        min_seq_id=0.9,
-        coverage=0.9,
-        cov_mode=0,
-        threads=32,
-        overwrite=False,
-    )
-    cluster30_outputs = run_mmseqs_cluster(
-        fasta_path=str(cluster_fasta_path),
-        output_prefix="processed_chains_c30",
-        min_seq_id=0.3,
-        coverage=0.0,
-        cov_mode=0,
-        threads=32,
-        overwrite=False,
-    )
-
-    member_to_rep90, _ = parse_mmseqs_cluster_tsv(cluster90_outputs["cluster_tsv"])
-    member_to_rep30, _ = parse_mmseqs_cluster_tsv(cluster30_outputs["cluster_tsv"])
-
-    homodimer_path = root_dir / "verified_homodimers.tsv"
-    heterodimer_path = root_dir / "verified_heterodimers.tsv"
-    df_homo, df_hetero = split_homodimer_heterodimer_pairs(
-        verified_pairs_tsv=str(verified_pairs_path),
-        member_to_rep90=member_to_rep90,
-        output_homo_tsv=str(homodimer_path),
-        output_hetero_tsv=str(heterodimer_path),
-    )
-
-    heterodimer_clustered_path = root_dir / "verified_heterodimers.clustered.tsv"
-    heterodimer_duplicate_path = root_dir / "verified_heterodimers.duplicate.tsv"
-    df_hetero_clustered = cluster_heterodimer_ppi_pairs(
-        heterodimer_tsv=str(heterodimer_path),
-        member_to_rep30=member_to_rep30,
-        output_clustered_tsv=str(heterodimer_clustered_path),
-    )
-    df_hetero_duplicate = cluster_heterodimer_ppi_pairs(
-        heterodimer_tsv=str(heterodimer_path),
-        member_to_rep30=member_to_rep90,
-        output_clustered_tsv=str(heterodimer_duplicate_path),
-    )
-    print(
-        "Step 10 complete: "
-        f"{len(df_homo)} homodimers, {len(df_hetero)} heterodimers, "
-        f"{df_hetero_clustered['ppi_cluster_id'].nunique() if not df_hetero_clustered.empty else 0} heterodimer clusters."
-        f"{df_hetero_duplicate['ppi_cluster_id'].nunique() if not df_hetero_duplicate.empty else 0} heterodimer duplicate clusters."
-    )
+    # heterodimer_clustered_path = root_dir / "verified_heterodimers.clustered.tsv"
+    # heterodimer_duplicate_path = root_dir / "verified_heterodimers.duplicate.tsv"
+    # df_hetero_clustered = cluster_heterodimer_ppi_pairs(
+    #     heterodimer_tsv=str(heterodimer_path),
+    #     member_to_rep30=member_to_rep30,
+    #     output_clustered_tsv=str(heterodimer_clustered_path),
+    # )
+    # df_hetero_duplicate = cluster_heterodimer_ppi_pairs(
+    #     heterodimer_tsv=str(heterodimer_path),
+    #     member_to_rep30=member_to_rep90,
+    #     output_clustered_tsv=str(heterodimer_duplicate_path),
+    # )
+    # print(
+    #     "Step 10 complete: "
+    #     f"{len(df_homo)} homodimers, {len(df_hetero)} heterodimers, "
+    #     f"{df_hetero_clustered['ppi_cluster_id'].nunique() if not df_hetero_clustered.empty else 0} heterodimer clusters."
+    #     f"{df_hetero_duplicate['ppi_cluster_id'].nunique() if not df_hetero_duplicate.empty else 0} heterodimer duplicate clusters."
+    # )
 
 if __name__ == "__main__":
     main(build_arg_parser().parse_args())

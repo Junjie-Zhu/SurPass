@@ -16,6 +16,7 @@ data:
   center_coordinates: true
   random_rotation: true
   test_fraction: 0.2
+  negative_ratio: 1
   distance_bin_start: 2.0
   distance_bin_width: 0.5
   distance_bin_count: 36

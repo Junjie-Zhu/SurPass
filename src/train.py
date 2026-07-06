@@ -8,11 +8,11 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, random_split
+from torch.utils.data import Dataset, Subset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from src.data.dataset import PepoTrainDataset, collate_fn, get_dataloader
+from src.data.dataset import BalancedClusterDataset, PepoTrainDataset, collate_fn, get_dataloader
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
@@ -73,6 +73,47 @@ def split_dataset(
         train_len, test_len = 1, len(dataset) - 1
     generator = torch.Generator().manual_seed(seed)
     return random_split(dataset, [train_len, test_len], generator=generator)
+
+
+def _as_balanced_cluster_dataset(
+    dataset: Dataset,
+    negative_ratio: int,
+    distance_bin_count: int,
+) -> Dataset:
+    if negative_ratio <= 0:
+        return dataset
+    if isinstance(dataset, Subset) and isinstance(dataset.dataset, PepoTrainDataset):
+        if len(dataset.indices) < 2:
+            return dataset
+        return BalancedClusterDataset(
+            dataset.dataset,
+            indices=list(dataset.indices),
+            distance_bin_count=distance_bin_count,
+            negative_ratio=negative_ratio,
+        )
+    if isinstance(dataset, PepoTrainDataset):
+        if len(dataset) < 2:
+            return dataset
+        return BalancedClusterDataset(
+            dataset,
+            distance_bin_count=distance_bin_count,
+            negative_ratio=negative_ratio,
+        )
+    raise TypeError(f"Unsupported dataset type for negative sampling: {type(dataset)}")
+
+
+def create_balanced_split_datasets(
+    dataset: PepoTrainDataset,
+    test_fraction: float,
+    seed: int,
+    negative_ratio: int,
+    distance_bin_count: int,
+) -> tuple[Dataset, Dataset]:
+    train_dataset, test_dataset = split_dataset(dataset, test_fraction=test_fraction, seed=seed)
+    return (
+        _as_balanced_cluster_dataset(train_dataset, negative_ratio, distance_bin_count),
+        _as_balanced_cluster_dataset(test_dataset, negative_ratio, distance_bin_count),
+    )
 
 
 def contact_bin_count(
@@ -311,10 +352,12 @@ def main(args: DictConfig):
         distance_bin_width=args.data.distance_bin_width,
         distance_bin_count=args.data.distance_bin_count,
     )
-    train_dataset, test_dataset = split_dataset(
+    train_dataset, test_dataset = create_balanced_split_datasets(
         full_dataset,
         test_fraction=args.data.test_fraction,
         seed=args.seed,
+        negative_ratio=int(_cfg_get(args, "data.negative_ratio", default=1)),
+        distance_bin_count=args.data.distance_bin_count,
     )
     log_info(
         f"Loaded {len(full_dataset)} clusters: {len(train_dataset)} train, {len(test_dataset)} test"
