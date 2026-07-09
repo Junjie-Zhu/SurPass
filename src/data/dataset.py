@@ -507,11 +507,7 @@ class PepoTrainDataset(Dataset):
         )
 
         return {
-            "plm_emb": torch.zeros(
-                residue_features["residue_type"].shape[0],
-                1280,
-                dtype=torch.float32,
-            ),
+            "plm_emb": residue_features["plm_emb"],
             "residue_type": residue_features["residue_type"],
             "residue_index": residue_features["residue_index"],
             "residue_position": residue_features["cb_positions"],
