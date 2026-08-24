@@ -216,6 +216,36 @@ def _unpack_batch(step_batch, device):
     return p1_batch, p2_batch, labels
 
 
+def _set_progress_postfix(progress, **kwargs) -> None:
+    set_postfix = getattr(progress, "set_postfix", None)
+    if callable(set_postfix):
+        set_postfix(**kwargs)
+
+
+def resolve_cuda_device(local_rank: int, device_count: int) -> torch.device:
+    if device_count <= 0:
+        return torch.device("cpu")
+    index = 0 if device_count == 1 else int(local_rank)
+    if index >= device_count:
+        index = int(local_rank) % device_count
+    return torch.device(f"cuda:{index}")
+
+
+def resolve_dist_backend(use_cuda: bool) -> str:
+    return "nccl" if use_cuda else "gloo"
+
+
+def wrap_ddp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+    if device.type == "cuda":
+        return DDP(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=False,
+        )
+    return DDP(model, find_unused_parameters=False)
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader,
@@ -271,6 +301,7 @@ def train_epoch(
 
         total_loss += raw_loss.item()
         num_steps += 1
+        _set_progress_postfix(loader, loss=f"{raw_loss.item():.3f}")
 
     return total_loss / max(num_steps, 1)
 
@@ -328,6 +359,7 @@ def evaluate_epoch(
             num_steps += 1
             score_rows.append(scores.detach().cpu())
             target_rows.append(targets.detach().cpu())
+            _set_progress_postfix(loader, loss=f"{loss.item():.3f}")
 
     if score_rows:
         metrics = _binary_classification_metrics(
@@ -359,15 +391,16 @@ def main(args: DictConfig):
 
     use_cuda = torch.cuda.device_count() > 0
     if use_cuda:
-        device = torch.device(f"cuda:{DIST_WRAPPER.local_rank}")
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        device = resolve_cuda_device(DIST_WRAPPER.local_rank, torch.cuda.device_count())
         all_gpu_ids = ",".join(str(x) for x in range(torch.cuda.device_count()))
         devices = os.getenv("CUDA_VISIBLE_DEVICES", all_gpu_ids)
         torch.cuda.set_device(device)
     else:
         device = torch.device("cpu")
+        devices = "cpu"
 
-    if DIST_WRAPPER.world_size > 1:
+    if DIST_WRAPPER.world_size > 1 and not dist.is_initialized():
         if DIST_WRAPPER.rank == 0:
             log_info(
                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
@@ -377,7 +410,8 @@ def main(args: DictConfig):
             )
         timeout_seconds = int(os.environ.get("NCCL_TIMEOUT_SECOND", 600))
         dist.init_process_group(
-            backend="nccl", timeout=datetime.timedelta(seconds=timeout_seconds)
+            backend=resolve_dist_backend(use_cuda),
+            timeout=datetime.timedelta(seconds=timeout_seconds),
         )
 
     seed_everything(seed=args.seed, deterministic=args.deterministic)
@@ -451,12 +485,7 @@ def main(args: DictConfig):
     model_kwargs.setdefault("num_classes", args.data.distance_bin_count)
     model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
-        model = DDP(
-            model,
-            device_ids=[DIST_WRAPPER.local_rank],
-            output_device=DIST_WRAPPER.local_rank,
-            find_unused_parameters=False,
-        )
+        model = wrap_ddp(model, device)
     log_info(
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
@@ -583,7 +612,7 @@ def main(args: DictConfig):
                     checkpoint_path,
                 )
 
-    if DIST_WRAPPER.world_size > 1:
+    if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 

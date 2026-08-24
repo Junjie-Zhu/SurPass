@@ -1,7 +1,12 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
+
+from src.common.residue_constants import restypes_with_x
+
+NUM_RESIDUE_TYPES = len(restypes_with_x)
 
 
 # Adapted from frameflow code
@@ -48,20 +53,25 @@ def relative_position_encoding(
     pair_mask = pair_mask[..., None] & pair_mask[..., None, :]
 
     same_chain_mask = (chain_index[:, :, None] == chain_index[:, None, :]).long()
-    rel_pos_chain = F.one_hot(same_chain_mask, 2)
+    rel_pos_chain = F.one_hot(same_chain_mask.clamp(0, 1), 2)
 
+    rel_pos_classes = 2 * (int(r_max) + 1)
     d_residue = torch.clip(
         input=residue_index[:, :, None] - residue_index[:, None, :] + r_max,
         min=0, max=2 * r_max,
     ) * same_chain_mask + (1 - same_chain_mask) * (2 * r_max + 1)
-    rel_pos_residue = F.one_hot(d_residue.long(), 2 * (r_max + 1))
+    rel_pos_residue = F.one_hot(
+        d_residue.long().clamp(0, rel_pos_classes - 1), rel_pos_classes
+    )
 
     # add a global position encoding
     d_token = torch.clip(
         input=token_index[:, :, None] - token_index[:, None, :] + r_max,
         min=0, max=2 * r_max,
     )
-    rel_pos_token = F.one_hot(d_token.long(), 2 * (r_max + 1))
+    rel_pos_token = F.one_hot(
+        d_token.long().clamp(0, rel_pos_classes - 1), rel_pos_classes
+    )
 
     rel_pos = torch.cat([rel_pos_token, rel_pos_residue, rel_pos_chain], dim=-1).float()
     return rel_pos * pair_mask[..., None].to(dtype=rel_pos.dtype)  # [b, n, n, 2 + 4 * (r_max + 1)]
@@ -132,7 +142,7 @@ class ResidueEmbedder(nn.Module):
         
         self.plm_embedder = nn.Linear(self.plm_in_dim, self.plm_out_dim)
         
-        single_dim = self.plm_out_dim + 20 + self.residue_index_dim + 1
+        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + self.residue_index_dim + 1
         self.single_out = nn.Linear(single_dim, self.dim_token, bias=False)
     
         pair_dim = self.xt_pair_dist_dim + 2 + 4 * (self.r_max + 1)
@@ -151,7 +161,10 @@ class ResidueEmbedder(nn.Module):
     ):
         plm_emb = self.plm_embedder(plm_emb)
         
-        residue_type_emb = F.one_hot(residue_type, num_classes=20) * 1.0
+        residue_type = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
+        residue_type_emb = F.one_hot(residue_type, num_classes=NUM_RESIDUE_TYPES).to(
+            dtype=plm_emb.dtype
+        )
         residue_index_emb = get_index_embedding(
             residue_index, self.residue_index_dim, max_len=2056)
         

@@ -33,12 +33,17 @@ class OuterProductMean(nn.Module):
         mask: torch.Tensor,
     ):
         token_repr = self.layernorm(token_repr)
-        token_repr = self.linear_no_bias(token_repr).unsqueeze(-2)
+        token_repr = self.linear_no_bias(token_repr)
+        if mask is not None:
+            token_repr = token_repr * mask.to(dtype=token_repr.dtype)[..., None]
 
-        outer_product = torch.einsum("biad,bjae->bijde", token_repr, token_repr)
-        outer_product = outer_product.reshape(outer_product.shape[:-2] + (-1,))
-
-        outer_product = self.linear_out(outer_product)  # B, L, L, D_pair
+        # Project a_i ⊗ a_j without materializing [B, L, L, C, C].
+        pair_dim, inner = self.linear_out.weight.shape[0], token_repr.shape[-1]
+        weight = self.linear_out.weight.view(pair_dim, inner, inner)
+        projected = torch.einsum("pcd,bjd->bjpc", weight, token_repr)
+        outer_product = torch.einsum("bic,bjpc->bijp", token_repr, projected)
+        if self.linear_out.bias is not None:
+            outer_product = outer_product + self.linear_out.bias
         return outer_product
 
 
@@ -210,7 +215,7 @@ class ResOnly(nn.Module):
         pair_logits = self.pair_out_linear(self.pair_out_layernorm(pair_repr))
         
         # add transposed pair_logits to ensure symmetry
-        pair_logits = pair_logits + pair_logits.transpose(-1, -2)
+        pair_logits = pair_logits + pair_logits.transpose(-2, -3)
         pair_mask = pair_mask | pair_mask.transpose(-1, -2)
         return pair_logits, pair_mask
 

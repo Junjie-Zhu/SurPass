@@ -51,15 +51,6 @@ def collate_fn(batch):
             out[i, : t.shape[0]] = t
         return out
 
-    def _pad_first_two_dims(tensors: list[torch.Tensor]) -> torch.Tensor:
-        max_n = max(t.shape[0] for t in tensors)
-        max_m = max(t.shape[1] for t in tensors)
-        out_shape = (len(tensors), max_n, max_m, *tensors[0].shape[2:])
-        out = tensors[0].new_full(out_shape, fill_value=_pad_value(tensors[0]))
-        for i, t in enumerate(tensors):
-            out[i, : t.shape[0], : t.shape[1]] = t
-        return out
-
     def _collate_complex(samples: list[dict]) -> dict:
         feature_batch = {}
         for key in samples[0].keys():
@@ -70,13 +61,36 @@ def collate_fn(batch):
             feature_batch[key] = _pad_first_dim(values)
         return feature_batch
 
+    def _pad_concat_pair_labels(tensors: list[torch.Tensor]) -> torch.Tensor:
+        p1_lengths = [int(sample["mask"].shape[0]) for sample in proteins]
+        p2_lengths = [int(sample["mask"].shape[0]) for sample in peptides]
+        max_l1 = max(p1_lengths)
+        max_l2 = max(p2_lengths)
+        total = max_l1 + max_l2
+        out = tensors[0].new_full(
+            (len(tensors), total, total, *tensors[0].shape[2:]),
+            fill_value=_pad_value(tensors[0]),
+        )
+        for i, (label, l1, l2) in enumerate(zip(tensors, p1_lengths, p2_lengths)):
+            out[i, :l1, :l1] = label[:l1, :l1]
+            out[i, :l1, max_l1 : max_l1 + l2] = label[:l1, l1 : l1 + l2]
+            out[i, max_l1 : max_l1 + l2, :l1] = label[l1 : l1 + l2, :l1]
+            out[i, max_l1 : max_l1 + l2, max_l1 : max_l1 + l2] = label[
+                l1 : l1 + l2, l1 : l1 + l2
+            ]
+        return out
+
     proteins, peptides, labels_2d_bins, labels_2d_mask = zip(*batch)
     protein_batch = _collate_complex(list(proteins))
     peptide_batch = _collate_complex(list(peptides))
 
     label_batch = {
-        "label_2d_bins": _pad_first_two_dims([x.to(dtype=torch.long) for x in labels_2d_bins]),
-        "label_2d_mask": _pad_first_two_dims([x.to(dtype=torch.bool) for x in labels_2d_mask]),
+        "label_2d_bins": _pad_concat_pair_labels(
+            [x.to(dtype=torch.long) for x in labels_2d_bins]
+        ),
+        "label_2d_mask": _pad_concat_pair_labels(
+            [x.to(dtype=torch.bool) for x in labels_2d_mask]
+        ),
     }
     return protein_batch, peptide_batch, label_batch
 
@@ -240,30 +254,10 @@ class PepoTrainDataset(Dataset):
             return pickle.load(f)
 
     def _load_chain_features(self, chain_name: str) -> dict:
-        path = self.root_dir / "processed" / f"{chain_name}.pkl"
+        path = self.root_dir / "embedded" / f"{chain_name}.pt"
         if not path.exists():
-            raise FileNotFoundError(f"Missing chain feature pickle: {path}")
-        return self._load_pickle(path)
-
-    def _load_pair_labels(
-        self,
-        label_path: str,
-        protein_len: int,
-        peptide_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pairwise_dist, pairwise_mask = self._load_pair_distance_and_mask(
-            label_path,
-            protein_len,
-            peptide_len,
-        )
-        cross_bins = distance_to_bins(
-            pairwise_dist,
-            bin_start=self.distance_bin_start,
-            bin_end=self.distance_bin_end,
-            bin_count=self.distance_bin_count,
-        )
-
-        return cross_bins, pairwise_mask
+            raise FileNotFoundError(f"Missing chain feature file: {path}")
+        return torch.load(path)
 
     def _load_pair_distance_and_mask(
         self,
@@ -403,7 +397,33 @@ class PepoTrainDataset(Dataset):
 
         if not selected:
             return PepoTrainDataset._select_contiguous_crop_indices(length, crop_size)
+
+        target = min(int(length), int(crop_size))
+        if len(selected) < target:
+            selected = PepoTrainDataset._fill_crop_indices(selected, length, target)
         return torch.tensor(sorted(selected), dtype=torch.long)
+
+    @staticmethod
+    def _fill_crop_indices(selected: set[int], length: int, crop_size: int) -> set[int]:
+        filled = set(selected)
+        left = min(filled)
+        right = max(filled)
+        while len(filled) < crop_size and (left > 0 or right + 1 < length):
+            if left > 0:
+                left -= 1
+                filled.add(left)
+                if len(filled) >= crop_size:
+                    break
+            if right + 1 < length and len(filled) < crop_size:
+                right += 1
+                filled.add(right)
+        if len(filled) < crop_size:
+            for idx in range(length):
+                if idx not in filled:
+                    filled.add(idx)
+                    if len(filled) >= crop_size:
+                        break
+        return filled
 
     @staticmethod
     def _select_contiguous_crop_indices(
@@ -480,6 +500,9 @@ class PepoTrainDataset(Dataset):
         )
         residue_features["chain_index"] = self._encode_chain_index(
             residue_features["chain_index"]
+        )
+        residue_features["plm_emb"] = self._to_tensor(
+            residue_features["plm_emb"], dtype=torch.float32
         )
 
         # use CA to center the proteins

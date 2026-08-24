@@ -9,6 +9,10 @@ load_model_only: false
 recycle_rounds: 2
 self_conditioning_probability: 0.5
 
+hydra:
+  job:
+    chdir: false
+
 data:
   root_dir: pdb_metadata
   cluster_tsv_path: tests/verified_heterodimers.clustered.tsv
