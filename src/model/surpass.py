@@ -111,8 +111,14 @@ class ResOnly(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        for parameter in self.parameters():
-            nn.init.zeros_(parameter)
+        for opm in self.outer_product_mean:
+            nn.init.zeros_(opm.linear_out.weight)
+            if opm.linear_out.bias is not None:
+                nn.init.zeros_(opm.linear_out.bias)
+        for block in self.pair_blocks:
+            nn.init.zeros_(block.linear_out.weight)
+            if block.linear_out.bias is not None:
+                nn.init.zeros_(block.linear_out.bias)
 
     def forward(
         self,
@@ -205,8 +211,8 @@ class ResOnly(nn.Module):
                 single_repr, 
                 mask,
             ) * pair_mask.to(single_repr.dtype)[..., None]
-            # update pair representation
-            pair_repr = self.pair_blocks[i](
+            # residual pair transition; output weights are zero at init
+            pair_repr = pair_repr + self.pair_blocks[i](
                 pair_repr,
                 pair_mask.to(single_repr.dtype),
             )

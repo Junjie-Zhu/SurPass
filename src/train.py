@@ -226,6 +226,8 @@ def contact_eval_mask(
     pair_mask: torch.Tensor,
     label_mask: torch.Tensor,
     p1_length: int,
+    *,
+    inter_chain: bool = True,
 ) -> torch.Tensor:
     valid = pair_mask.to(dtype=torch.bool) & label_mask.to(dtype=torch.bool)
     total_length = int(valid.shape[-1])
@@ -236,7 +238,8 @@ def contact_eval_mask(
     )
     if valid.ndim == 3:
         inter_mask = inter_mask.unsqueeze(0)
-    return valid & inter_mask
+    region = inter_mask if inter_chain else ~inter_mask
+    return valid & region
 
 
 def _contact_scores_and_targets(
@@ -350,6 +353,31 @@ def train_epoch(
     return total_loss / max(num_steps, 1)
 
 
+def _contact_metrics_from_rows(
+    score_rows: list[torch.Tensor],
+    target_rows: list[torch.Tensor],
+) -> dict[str, float]:
+    if not score_rows:
+        return {
+            "auroc": float("nan"),
+            "auprc": float("nan"),
+            "contact_prev": float("nan"),
+        }
+    all_scores = torch.cat(score_rows, dim=0)
+    all_targets = torch.cat(target_rows, dim=0)
+    metrics = _binary_classification_metrics(all_scores, all_targets)
+    contact_prev = (
+        float(all_targets.to(dtype=torch.float32).mean().item())
+        if all_targets.numel() > 0
+        else float("nan")
+    )
+    return {
+        "auroc": metrics["auroc"],
+        "auprc": metrics["auprc"],
+        "contact_prev": contact_prev,
+    }
+
+
 def evaluate_epoch(
     model: torch.nn.Module,
     loader,
@@ -365,8 +393,10 @@ def evaluate_epoch(
     model.eval()
     total_loss = 0.0
     num_steps = 0
-    score_rows = []
-    target_rows = []
+    inter_score_rows = []
+    inter_target_rows = []
+    intra_score_rows = []
+    intra_target_rows = []
     n_contact_bins = contact_bin_count(
         contact_threshold,
         distance_bin_start,
@@ -387,48 +417,59 @@ def evaluate_epoch(
             valid_mask = (
                 pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
             )
-            eval_mask = contact_eval_mask(
+            p1_length = int(p1_batch["mask"].shape[1])
+            inter_mask = contact_eval_mask(
                 pair_mask,
                 labels["label_2d_mask"],
-                p1_length=int(p1_batch["mask"].shape[1]),
+                p1_length=p1_length,
+                inter_chain=True,
+            )
+            intra_mask = contact_eval_mask(
+                pair_mask,
+                labels["label_2d_mask"],
+                p1_length=p1_length,
+                inter_chain=False,
             )
             loss = masked_cross_entropy(
                 logits,
                 labels["label_2d_bins"],
                 valid_mask,
                 loss_fn,
-                p1_length=int(p1_batch["mask"].shape[1]),
+                p1_length=p1_length,
             )
-            scores, targets = _contact_scores_and_targets(
+            inter_scores, inter_targets = _contact_scores_and_targets(
                 logits,
                 labels["label_2d_bins"],
-                eval_mask,
+                inter_mask,
+                n_contact_bins,
+            )
+            intra_scores, intra_targets = _contact_scores_and_targets(
+                logits,
+                labels["label_2d_bins"],
+                intra_mask,
                 n_contact_bins,
             )
             total_loss += loss.item()
             num_steps += 1
-            score_rows.append(scores.detach().cpu())
-            target_rows.append(targets.detach().cpu())
+            inter_score_rows.append(inter_scores.detach().cpu())
+            inter_target_rows.append(inter_targets.detach().cpu())
+            intra_score_rows.append(intra_scores.detach().cpu())
+            intra_target_rows.append(intra_targets.detach().cpu())
             _set_progress_postfix(loader, loss=f"{loss.item():.3f}")
 
-    if score_rows:
-        all_scores = torch.cat(score_rows, dim=0)
-        all_targets = torch.cat(target_rows, dim=0)
-        metrics = _binary_classification_metrics(all_scores, all_targets)
-        contact_prev = (
-            float(all_targets.to(dtype=torch.float32).mean().item())
-            if all_targets.numel() > 0
-            else float("nan")
-        )
-    else:
-        metrics = {"auroc": float("nan"), "auprc": float("nan")}
-        contact_prev = float("nan")
-
+    inter_metrics = _contact_metrics_from_rows(inter_score_rows, inter_target_rows)
+    intra_metrics = _contact_metrics_from_rows(intra_score_rows, intra_target_rows)
     return {
         "test_loss": total_loss / max(num_steps, 1),
-        "test_auroc": metrics["auroc"],
-        "test_auprc": metrics["auprc"],
-        "test_contact_prev": contact_prev,
+        "test_auroc": inter_metrics["auroc"],
+        "test_auprc": inter_metrics["auprc"],
+        "test_contact_prev": inter_metrics["contact_prev"],
+        "test_inter_auroc": inter_metrics["auroc"],
+        "test_inter_auprc": inter_metrics["auprc"],
+        "test_inter_contact_prev": inter_metrics["contact_prev"],
+        "test_intra_auroc": intra_metrics["auroc"],
+        "test_intra_auprc": intra_metrics["auprc"],
+        "test_intra_contact_prev": intra_metrics["contact_prev"],
     }
 
 
@@ -582,7 +623,11 @@ def main(args: DictConfig):
 
     if DIST_WRAPPER.rank == 0:
         with open(f"{logging_dir}/loss.csv", "w", encoding="utf-8") as f:
-            f.write("Epoch,Train Loss,Test Loss,Test AUROC,Test AUPRC,Test Contact Prev\n")
+            f.write(
+                "Epoch,Train Loss,Test Loss,"
+                "Test Inter AUROC,Test Inter AUPRC,Test Inter Prev,"
+                "Test Intra AUROC,Test Intra AUPRC,Test Intra Prev\n"
+            )
 
     epoch_progress = (
         tqdm(total=args.epochs, leave=False, position=0)
@@ -641,23 +686,27 @@ def main(args: DictConfig):
             epoch_progress.set_postfix(
                 loss=f"{train_loss:.3f}",
                 test_loss=f"{metrics['test_loss']:.3f}",
-                auroc=f"{metrics['test_auroc']:.4f}",
-                auprc=f"{metrics['test_auprc']:.4f}",
-                prev=f"{metrics['test_contact_prev']:.4f}",
+                inter_auc=f"{metrics['test_inter_auroc']:.4f}",
+                intra_auc=f"{metrics['test_intra_auroc']:.4f}",
             )
             epoch_progress.update()
             with open(f"{logging_dir}/loss.csv", "a", encoding="utf-8") as f:
                 f.write(
                     f"{crt_epoch},{train_loss},{metrics['test_loss']},"
-                    f"{metrics['test_auroc']},{metrics['test_auprc']},"
-                    f"{metrics['test_contact_prev']}\n"
+                    f"{metrics['test_inter_auroc']},{metrics['test_inter_auprc']},"
+                    f"{metrics['test_inter_contact_prev']},"
+                    f"{metrics['test_intra_auroc']},{metrics['test_intra_auprc']},"
+                    f"{metrics['test_intra_contact_prev']}\n"
                 )
             log_info(
                 f"[test-metrics][epoch={crt_epoch}] "
                 f"loss={metrics['test_loss']:.4f} "
-                f"auroc={metrics['test_auroc']:.4f} "
-                f"auprc={metrics['test_auprc']:.4f} "
-                f"contact_prev={metrics['test_contact_prev']:.4f}"
+                f"inter_auroc={metrics['test_inter_auroc']:.4f} "
+                f"inter_auprc={metrics['test_inter_auprc']:.4f} "
+                f"inter_prev={metrics['test_inter_contact_prev']:.4f} "
+                f"intra_auroc={metrics['test_intra_auroc']:.4f} "
+                f"intra_auprc={metrics['test_intra_auprc']:.4f} "
+                f"intra_prev={metrics['test_intra_contact_prev']:.4f}"
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:
