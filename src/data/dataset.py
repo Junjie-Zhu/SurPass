@@ -35,6 +35,55 @@ def distance_to_bins(
     return torch.bucketize(distance.to(dtype=torch.float32), bin_limits).to(dtype=torch.long)
 
 
+def inter_chain_pair_mask(
+    p1_length: int,
+    p2_length: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    p1_length = int(p1_length)
+    p2_length = int(p2_length)
+    total = p1_length + p2_length
+    mask = torch.zeros((total, total), dtype=torch.bool, device=device)
+    mask[:p1_length, p1_length:] = True
+    mask[p1_length:, :p1_length] = True
+    return mask
+
+
+def build_negative_pair_labels(
+    p1_positions: torch.Tensor,
+    p1_mask: torch.Tensor,
+    p2_positions: torch.Tensor,
+    p2_mask: torch.Tensor,
+    *,
+    bin_start: float,
+    bin_end: float,
+    bin_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    p1_mask = p1_mask.to(dtype=torch.bool)
+    p2_mask = p2_mask.to(dtype=torch.bool)
+    p1_length = int(p1_mask.shape[0])
+    p2_length = int(p2_mask.shape[0])
+    p1_positions = p1_positions.to(dtype=torch.float32)
+    p2_positions = p2_positions.to(dtype=torch.float32)
+
+    combined = p1_positions.new_full(
+        (p1_length + p2_length, p1_length + p2_length),
+        float(bin_end) + 1.0,
+    )
+    combined[:p1_length, :p1_length] = torch.cdist(p1_positions, p1_positions)
+    combined[p1_length:, p1_length:] = torch.cdist(p2_positions, p2_positions)
+
+    label_bins = distance_to_bins(
+        combined,
+        bin_start=bin_start,
+        bin_end=bin_end,
+        bin_count=bin_count,
+    )
+    residue_mask = torch.cat([p1_mask, p2_mask], dim=0)
+    label_mask = residue_mask[:, None] & residue_mask[None, :]
+    return label_bins, label_mask
+
+
 def collate_fn(batch):
     def _pad_value(t: torch.Tensor):
         if t.dtype == torch.bool:
@@ -217,16 +266,14 @@ class PepoTrainDataset(Dataset):
         p2_features = self._process_complex(self._load_chain_features(p2_row["chain2"]))
         p1_features, p2_features = self._crop_negative_pair(p1_features, p2_features)
 
-        p1_mask = p1_features["mask"].to(dtype=torch.bool)
-        p2_mask = p2_features["mask"].to(dtype=torch.bool)
-        mask = torch.cat([p1_mask, p2_mask], dim=0)
-        label_mask = mask[:, None] & mask[None, :]
-        p1_length = int(p1_mask.shape[0])
-
-        label_bins = torch.full(
-            label_mask.shape,
-            fill_value=self.distance_bin_count - 1,
-            dtype=torch.long,
+        label_bins, label_mask = build_negative_pair_labels(
+            p1_features["residue_position"],
+            p1_features["mask"],
+            p2_features["residue_position"],
+            p2_features["mask"],
+            bin_start=self.distance_bin_start,
+            bin_end=self.distance_bin_end,
+            bin_count=self.distance_bin_count,
         )
         sample = (p1_features, p2_features, label_bins, label_mask)
         if self.transform is not None:
@@ -257,7 +304,7 @@ class PepoTrainDataset(Dataset):
         path = self.root_dir / "embedded" / f"{chain_name}.pt"
         if not path.exists():
             raise FileNotFoundError(f"Missing chain feature file: {path}")
-        return torch.load(path)
+        return torch.load(path, weights_only=False)
 
     def _load_pair_distance_and_mask(
         self,
@@ -501,6 +548,13 @@ class PepoTrainDataset(Dataset):
         residue_features["chain_index"] = self._encode_chain_index(
             residue_features["chain_index"]
         )
+        if "plm_emb" not in residue_features:
+            residue_count = int(
+                self._to_tensor(residue_features["cb_positions"]).shape[0]
+            )
+            residue_features["plm_emb"] = torch.zeros(
+                residue_count, 1280, dtype=torch.float32
+            )
         residue_features["plm_emb"] = self._to_tensor(
             residue_features["plm_emb"], dtype=torch.float32
         )

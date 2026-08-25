@@ -49,6 +49,12 @@ model:
   idx_emb_dim: 128
   num_classes: 64
 
+loss:
+  alpha: 0.75
+  gamma: 1.5
+  inter_weight: 5.0
+  intra_weight: 1.0
+
 optimizer:
   lr: 0.0001
   weight_decay: 0.0

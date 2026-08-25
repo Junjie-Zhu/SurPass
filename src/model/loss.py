@@ -54,4 +54,67 @@ class CrossEntropyLoss(nn.Module):
     def forward(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         loss = self.loss(logits, target)
         return (loss * mask).sum() / mask.sum().clamp(min=1.0)
-        
+
+
+class FocalCrossEntropyLoss(nn.Module):
+    """Multi-class focal CE with a larger weight on inter-chain pairs."""
+
+    def __init__(
+        self,
+        alpha: float = 0.75,
+        gamma: float = 1.5,
+        inter_weight: float = 5.0,
+        intra_weight: float = 1.0,
+    ):
+        super().__init__()
+        if inter_weight < 0.0 or intra_weight < 0.0:
+            raise ValueError("inter_weight and intra_weight must be non-negative.")
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.inter_weight = float(inter_weight)
+        self.intra_weight = float(intra_weight)
+        self.loss = nn.CrossEntropyLoss(reduction="none")
+
+    def _pair_type_weight(
+        self,
+        p1_length: int,
+        total_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        weight = torch.full(
+            (total_length, total_length),
+            self.intra_weight,
+            device=device,
+            dtype=dtype,
+        )
+        p1_length = int(p1_length)
+        weight[:p1_length, p1_length:] = self.inter_weight
+        weight[p1_length:, :p1_length] = self.inter_weight
+        return weight
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        p1_length: int,
+    ) -> torch.Tensor:
+        if logits.shape[:-1] != target.shape:
+            raise ValueError(
+                f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
+                f"target={tuple(target.shape)}"
+            )
+        ce = self.loss(logits.permute(0, 3, 1, 2), target.long())
+        p_true = torch.exp(-ce)
+        focal = self.alpha * ((1.0 - p_true).clamp(min=0.0) ** self.gamma) * ce
+        pair_weight = self._pair_type_weight(
+            p1_length,
+            int(target.shape[-1]),
+            device=focal.device,
+            dtype=focal.dtype,
+        )
+        if focal.ndim == 3:
+            pair_weight = pair_weight.unsqueeze(0)
+        weight = pair_weight * mask.to(dtype=focal.dtype)
+        return (focal * weight).sum() / weight.sum().clamp(min=1.0)

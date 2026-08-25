@@ -12,7 +12,14 @@ from torch.utils.data import Dataset, Subset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from src.data.dataset import BalancedClusterDataset, PepoTrainDataset, collate_fn, get_dataloader
+from src.data.dataset import (
+    BalancedClusterDataset,
+    PepoTrainDataset,
+    collate_fn,
+    get_dataloader,
+    inter_chain_pair_mask,
+)
+from src.model.loss import FocalCrossEntropyLoss
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
@@ -154,7 +161,12 @@ def masked_cross_entropy(
     target_bins: torch.Tensor,
     mask: torch.Tensor,
     loss_fn: torch.nn.Module,
+    p1_length: int | None = None,
 ) -> torch.Tensor:
+    if isinstance(loss_fn, FocalCrossEntropyLoss):
+        if p1_length is None:
+            raise ValueError("p1_length is required for FocalCrossEntropyLoss.")
+        return loss_fn(logits, target_bins, mask, p1_length=p1_length)
     if logits.shape[:-1] != target_bins.shape:
         raise ValueError(
             f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
@@ -163,6 +175,20 @@ def masked_cross_entropy(
     loss = loss_fn(logits.permute(0, 3, 1, 2), target_bins.long())
     mask_float = mask.to(dtype=loss.dtype)
     return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
+
+
+def _tie_group_last_indices(sorted_scores: torch.Tensor) -> torch.Tensor:
+    if sorted_scores.numel() == 0:
+        return sorted_scores.new_empty((0,), dtype=torch.long)
+    if sorted_scores.numel() == 1:
+        return torch.tensor([0], dtype=torch.long)
+    group_breaks = torch.nonzero(
+        sorted_scores[:-1] != sorted_scores[1:],
+        as_tuple=False,
+    ).flatten()
+    return torch.cat(
+        [group_breaks, torch.tensor([sorted_scores.numel() - 1], dtype=torch.long)]
+    )
 
 
 def _binary_classification_metrics(
@@ -176,24 +202,41 @@ def _binary_classification_metrics(
     if pos_count == 0 or neg_count == 0:
         return {"auroc": float("nan"), "auprc": float("nan")}
 
-    order = torch.argsort(scores, descending=True)
+    sorted_scores, order = torch.sort(scores, descending=True, stable=True)
     y_sorted = target_bool[order].to(dtype=torch.float32)
-    tps = torch.cumsum(y_sorted, dim=0)
-    fps = torch.cumsum(1.0 - y_sorted, dim=0)
+    group_last = _tie_group_last_indices(sorted_scores)
+    tps = torch.cumsum(y_sorted, dim=0)[group_last]
+    fps = torch.cumsum(1.0 - y_sorted, dim=0)[group_last]
 
-    tpr = torch.cat([torch.tensor([0.0]), tps / pos_count, torch.tensor([1.0])])
-    fpr = torch.cat([torch.tensor([0.0]), fps / neg_count, torch.tensor([1.0])])
+    tpr = torch.cat([torch.tensor([0.0]), tps / pos_count])
+    fpr = torch.cat([torch.tensor([0.0]), fps / neg_count])
     auroc = torch.trapz(tpr, fpr).item()
 
-    precision_curve = tps / torch.arange(1, len(y_sorted) + 1, dtype=torch.float32)
-    recall_curve = tps / pos_count
-    recall_curve = torch.cat([torch.tensor([0.0]), recall_curve])
+    precision_curve = tps / (tps + fps).clamp_min(1.0)
+    recall_curve = torch.cat([torch.tensor([0.0]), tps / pos_count])
     precision_curve = torch.cat([torch.tensor([1.0]), precision_curve])
     auprc = torch.sum(
         (recall_curve[1:] - recall_curve[:-1]) * precision_curve[1:]
     ).item()
 
     return {"auroc": float(auroc), "auprc": float(auprc)}
+
+
+def contact_eval_mask(
+    pair_mask: torch.Tensor,
+    label_mask: torch.Tensor,
+    p1_length: int,
+) -> torch.Tensor:
+    valid = pair_mask.to(dtype=torch.bool) & label_mask.to(dtype=torch.bool)
+    total_length = int(valid.shape[-1])
+    inter_mask = inter_chain_pair_mask(
+        p1_length,
+        total_length - int(p1_length),
+        device=valid.device,
+    )
+    if valid.ndim == 3:
+        inter_mask = inter_mask.unsqueeze(0)
+    return valid & inter_mask
 
 
 def _contact_scores_and_targets(
@@ -284,6 +327,7 @@ def train_epoch(
             labels["label_2d_bins"],
             valid_mask,
             loss_fn,
+            p1_length=int(p1_batch["mask"].shape[1]),
         )
         loss = raw_loss / max(1, grad_accum_steps)
         loss.backward()
@@ -343,16 +387,22 @@ def evaluate_epoch(
             valid_mask = (
                 pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
             )
+            eval_mask = contact_eval_mask(
+                pair_mask,
+                labels["label_2d_mask"],
+                p1_length=int(p1_batch["mask"].shape[1]),
+            )
             loss = masked_cross_entropy(
                 logits,
                 labels["label_2d_bins"],
                 valid_mask,
                 loss_fn,
+                p1_length=int(p1_batch["mask"].shape[1]),
             )
             scores, targets = _contact_scores_and_targets(
                 logits,
                 labels["label_2d_bins"],
-                valid_mask,
+                eval_mask,
                 n_contact_bins,
             )
             total_loss += loss.item()
@@ -362,17 +412,23 @@ def evaluate_epoch(
             _set_progress_postfix(loader, loss=f"{loss.item():.3f}")
 
     if score_rows:
-        metrics = _binary_classification_metrics(
-            torch.cat(score_rows, dim=0),
-            torch.cat(target_rows, dim=0),
+        all_scores = torch.cat(score_rows, dim=0)
+        all_targets = torch.cat(target_rows, dim=0)
+        metrics = _binary_classification_metrics(all_scores, all_targets)
+        contact_prev = (
+            float(all_targets.to(dtype=torch.float32).mean().item())
+            if all_targets.numel() > 0
+            else float("nan")
         )
     else:
         metrics = {"auroc": float("nan"), "auprc": float("nan")}
+        contact_prev = float("nan")
 
     return {
         "test_loss": total_loss / max(num_steps, 1),
         "test_auroc": metrics["auroc"],
         "test_auprc": metrics["auprc"],
+        "test_contact_prev": contact_prev,
     }
 
 
@@ -490,7 +546,12 @@ def main(args: DictConfig):
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
 
-    loss_fn = torch.nn.CrossEntropyLoss(reduction="none").to(device)
+    loss_fn = FocalCrossEntropyLoss(
+        alpha=float(_cfg_get(args, "loss.alpha", default=0.75)),
+        gamma=float(_cfg_get(args, "loss.gamma", default=1.5)),
+        inter_weight=float(_cfg_get(args, "loss.inter_weight", default=5.0)),
+        intra_weight=float(_cfg_get(args, "loss.intra_weight", default=1.0)),
+    ).to(device)
     optimizer = get_optimizer(
         model,
         lr=args.optimizer.lr,
@@ -521,7 +582,7 @@ def main(args: DictConfig):
 
     if DIST_WRAPPER.rank == 0:
         with open(f"{logging_dir}/loss.csv", "w", encoding="utf-8") as f:
-            f.write("Epoch,Train Loss,Test Loss,Test AUROC,Test AUPRC\n")
+            f.write("Epoch,Train Loss,Test Loss,Test AUROC,Test AUPRC,Test Contact Prev\n")
 
     epoch_progress = (
         tqdm(total=args.epochs, leave=False, position=0)
@@ -582,18 +643,21 @@ def main(args: DictConfig):
                 test_loss=f"{metrics['test_loss']:.3f}",
                 auroc=f"{metrics['test_auroc']:.4f}",
                 auprc=f"{metrics['test_auprc']:.4f}",
+                prev=f"{metrics['test_contact_prev']:.4f}",
             )
             epoch_progress.update()
             with open(f"{logging_dir}/loss.csv", "a", encoding="utf-8") as f:
                 f.write(
                     f"{crt_epoch},{train_loss},{metrics['test_loss']},"
-                    f"{metrics['test_auroc']},{metrics['test_auprc']}\n"
+                    f"{metrics['test_auroc']},{metrics['test_auprc']},"
+                    f"{metrics['test_contact_prev']}\n"
                 )
             log_info(
                 f"[test-metrics][epoch={crt_epoch}] "
                 f"loss={metrics['test_loss']:.4f} "
                 f"auroc={metrics['test_auroc']:.4f} "
-                f"auprc={metrics['test_auprc']:.4f}"
+                f"auprc={metrics['test_auprc']:.4f} "
+                f"contact_prev={metrics['test_contact_prev']:.4f}"
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:
