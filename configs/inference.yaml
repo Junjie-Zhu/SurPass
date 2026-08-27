@@ -1,0 +1,46 @@
+task_prefix: infer
+logging_dir: logs
+seed: 42
+deterministic: false
+ckpt_dir: null
+recycle_rounds: 2
+
+data:
+  root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
+  test_set_tsv: ${data.root_dir}/test_set.tsv
+  fasta_path: ${data.root_dir}/test_set.fasta
+  embedding_dir: ${data.root_dir}/embeddings
+  batch_size: 1
+  num_workers: 0
+  pin_memory: true
+  max_full_length: 1024
+  distance_bin_start: 2.0
+  distance_bin_end: 22.0
+  distance_bin_count: 64
+  contact_threshold: 8.0
+  ppi_score_threshold: 0.5
+
+model:
+  n_layers: 3
+  dim_token: 256
+  dim_pair: 128
+  n_heads: 8
+  residual_mha: true
+  residual_transition: true
+  use_attn_pair_bias: true
+  use_qkln: true
+  dropout: 0.0
+  expansion_factor: 2
+  plm_in_dim: 1280
+  plm_out_dim: 256
+  r_max: 32
+  xt_pair_dist_min: 2.0
+  xt_pair_dist_max: 22.0
+  xt_pair_dist_dim: 64
+  idx_emb_dim: 128
+  num_classes: 64
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

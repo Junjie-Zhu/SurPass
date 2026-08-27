@@ -19,7 +19,7 @@ from src.data.dataset import (
     get_dataloader,
     inter_chain_pair_mask,
 )
-from src.model.loss import FocalCrossEntropyLoss
+from src.model.loss import DistogramCELoss
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
@@ -154,27 +154,6 @@ def resolve_train_recycle_rounds(
     if random_value is None:
         random_value = float(torch.rand(()).item())
     return recycle_rounds if float(random_value) < probability else 1
-
-
-def masked_cross_entropy(
-    logits: torch.Tensor,
-    target_bins: torch.Tensor,
-    mask: torch.Tensor,
-    loss_fn: torch.nn.Module,
-    p1_length: int | None = None,
-) -> torch.Tensor:
-    if isinstance(loss_fn, FocalCrossEntropyLoss):
-        if p1_length is None:
-            raise ValueError("p1_length is required for FocalCrossEntropyLoss.")
-        return loss_fn(logits, target_bins, mask, p1_length=p1_length)
-    if logits.shape[:-1] != target_bins.shape:
-        raise ValueError(
-            f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
-            f"target={tuple(target_bins.shape)}"
-        )
-    loss = loss_fn(logits.permute(0, 3, 1, 2), target_bins.long())
-    mask_float = mask.to(dtype=loss.dtype)
-    return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
 
 
 def _tie_group_last_indices(sorted_scores: torch.Tensor) -> torch.Tensor:
@@ -325,13 +304,7 @@ def train_epoch(
             recycle_rounds=step_recycle_rounds,
         )
         valid_mask = pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(dtype=torch.bool)
-        raw_loss = masked_cross_entropy(
-            logits,
-            labels["label_2d_bins"],
-            valid_mask,
-            loss_fn,
-            p1_length=int(p1_batch["mask"].shape[1]),
-        )
+        raw_loss = loss_fn(logits, labels["label_2d_bins"], valid_mask)
         loss = raw_loss / max(1, grad_accum_steps)
         loss.backward()
 
@@ -430,13 +403,7 @@ def evaluate_epoch(
                 p1_length=p1_length,
                 inter_chain=False,
             )
-            loss = masked_cross_entropy(
-                logits,
-                labels["label_2d_bins"],
-                valid_mask,
-                loss_fn,
-                p1_length=p1_length,
-            )
+            loss = loss_fn(logits, labels["label_2d_bins"], valid_mask)
             inter_scores, inter_targets = _contact_scores_and_targets(
                 logits,
                 labels["label_2d_bins"],
@@ -587,12 +554,7 @@ def main(args: DictConfig):
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
 
-    loss_fn = FocalCrossEntropyLoss(
-        alpha=float(_cfg_get(args, "loss.alpha", default=0.75)),
-        gamma=float(_cfg_get(args, "loss.gamma", default=1.5)),
-        inter_weight=float(_cfg_get(args, "loss.inter_weight", default=5.0)),
-        intra_weight=float(_cfg_get(args, "loss.intra_weight", default=1.0)),
-    ).to(device)
+    loss_fn = DistogramCELoss().to(device)
     optimizer = get_optimizer(
         model,
         lr=args.optimizer.lr,

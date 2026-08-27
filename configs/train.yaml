@@ -2,32 +2,28 @@ task_prefix: surpass
 logging_dir: logs
 seed: 42
 deterministic: false
-epochs: 10
-checkpoint_interval: 1
+epochs: 200
+checkpoint_interval: 10
 ckpt_dir: null
 load_model_only: false
 recycle_rounds: 2
 self_conditioning_probability: 0.5
 
-hydra:
-  job:
-    chdir: false
-
 data:
-  root_dir: pdb_metadata
-  cluster_tsv_path: tests/verified_heterodimers.clustered.tsv
-  batch_size: 1
-  num_workers: 0
+  root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
+  cluster_tsv_path: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/verified_heterodimers.clustered.tsv
+  batch_size: 4
+  num_workers: 4
   pin_memory: true
   center_coordinates: true
   random_rotation: true
   test_fraction: 0.2
-  negative_ratio: 1
+  negative_ratio: 0
   distance_bin_start: 2.0
   distance_bin_end: 22.0
   distance_bin_count: 64
   contact_threshold: 8.0
-  crop_size: 256
+  crop_size: 192
 
 model:
   n_layers: 3
@@ -49,24 +45,23 @@ model:
   idx_emb_dim: 128
   num_classes: 64
 
-loss:
-  alpha: 0.75
-  gamma: 1.5
-  inter_weight: 5.0
-  intra_weight: 1.0
-
 optimizer:
   lr: 0.0001
   weight_decay: 0.0
   beta1: 0.9
   beta2: 0.999
   use_adamw: true
-  lr_scheduler: constant
-  warmup_steps: 1000
-  decay_every_n_steps: 50000
+  lr_scheduler: af3
+  warmup_steps: 500
+  decay_every_n_steps: 25000
   decay_factor: 0.95
   grad_accum_steps: 1
-  max_grad_norm: 1.0
+  max_grad_norm: 0.0
 
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  
 performance:
   empty_cache_each_step: false

@@ -1,120 +1,180 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-# BCE loss on only positive samples for pairwise binding map prediction
-class PosOnlyBCELoss(nn.Module):
-    def __init__(self):
-        super(PosOnlyBCELoss, self).__init__()
-        self.loss = nn.BCEWithLogitsLoss(reduction="none")
-    def forward(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        pos_mask = target == 1
-        mask = mask * pos_mask.to(dtype=mask.dtype)
-        return (self.loss(logits, target) * mask).sum() / mask.sum().clamp(min=1.0)
+def distance_bin_centers(
+    bin_start: float,
+    bin_end: float,
+    bin_count: int,
+) -> torch.Tensor:
+    bin_count = int(bin_count)
+    if bin_count < 2:
+        raise ValueError("bin_count must be at least 2.")
+    limits = torch.linspace(float(bin_start), float(bin_end), bin_count - 1)
+    centers = torch.empty(bin_count, dtype=torch.float32)
+    if bin_count == 2:
+        width = float(bin_end) - float(bin_start)
+        centers[0] = limits[0] - 0.5 * width
+        centers[1] = limits[-1] + 0.5 * width
+        return centers
+    first_width = limits[1] - limits[0]
+    last_width = limits[-1] - limits[-2]
+    centers[0] = limits[0] - 0.5 * first_width
+    centers[1:-1] = 0.5 * (limits[:-1] + limits[1:])
+    centers[-1] = limits[-1] + 0.5 * last_width
+    return centers
 
 
-class MaskedBinnedBCELoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.loss = nn.BCEWithLogitsLoss(reduction="none")
+def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_float = mask.to(dtype=loss.dtype)
+    return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
+
+
+def _validate_pair_shapes(
+    logits: torch.Tensor,
+    target_bins: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    if logits.shape[:-1] != target_bins.shape:
+        raise ValueError(
+            f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
+            f"target={tuple(target_bins.shape)}"
+        )
+    if tuple(mask.shape) != tuple(target_bins.shape):
+        raise ValueError(
+            f"Mask/target shape mismatch: mask={tuple(mask.shape)} "
+            f"target={tuple(target_bins.shape)}"
+        )
+
+
+class DistogramCELoss(nn.Module):
+    """Masked cross-entropy over pairwise distance bins."""
 
     def forward(
         self,
         logits: torch.Tensor,
-        target: torch.Tensor,
-        pair_mask: torch.Tensor,
+        target_bins: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        mask = pair_mask.to(dtype=logits.dtype)[..., None]
-        loss = self.loss(logits, target)
-        return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+        _validate_pair_shapes(logits, target_bins, mask)
+        loss = F.cross_entropy(
+            logits.permute(0, 3, 1, 2),
+            target_bins.long(),
+            reduction="none",
+        )
+        return _masked_mean(loss, mask)
 
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha: float = 0.75, gamma: float = 1.5):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.loss = nn.BCEWithLogitsLoss(reduction="none")
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        bce = self.loss(logits, target)
-        prob = torch.sigmoid(logits)
-        p_t = target * prob + (1.0 - target) * (1.0 - prob)
-        alpha_t = target * self.alpha + (1.0 - target) * (1.0 - self.alpha)
-        focal_weight = alpha_t * ((1.0 - p_t).clamp(min=0.0) ** self.gamma)
-        loss = focal_weight * bce
-        return (loss * mask).sum() / mask.sum().clamp(min=1.0)
-
-
-class CrossEntropyLoss(nn.Module):
-    def __init__(self):
-        super(CrossEntropyLoss, self).__init__()
-        self.loss = nn.CrossEntropyLoss(reduction="none")
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        loss = self.loss(logits, target)
-        return (loss * mask).sum() / mask.sum().clamp(min=1.0)
-
-
-class FocalCrossEntropyLoss(nn.Module):
-    """Multi-class focal CE with a larger weight on inter-chain pairs."""
+class FocalCELoss(nn.Module):
+    """Multi-class focal CE with extra weight on contact bins (d < threshold)."""
 
     def __init__(
         self,
-        alpha: float = 0.75,
+        contact_bins: int,
+        contact_weight: float = 10.0,
         gamma: float = 1.5,
-        inter_weight: float = 5.0,
-        intra_weight: float = 1.0,
+        alpha: float = 1.0,
     ):
         super().__init__()
-        if inter_weight < 0.0 or intra_weight < 0.0:
-            raise ValueError("inter_weight and intra_weight must be non-negative.")
-        self.alpha = float(alpha)
+        if int(contact_bins) <= 0:
+            raise ValueError("contact_bins must be positive.")
+        self.contact_bins = int(contact_bins)
+        self.contact_weight = float(contact_weight)
         self.gamma = float(gamma)
-        self.inter_weight = float(inter_weight)
-        self.intra_weight = float(intra_weight)
-        self.loss = nn.CrossEntropyLoss(reduction="none")
-
-    def _pair_type_weight(
-        self,
-        p1_length: int,
-        total_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        weight = torch.full(
-            (total_length, total_length),
-            self.intra_weight,
-            device=device,
-            dtype=dtype,
-        )
-        p1_length = int(p1_length)
-        weight[:p1_length, p1_length:] = self.inter_weight
-        weight[p1_length:, :p1_length] = self.inter_weight
-        return weight
+        self.alpha = float(alpha)
 
     def forward(
         self,
         logits: torch.Tensor,
-        target: torch.Tensor,
+        target_bins: torch.Tensor,
         mask: torch.Tensor,
-        p1_length: int,
     ) -> torch.Tensor:
-        if logits.shape[:-1] != target.shape:
-            raise ValueError(
-                f"Logit/target shape mismatch: logits={tuple(logits.shape)} "
-                f"target={tuple(target.shape)}"
-            )
-        ce = self.loss(logits.permute(0, 3, 1, 2), target.long())
-        p_true = torch.exp(-ce)
-        focal = self.alpha * ((1.0 - p_true).clamp(min=0.0) ** self.gamma) * ce
-        pair_weight = self._pair_type_weight(
-            p1_length,
-            int(target.shape[-1]),
-            device=focal.device,
-            dtype=focal.dtype,
+        _validate_pair_shapes(logits, target_bins, mask)
+        target = target_bins.long()
+        log_probs = F.log_softmax(logits, dim=-1)
+        log_p_t = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+        p_t = log_p_t.exp()
+        focal = self.alpha * ((1.0 - p_t).clamp(min=0.0) ** self.gamma) * (-log_p_t)
+        pair_weight = torch.where(
+            target < self.contact_bins,
+            focal.new_tensor(self.contact_weight),
+            focal.new_tensor(1.0),
         )
-        if focal.ndim == 3:
-            pair_weight = pair_weight.unsqueeze(0)
-        weight = pair_weight * mask.to(dtype=focal.dtype)
-        return (focal * weight).sum() / weight.sum().clamp(min=1.0)
+        return _masked_mean(focal * pair_weight, mask)
+
+
+class DistogramHuberLoss(nn.Module):
+    """Huber loss between expected bin distance and the target bin center."""
+
+    def __init__(
+        self,
+        bin_centers: torch.Tensor | None = None,
+        bin_start: float = 2.0,
+        bin_end: float = 22.0,
+        bin_count: int = 64,
+        delta: float = 1.0,
+    ):
+        super().__init__()
+        if bin_centers is None:
+            bin_centers = distance_bin_centers(bin_start, bin_end, bin_count)
+        self.delta = float(delta)
+        self.register_buffer("bin_centers", bin_centers.to(dtype=torch.float32))
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_bins: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        _validate_pair_shapes(logits, target_bins, mask)
+        centers = self.bin_centers.to(device=logits.device, dtype=logits.dtype)
+        if logits.shape[-1] != int(centers.shape[0]):
+            raise ValueError(
+                f"Logit class count {logits.shape[-1]} does not match "
+                f"bin_centers {int(centers.shape[0])}."
+            )
+        probs = torch.softmax(logits, dim=-1)
+        pred_dist = (probs * centers).sum(dim=-1)
+        target_dist = centers[target_bins.long().clamp(0, centers.shape[0] - 1)]
+        loss = F.huber_loss(pred_dist, target_dist, reduction="none", delta=self.delta)
+        return _masked_mean(loss, mask)
+
+
+class TverskyLoss(nn.Module):
+    """Soft Tversky loss on P(d < threshold) versus contact-bin labels."""
+
+    def __init__(
+        self,
+        contact_bins: int,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        smooth: float = 1.0,
+    ):
+        super().__init__()
+        if int(contact_bins) <= 0:
+            raise ValueError("contact_bins must be positive.")
+        self.contact_bins = int(contact_bins)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_bins: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        _validate_pair_shapes(logits, target_bins, mask)
+        if logits.shape[-1] < self.contact_bins:
+            raise ValueError(
+                f"contact_bins {self.contact_bins} exceeds logit classes {logits.shape[-1]}."
+            )
+        mask_float = mask.to(dtype=logits.dtype)
+        p_contact = torch.softmax(logits, dim=-1)[..., : self.contact_bins].sum(dim=-1)
+        y_contact = (target_bins.long() < self.contact_bins).to(dtype=logits.dtype)
+        tp = (p_contact * y_contact * mask_float).sum()
+        fp = (p_contact * (1.0 - y_contact) * mask_float).sum()
+        fn = ((1.0 - p_contact) * y_contact * mask_float).sum()
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        return 1.0 - tversky
