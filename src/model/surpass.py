@@ -222,6 +222,7 @@ class ResOnly(nn.Module):
         
         # add transposed pair_logits to ensure symmetry
         pair_logits = pair_logits + pair_logits.transpose(-2, -3)
+        pair_logits = pair_logits / 2
         pair_mask = pair_mask | pair_mask.transpose(-1, -2)
         return pair_logits, pair_mask
 

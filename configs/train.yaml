@@ -45,6 +45,20 @@ model:
   idx_emb_dim: 128
   num_classes: 64
 
+loss:
+  intra: 0.3
+  inter: 0.7
+  focal:
+    weight: 1.0
+    gamma: 1.5
+    alpha: 3.0
+  mae:
+    weight: 0.1
+  tversky:
+    weight: 0.5
+    alpha: 0.3
+    beta: 0.4
+
 optimizer:
   lr: 0.0001
   weight_decay: 0.0
@@ -57,6 +71,17 @@ optimizer:
   decay_factor: 0.95
   grad_accum_steps: 1
   max_grad_norm: 0.0
+
+wandb:
+  enabled: true
+  project: surpass
+  entity: null
+  name: null
+  mode: online
+  log_interval: 1
+  id: null
+  resume: allow
+  tags: []
 
 hydra:
   run:
