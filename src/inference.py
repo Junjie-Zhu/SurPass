@@ -265,14 +265,19 @@ def merge_rank_prediction_rows(rank_rows: list[list[dict[str, Any]]]) -> list[di
     return merged
 
 
-def metrics_from_prediction_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
+def metrics_from_prediction_rows(
+    rows: list[dict[str, Any]],
+    positive_weight: float = 1.0,
+) -> dict[str, float]:
     if not rows:
         all_scores = torch.empty(0, dtype=torch.float32)
         all_targets = torch.empty(0, dtype=torch.bool)
     else:
         all_scores = torch.tensor([float(row["p_bind"]) for row in rows], dtype=torch.float32)
         all_targets = torch.tensor([bool(row["Category"]) for row in rows], dtype=torch.bool)
-    classification = _binary_classification_metrics(all_scores, all_targets)
+    classification = _binary_classification_metrics(
+        all_scores, all_targets, positive_weight=positive_weight
+    )
     return {
         "auroc": classification["auroc"],
         "auprc": classification["auprc"],
@@ -333,6 +338,7 @@ def evaluate_ppi(
     distance_bin_count: int,
     recycle_rounds: int,
     ppi_score_threshold: float,
+    positive_weight: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     model.eval()
     contact_bins = contact_bin_count(
@@ -378,7 +384,7 @@ def evaluate_ppi(
             if callable(set_postfix) and len(p_bind) > 0:
                 set_postfix(p_bind=f"{float(p_bind[0].item()):.3f}")
 
-    return rows, metrics_from_prediction_rows(rows)
+    return rows, metrics_from_prediction_rows(rows, positive_weight=positive_weight)
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="inference")
@@ -457,6 +463,7 @@ def main(args: DictConfig):
         leave=True,
         disable=DIST_WRAPPER.rank != 0,
     )
+    positive_weight = float(_cfg_get(args, "metrics.positive_weight", default=1.0))
     rows, _ = evaluate_ppi(
         model=model,
         loader=eval_iter,
@@ -467,11 +474,12 @@ def main(args: DictConfig):
         distance_bin_count=int(args.data.distance_bin_count),
         recycle_rounds=int(args.recycle_rounds),
         ppi_score_threshold=float(args.data.ppi_score_threshold),
+        positive_weight=positive_weight,
     )
     rows = gather_rank_prediction_rows(rows)
 
     if DIST_WRAPPER.rank == 0:
-        metrics = metrics_from_prediction_rows(rows)
+        metrics = metrics_from_prediction_rows(rows, positive_weight=positive_weight)
         predictions_path = os.path.join(logging_dir, "predictions.tsv")
         metrics_path = os.path.join(logging_dir, "metrics.csv")
         write_predictions(predictions_path, rows)

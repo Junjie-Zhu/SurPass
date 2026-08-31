@@ -47,12 +47,14 @@ class GatedAttention(nn.Module):
         elementwise_attn_output_gate=False,
         qkv_bias=False,
         use_sdpa=True,
+        dropout=0.0,
     ):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_head
         self.inner_dim = n_heads * d_head
         self.scale = self.d_head ** -0.5
+        self.dropout = float(dropout)
 
         self.qkv_proj = nn.Linear(d_model, self.inner_dim * 3, bias=qkv_bias)
  
@@ -114,7 +116,7 @@ class GatedAttention(nn.Module):
             k,
             v,
             attn_mask=sdpa_mask,
-            dropout_p=0.0,
+            dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
         )
             # except (RuntimeError, NotImplementedError):
@@ -152,12 +154,14 @@ class PairBiasAttention(nn.Module):
         dim_out: int,
         qkln: bool,
         pair_dim: Optional[int] = None,
+        dropout: float = 0.0,
         **kawrgs  # noqa
     ):
         super().__init__()
         inner_dim = dim_head * heads
         self.node_dim, self.pair_dim = node_dim, pair_dim
         self.heads, self.scale = heads, dim_head**-0.5
+        self.dropout = float(dropout)
         self.to_qkv = nn.Linear(node_dim, inner_dim * 3, bias=bias)
         self.to_g = nn.Linear(node_dim, inner_dim)
         self.to_out_node = nn.Linear(inner_dim, default(dim_out, node_dim))
@@ -212,6 +216,8 @@ class PairBiasAttention(nn.Module):
             mask = rearrange(mask, "b i j -> b () i j")
             sim = sim.masked_fill(~mask, max_neg_value(sim))
         attn = torch.softmax(sim + b, dim=-1)
+        if self.training and self.dropout > 0.0:
+            attn = F.dropout(attn, p=self.dropout)
         return einsum("b h i j, b h j d -> b h i d", attn, v)
 
 
@@ -230,7 +236,9 @@ class MultiHeadAttention(torch.nn.Module):
         #     dropout=dropout,
         #     batch_first=True,
         # )
-        self.mha = GatedAttention(dim_token, dim_token // nheads, nheads)
+        self.mha = GatedAttention(
+            dim_token, dim_token // nheads, nheads, dropout=dropout
+        )
 
     def forward(self, x, mask, cond=None):
         """
@@ -301,7 +309,7 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
     """Pair biased multi-head self-attention with adaptive layer norm applied to input
     and adaptive scaling applied to output."""
 
-    def __init__(self, dim_token, dim_pair, nheads, dim_cond, use_qkln):
+    def __init__(self, dim_token, dim_pair, nheads, dim_cond, use_qkln, dropout=0.0):
         super().__init__()
         dim_head = int(dim_token // nheads)
         self.adaln = AdaptiveLayerNorm(dim=dim_token, dim_cond=dim_cond)
@@ -313,6 +321,7 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
             dim_out=dim_token,
             qkln=use_qkln,
             pair_dim=dim_pair,
+            dropout=dropout,
         )
         self.scale_output = AdaptiveLayerNormOutputScale(
             dim=dim_token, dim_cond=dim_cond
@@ -390,6 +399,7 @@ class ResidueTransformer(torch.nn.Module):
                 nheads=nheads,
                 dim_cond=dim_cond,
                 use_qkln=use_qkln,
+                dropout=dropout,
             )
         else:
             self.mha = MultiHeadAttentionADALN(

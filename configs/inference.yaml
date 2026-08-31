@@ -20,6 +20,9 @@ data:
   contact_threshold: 8.0
   ppi_score_threshold: 0.5
 
+metrics:
+  positive_weight: 1.0
+
 model:
   n_layers: 3
   dim_token: 256

@@ -31,6 +31,66 @@ def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
 
 
+def inverse_frequency_pair_weights(
+    mask: torch.Tensor,
+    is_contact: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Balanced pos/neg weights: N / (2 * N_class) over pairs in `mask`."""
+    mask_bool = mask.to(dtype=torch.bool)
+    contact_bool = is_contact.to(dtype=torch.bool) & mask_bool
+    n_pairs = mask_bool.to(dtype=dtype).sum().clamp_min(1.0)
+    n_pos = contact_bool.to(dtype=dtype).sum().clamp_min(1.0)
+    n_neg = (mask_bool & ~contact_bool).to(dtype=dtype).sum().clamp_min(1.0)
+    w_pos = n_pairs / (2.0 * n_pos)
+    w_neg = n_pairs / (2.0 * n_neg)
+    return torch.where(contact_bool, w_pos, w_neg)
+
+
+def downsample_inter_negatives(
+    inter_mask: torch.Tensor,
+    target_bins: torch.Tensor,
+    contact_bins: int,
+    neg_per_pos: float = 4.0,
+) -> torch.Tensor:
+    """Keep all inter contacts and ~neg_per_pos random inter non-contacts per contact."""
+    if float(neg_per_pos) <= 0.0:
+        return inter_mask.to(dtype=torch.bool)
+
+    inter_mask = inter_mask.to(dtype=torch.bool)
+    is_contact = target_bins.long() < int(contact_bins)
+    keep = inter_mask & is_contact
+    neg = inter_mask & ~is_contact
+    squeezed = False
+    if keep.ndim == 2:
+        keep = keep.unsqueeze(0)
+        neg = neg.unsqueeze(0)
+        squeezed = True
+
+    out = keep.clone()
+    ratio = float(neg_per_pos)
+    for batch_index in range(keep.shape[0]):
+        n_pos = int(keep[batch_index].sum().item())
+        neg_flat = torch.nonzero(neg[batch_index].reshape(-1), as_tuple=False).flatten()
+        n_neg = int(neg_flat.numel())
+        if n_neg == 0:
+            continue
+        n_keep_neg = (
+            min(n_neg, max(1, int(round(n_pos * ratio))))
+            if n_pos > 0
+            else min(n_neg, max(1, int(round(ratio))))
+        )
+        order = torch.randperm(n_neg, device=neg_flat.device)[:n_keep_neg]
+        selected = neg_flat[order]
+        flat = out[batch_index].reshape(-1)
+        flat[selected] = True
+        out[batch_index] = flat.view_as(out[batch_index])
+
+    if squeezed:
+        return out.squeeze(0)
+    return out
+
+
 def _validate_pair_shapes(
     logits: torch.Tensor,
     target_bins: torch.Tensor,
@@ -68,7 +128,7 @@ class DistogramCELoss(nn.Module):
 
 
 class FocalCELoss(nn.Module):
-    """Multi-class focal CE with extra weight on contact bins (d < threshold)."""
+    """Focal CE: intra uses a flat contact alpha; inter uses inverse-frequency weights."""
 
     def __init__(
         self,
@@ -99,14 +159,18 @@ class FocalCELoss(nn.Module):
         )
         p_t = torch.exp(-ce_loss)
         focal = ((1.0 - p_t).clamp(min=0.0) ** self.gamma) * ce_loss
-        pair_weight = torch.where(
-            target < self.contact_bins,
+        is_contact = target < self.contact_bins
+        intra_weight = torch.where(
+            is_contact,
             focal.new_tensor(self.alpha),
             focal.new_tensor(1.0),
         )
+        inter_weight = inverse_frequency_pair_weights(
+            inter_mask, is_contact, dtype=focal.dtype
+        )
         return (
-            _masked_mean(focal * pair_weight, intra_mask),
-            _masked_mean(focal * pair_weight, inter_mask),
+            _masked_mean(focal * intra_weight, intra_mask),
+            _masked_mean(focal * inter_weight, inter_mask),
         )
 
 

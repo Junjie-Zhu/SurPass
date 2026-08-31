@@ -29,6 +29,7 @@ from src.model.loss import (
     FocalCELoss,
     DistogramMAELoss,
     TverskyLoss,
+    downsample_inter_negatives,
 )
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
@@ -169,16 +170,23 @@ def resolve_train_recycle_rounds(
 def _binary_classification_metrics(
     scores: torch.Tensor,
     target: torch.Tensor,
+    positive_weight: float = 1.0,
 ) -> dict[str, float]:
     scores = scores.detach().flatten().to(dtype=torch.float32).cpu().numpy()
     target_bool = target.detach().flatten().to(dtype=torch.bool).cpu().numpy()
     pos_count = int(target_bool.sum())
     neg_count = int(target_bool.size - pos_count)
-    if scores.size == 0 or pos_count == 0 or neg_count == 0:
+    weight = float(positive_weight)
+    if scores.size == 0 or pos_count == 0 or neg_count == 0 or weight <= 0.0:
         return {"auroc": float("nan"), "auprc": float("nan")}
-    fpr, tpr, _ = roc_curve(target_bool, scores)
+    sample_weight = None
+    if weight != 1.0:
+        sample_weight = 1.0 + (weight - 1.0) * target_bool.astype("float64")
+    fpr, tpr, _ = roc_curve(target_bool, scores, sample_weight=sample_weight)
     auroc = auc(fpr, tpr)
-    precision, recall, _ = precision_recall_curve(target_bool, scores)
+    precision, recall, _ = precision_recall_curve(
+        target_bool, scores, sample_weight=sample_weight
+    )
     auprc = auc(recall, precision)
     return {"auroc": float(auroc), "auprc": float(auprc)}
 
@@ -224,9 +232,9 @@ def _compute_pair_losses(
         intra_loss, inter_loss = loss_term(logits, target_bins, intra_mask, inter_mask)
         terms[f"{name}_intra"] = intra_loss.detach()
         terms[f"{name}_inter"] = inter_loss.detach()
+
         weighted = (
-            float(loss_weights["intra"]) * intra_loss
-            + float(loss_weights["inter"]) * inter_loss
+            float(loss_weights["intra"]) * intra_loss + float(loss_weights["inter"]) * inter_loss
         )
         terms[name] = weighted.detach()
         raw_loss = raw_loss + term_weight * weighted
@@ -379,6 +387,8 @@ def train_epoch(
     recycle_rounds: int = 2,
     self_conditioning_probability: float = 0.5,
     step_logger: Callable[[dict[str, float]], None] | None = None,
+    contact_bins: int | None = None,
+    inter_neg_per_pos: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -404,6 +414,13 @@ def train_epoch(
             labels["label_2d_mask"],
             p1_length=int(p1_batch["mask"].shape[1]),
         )
+        if contact_bins is not None and float(inter_neg_per_pos) > 0.0:
+            inter_mask = downsample_inter_negatives(
+                inter_mask,
+                labels["label_2d_bins"],
+                contact_bins=int(contact_bins),
+                neg_per_pos=float(inter_neg_per_pos),
+            )
         raw_loss, terms = _compute_pair_losses(
             loss_fn,
             loss_weights,
@@ -440,6 +457,7 @@ def train_epoch(
 def _contact_metrics_from_rows(
     score_rows: list[torch.Tensor],
     target_rows: list[torch.Tensor],
+    positive_weight: float = 1.0,
 ) -> dict[str, float]:
     if not score_rows:
         return {
@@ -455,7 +473,9 @@ def _contact_metrics_from_rows(
             "auprc": float("nan"),
             "contact_prev": float("nan"),
         }
-    metrics = _binary_classification_metrics(all_scores, all_targets)
+    metrics = _binary_classification_metrics(
+        all_scores, all_targets, positive_weight=positive_weight
+    )
     contact_prev = (
         float(all_targets.to(dtype=torch.float32).mean().item())
         if all_targets.numel() > 0
@@ -480,6 +500,7 @@ def evaluate_epoch(
     distance_bin_count: int = 64,
     max_batches: int | None = None,
     recycle_rounds: int = 2,
+    positive_weight: float = 1.0,
 ) -> dict[str, float]:
     model.eval()
     term_totals: dict[str, float] = {}
@@ -531,8 +552,12 @@ def evaluate_epoch(
             num_steps += 1
             _set_progress_postfix(loader, **_progress_postfix(term_floats))
 
-    inter_metrics = _contact_metrics_from_rows(inter_score_rows, inter_target_rows)
-    intra_metrics = _contact_metrics_from_rows(intra_score_rows, intra_target_rows)
+    inter_metrics = _contact_metrics_from_rows(
+        inter_score_rows, inter_target_rows, positive_weight=positive_weight
+    )
+    intra_metrics = _contact_metrics_from_rows(
+        intra_score_rows, intra_target_rows, positive_weight=positive_weight
+    )
     metrics = _mean_floats(term_totals, num_steps)
     metrics.update(
         {
@@ -699,7 +724,8 @@ def main(args: DictConfig):
     }
     loss_weights = _build_loss_weights(args)
     log_info(
-        f"Loss setup: contact_bins={n_contact_bins}, weights={loss_weights}"
+        f"Loss setup: contact_bins={n_contact_bins}, weights={loss_weights}, "
+        f"inter_neg_per_pos={float(_cfg_get(args, 'loss.inter_neg_per_pos', default=4.0))}"
     )
     optimizer = get_optimizer(
         model,
@@ -797,6 +823,8 @@ def main(args: DictConfig):
             recycle_rounds=int(args.recycle_rounds),
             self_conditioning_probability=float(args.self_conditioning_probability),
             step_logger=log_train_step,
+            contact_bins=n_contact_bins,
+            inter_neg_per_pos=float(_cfg_get(args, "loss.inter_neg_per_pos", default=4.0)),
         )
 
         test_iter = test_loader
@@ -819,6 +847,7 @@ def main(args: DictConfig):
             distance_bin_end=args.data.distance_bin_end,
             distance_bin_count=args.data.distance_bin_count,
             recycle_rounds=int(args.recycle_rounds),
+            positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
         )
 
         if DIST_WRAPPER.rank == 0:
