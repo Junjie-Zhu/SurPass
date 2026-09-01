@@ -354,7 +354,7 @@ def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> d
             "num_classes, xt_pair_dist_dim, and data.distance_bin_count must be equal, "
             f"got {num_classes}, {xt_pair_dist_dim}, {distance_bin_count}."
         )
-        return model_kwargs
+    return model_kwargs
 
 
 def _unpack_batch(step_batch, device):

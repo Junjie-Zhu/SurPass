@@ -6,13 +6,13 @@ epochs: 200
 checkpoint_interval: 10
 ckpt_dir: null
 load_model_only: false
-recycle_rounds: 2
+recycle_rounds: 1
 self_conditioning_probability: 0.5
 
 data:
   root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
   cluster_tsv_path: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/verified_heterodimers.clustered.tsv
-  batch_size: 2
+  batch_size: 4
   num_workers: 4
   pin_memory: true
   center_coordinates: true
