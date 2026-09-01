@@ -30,6 +30,7 @@ from src.model.loss import (
     DistogramMAELoss,
     TverskyLoss,
     downsample_inter_negatives,
+    gaussian_label_smoothing,
 )
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
@@ -194,16 +195,22 @@ def _binary_classification_metrics(
 def _region_masks(
     pair_mask: torch.Tensor,
     label_mask: torch.Tensor,
-    p1_length: int,
+    p1_length: int | torch.Tensor,
+    p2_length: int | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid_mask = pair_mask.to(dtype=torch.bool) & label_mask.to(dtype=torch.bool)
     total_length = int(valid_mask.shape[-1])
+    if p2_length is None:
+        if isinstance(p1_length, torch.Tensor) and p1_length.ndim > 0:
+            raise ValueError("p2_length is required when p1_length is batched.")
+        p2_length = total_length - int(p1_length)
     inter_mask = inter_chain_pair_mask(
-        int(p1_length),
-        total_length - int(p1_length),
+        p1_length,
+        p2_length,
         device=valid_mask.device,
+        total_length=total_length,
     )
-    if valid_mask.ndim == 3:
+    if valid_mask.ndim == 3 and inter_mask.ndim == 2:
         inter_mask = inter_mask.unsqueeze(0)
     intra_mask = valid_mask & ~inter_mask
     inter_mask = valid_mask & inter_mask
@@ -335,12 +342,26 @@ def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
     }
 
 
+def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> dict:
+    model_kwargs = dict(model_kwargs)
+    distance_bin_count = int(distance_bin_count)
+    model_kwargs.setdefault("num_classes", distance_bin_count)
+    model_kwargs.setdefault("xt_pair_dist_dim", distance_bin_count)
+    num_classes = int(model_kwargs["num_classes"])
+    xt_pair_dist_dim = int(model_kwargs["xt_pair_dist_dim"])
+    if len({num_classes, xt_pair_dist_dim, distance_bin_count}) != 1:
+        raise ValueError(
+            "num_classes, xt_pair_dist_dim, and data.distance_bin_count must be equal, "
+            f"got {num_classes}, {xt_pair_dist_dim}, {distance_bin_count}."
+        )
+        return model_kwargs
+
+
 def _unpack_batch(step_batch, device):
-    p1_batch, p2_batch, labels = step_batch
-    p1_batch = to_device(p1_batch, device)
-    p2_batch = to_device(p2_batch, device)
+    residue_batch, labels = step_batch
+    residue_batch = to_device(residue_batch, device)
     labels = to_device(labels, device)
-    return p1_batch, p2_batch, labels
+    return residue_batch, labels
 
 
 def _set_progress_postfix(progress, **kwargs) -> None:
@@ -398,21 +419,21 @@ def train_epoch(
     for step, step_batch in enumerate(loader):
         if max_batches is not None and step >= max_batches:
             break
-        p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
+        residue_batch, labels = _unpack_batch(step_batch, device)
 
         step_recycle_rounds = resolve_train_recycle_rounds(
             recycle_rounds=recycle_rounds,
             self_conditioning_probability=self_conditioning_probability,
         )
         logits, pair_mask = model(
-            p1_batch,
-            p2_batch,
+            residue_batch,
             recycle_rounds=step_recycle_rounds,
         )
         intra_mask, inter_mask = _region_masks(
             pair_mask,
             labels["label_2d_mask"],
-            p1_length=int(p1_batch["mask"].shape[1]),
+            p1_length=residue_batch["p1_length"],
+            p2_length=residue_batch["p2_length"],
         )
         if contact_bins is not None and float(inter_neg_per_pos) > 0.0:
             inter_mask = downsample_inter_negatives(
@@ -520,16 +541,16 @@ def evaluate_epoch(
         for step, step_batch in enumerate(loader):
             if max_batches is not None and step >= max_batches:
                 break
-            p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
+            residue_batch, labels = _unpack_batch(step_batch, device)
             logits, pair_mask = model(
-                p1_batch,
-                p2_batch,
+                residue_batch,
                 recycle_rounds=max(1, int(recycle_rounds)),
             )
             intra_mask, inter_mask = _region_masks(
                 pair_mask,
                 labels["label_2d_mask"],
-                p1_length=int(p1_batch["mask"].shape[1]),
+                p1_length=residue_batch["p1_length"],
+                p2_length=residue_batch["p2_length"],
             )
             _, terms = _compute_pair_losses(
                 loss_fn,
@@ -688,7 +709,7 @@ def main(args: DictConfig):
     if isinstance(model_kwargs, DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
-    model_kwargs.setdefault("num_classes", args.data.distance_bin_count)
+    model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
     model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = wrap_ddp(model, device)

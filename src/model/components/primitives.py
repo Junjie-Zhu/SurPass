@@ -103,7 +103,7 @@ class Transition(torch.nn.Module):
             torch.nn.Linear(dim, dim_inner * 2, bias=False),
             SwiGLU(),
         )
-        self.linear_out = torch.nn.Linear(dim_inner, dim, bias=False)
+        self.linear_out = torch.nn.Linear(dim_inner, dim)
 
     def forward(self, x, mask):
         """

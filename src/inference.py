@@ -12,11 +12,16 @@ from torch.utils.data import Dataset, Subset
 from tqdm import tqdm
 
 from src.common.residue_constants import restype_order, unk_restype_index
-from src.data.dataset import get_dataloader, inter_chain_pair_mask
+from src.data.dataset import (
+    collate_concatenated_pairs,
+    get_dataloader,
+    inter_chain_pair_mask,
+)
 from src.model.surpass import ResOnly
 from src.train import (
     _binary_classification_metrics,
     _cfg_get,
+    _validate_model_bin_counts,
     contact_bin_count,
     log_info,
     resolve_cuda_device,
@@ -131,18 +136,24 @@ def build_residue_features(sequence: str, plm_emb: torch.Tensor) -> dict[str, to
 def pair_bind_scores(
     logits: torch.Tensor,
     pair_mask: torch.Tensor,
-    p1_length: int,
+    p1_length: int | torch.Tensor,
     contact_bins: int,
     ppi_score_threshold: float = 0.5,
+    p2_length: int | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     p_contact = torch.softmax(logits, dim=-1)[..., : int(contact_bins)].sum(dim=-1)
     total_length = int(p_contact.shape[-1])
+    if p2_length is None:
+        if isinstance(p1_length, torch.Tensor) and p1_length.ndim > 0:
+            raise ValueError("p2_length is required when p1_length is batched.")
+        p2_length = total_length - int(p1_length)
     inter_mask = inter_chain_pair_mask(
-        int(p1_length),
-        total_length - int(p1_length),
+        p1_length,
+        p2_length,
         device=p_contact.device,
+        total_length=total_length,
     )
-    if p_contact.ndim == 3:
+    if p_contact.ndim == 3 and inter_mask.ndim == 2:
         inter_mask = inter_mask.unsqueeze(0)
     inter_mask = inter_mask & pair_mask.to(dtype=torch.bool)
     p_bind = p_contact.masked_fill(~inter_mask, 0.0).amax(dim=(-2, -1)).clamp(0.0, 1.0)
@@ -150,33 +161,10 @@ def pair_bind_scores(
     return p_bind, n_contacts
 
 
-def _pad_value(tensor: torch.Tensor):
-    if tensor.dtype == torch.bool:
-        return False
-    if torch.is_floating_point(tensor):
-        return 0.0
-    return 0
-
-
-def _pad_first_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
-    max_n = max(t.shape[0] for t in tensors)
-    out = tensors[0].new_full((len(tensors), max_n, *tensors[0].shape[1:]), _pad_value(tensors[0]))
-    for index, tensor in enumerate(tensors):
-        out[index, : tensor.shape[0]] = tensor
-    return out
-
-
 def inference_collate_fn(batch):
     proteins, peptides, metas = zip(*batch)
-    protein_batch = {}
-    peptide_batch = {}
-    for key in proteins[0]:
-        values = [sample[key] for sample in proteins]
-        protein_batch[key] = values if not isinstance(values[0], torch.Tensor) else _pad_first_dim(values)
-    for key in peptides[0]:
-        values = [sample[key] for sample in peptides]
-        peptide_batch[key] = values if not isinstance(values[0], torch.Tensor) else _pad_first_dim(values)
-    return protein_batch, peptide_batch, list(metas)
+    residue_batch = collate_concatenated_pairs(list(proteins), list(peptides))
+    return residue_batch, list(metas)
 
 
 class InferencePairDataset(Dataset):
@@ -350,19 +338,17 @@ def evaluate_ppi(
     rows: list[dict[str, Any]] = []
 
     with torch.no_grad():
-        for p1_batch, p2_batch, metas in loader:
-            p1_batch = to_device(p1_batch, device)
-            p2_batch = to_device(p2_batch, device)
+        for residue_batch, metas in loader:
+            residue_batch = to_device(residue_batch, device)
             logits, pair_mask = model(
-                p1_batch,
-                p2_batch,
+                residue_batch,
                 recycle_rounds=max(1, int(recycle_rounds)),
             )
-            p1_length = int(p1_batch["mask"].shape[1])
             p_bind, n_contacts = pair_bind_scores(
                 logits,
                 pair_mask,
-                p1_length=p1_length,
+                p1_length=residue_batch["p1_length"],
+                p2_length=residue_batch["p2_length"],
                 contact_bins=contact_bins,
                 ppi_score_threshold=ppi_score_threshold,
             )
@@ -449,7 +435,7 @@ def main(args: DictConfig):
     if isinstance(model_kwargs, DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
-    model_kwargs.setdefault("num_classes", args.data.distance_bin_count)
+    model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint

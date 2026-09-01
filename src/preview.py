@@ -15,6 +15,7 @@ from src.model.surpass import ResOnly
 from src.train import (
     _cfg_get,
     _unpack_batch,
+    _validate_model_bin_counts,
     create_balanced_split_datasets,
     resolve_cuda_device,
 )
@@ -178,7 +179,7 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
     if isinstance(model_kwargs, DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
-    model_kwargs.setdefault("num_classes", args.data.distance_bin_count)
+    model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -208,10 +209,9 @@ def main(args: DictConfig):
 
     with torch.no_grad():
         for index, step_batch in enumerate(loader):
-            p1_batch, p2_batch, labels = _unpack_batch(step_batch, device)
+            residue_batch, labels = _unpack_batch(step_batch, device)
             logits, pair_mask = model(
-                p1_batch,
-                p2_batch,
+                residue_batch,
                 recycle_rounds=recycle_rounds,
             )
             pred_bins = logits.argmax(dim=-1)
@@ -227,7 +227,7 @@ def main(args: DictConfig):
                 label_map[0],
                 pred_map[0],
                 output_path,
-                p1_length=int(p1_batch["mask"].shape[1]),
+                p1_length=int(residue_batch["p1_length"][0].item()),
             )
             print(
                 f"[sample {index:02d}] {summarize_prediction(pred_bins[0], valid_mask[0], last_bin)} "

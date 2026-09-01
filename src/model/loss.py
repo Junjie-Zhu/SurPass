@@ -26,6 +26,25 @@ def distance_bin_centers(
     return centers
 
 
+def gaussian_label_smoothing(
+    target: torch.Tensor,
+    num_bins: int,
+    sigma: float = 0.8,
+) -> torch.Tensor:
+    """Soft distogram labels. Rows sum to 1; `sigma <= 0` is one-hot."""
+    num_bins = int(num_bins)
+    if num_bins < 1:
+        raise ValueError("num_bins must be positive.")
+    target = target.long()
+    if float(sigma) <= 0.0:
+        return F.one_hot(target.clamp(0, num_bins - 1), num_classes=num_bins).to(
+            dtype=torch.float32
+        )
+    bins = torch.arange(num_bins, device=target.device, dtype=torch.float32)
+    delta = bins - target[..., None].to(dtype=bins.dtype)
+    return torch.softmax(-0.5 * (delta / float(sigma)) ** 2, dim=-1)
+
+
 def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_float = mask.to(dtype=loss.dtype)
     return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)

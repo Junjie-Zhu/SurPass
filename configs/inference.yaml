@@ -24,7 +24,7 @@ metrics:
   positive_weight: 1.0
 
 model:
-  n_layers: 3
+  n_layers: 4
   dim_token: 256
   dim_pair: 128
   n_heads: 8
@@ -40,7 +40,8 @@ model:
   xt_pair_dist_min: 2.0
   xt_pair_dist_max: 22.0
   xt_pair_dist_dim: 64
-  idx_emb_dim: 128
+  dim_opm_inner: 32
+  dim_triangle_hidden: 32
   num_classes: 64
 
 hydra:

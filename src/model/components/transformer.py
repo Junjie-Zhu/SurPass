@@ -338,7 +338,7 @@ class MultiHeadBiasedAttentionADALN_MM(torch.nn.Module):
         Returns:
             Updated sequence representation, shape [b, n, dim_token].
         """
-        pair_mask = mask[:, :, None] * mask[:, None, :]  # [b, n, n]
+        pair_mask = mask.to(dtype=torch.bool)[:, :, None] & mask.to(dtype=torch.bool)[:, None, :]
         x = self.adaln(x, cond, mask)
         x = self.mha(node_feats=x, pair_feats=pair_rep, mask=pair_mask)
         x = self.scale_output(x, cond, mask)

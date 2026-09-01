@@ -1,12 +1,78 @@
 import math
+import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.common.residue_constants import restypes_with_x
+from src.common.residue_constants import restypes, restypes_with_x
+from src.model.components.calvados_functions import (
+    compute_ashbaugh_hatch,
+    compute_yukawa,
+    load_calvados_model,
+)
+from src.model.loss import distance_bin_centers
 
 NUM_RESIDUE_TYPES = len(restypes_with_x)
+k_BOLTZMANN = 0.0083144721  # kJ/mol/K
+CALVADOS = load_calvados_model(
+    version='CALVADOS2',
+    salt=0.150,
+    pH=7.4,
+    temp=298.15,
+    residue_pickle_path=os.path.join(os.path.dirname(__file__), "calvados_residues.pickle"),
+)
+CALVADOS_TEMP = 298.15
+_MIN_CALVADOS_DISTANCE_NM = 1e-6
+
+
+def normalize_calvados_energy(energy_kt):
+    """asinh(E/kT) keeps attractive wells nearly linear and compresses the LJ wall."""
+    return np.arcsinh(np.asarray(energy_kt, dtype=np.float64))
+
+
+def build_calvados_bin_energy_table(
+    min_dist: float,
+    max_dist: float,
+    dim: int,
+    *,
+    model=None,
+    temp: float = CALVADOS_TEMP,
+) -> torch.Tensor:
+    """CALVADOS asinh(E/kT) at each pairwise-distance bin center, shape [n_aa, n_aa, dim]."""
+    model = CALVADOS if model is None else model
+    centers_a = distance_bin_centers(min_dist, max_dist, dim).detach().cpu().numpy()
+    r_nm = np.maximum(np.asarray(centers_a, dtype=np.float64) * 0.1, _MIN_CALVADOS_DISTANCE_NM)
+
+    aa_names = list(restypes)
+    sigma = model.sigmamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
+    lam = model.lambdamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
+    yukawa_q = model.yukawa_eps.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
+
+    r_b = r_nm[None, None, :]
+    ah = compute_ashbaugh_hatch(
+        r_b,
+        sigma[:, :, None],
+        lam[:, :, None],
+        cutoff=model.cutoff,
+        lj_eps=model.lj_eps,
+    )
+    yu = compute_yukawa(
+        r_b,
+        yukawa_q[:, :, None],
+        model.yukawa_kappa,
+        yukawa_r_cut=model.yukawa_r_cut,
+    )
+    ah = np.where(r_b > model.cutoff, 0.0, ah)
+    yu = np.where(r_b > model.yukawa_r_cut, 0.0, yu)
+    energy_kt = (ah + yu) / (k_BOLTZMANN * float(temp))
+    energy_norm = normalize_calvados_energy(energy_kt)
+
+    table = np.zeros((NUM_RESIDUE_TYPES, NUM_RESIDUE_TYPES, int(dim)), dtype=np.float32)
+    n_canonical = len(aa_names)
+    table[:n_canonical, :n_canonical] = np.asarray(energy_norm, dtype=np.float32)
+    return torch.from_numpy(table)
 
 
 # Adapted from frameflow code
@@ -136,17 +202,29 @@ class ResidueEmbedder(nn.Module):
         self.xt_pair_dist_min = kwargs.get('xt_pair_dist_min', 1)
         self.xt_pair_dist_max = kwargs.get('xt_pair_dist_max', 33)
         self.xt_pair_dist_dim = kwargs.get('xt_pair_dist_dim', 64)  # 0.5 A per bin
-        self.residue_index_dim = kwargs.get('idx_emb_dim', 128)
         self.plm_in_dim = kwargs.get('plm_in_dim', 1280)
         self.plm_out_dim = kwargs.get('plm_out_dim', 256)
         
         self.plm_embedder = nn.Linear(self.plm_in_dim, self.plm_out_dim)
         
-        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + self.residue_index_dim + 1
-        self.single_out = nn.Linear(single_dim, self.dim_token, bias=False)
-    
+        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + 1
+        self.single_out = nn.Linear(single_dim, self.dim_token)
+
         pair_dim = self.xt_pair_dist_dim + 2 + 4 * (self.r_max + 1)
-        self.pair_out = nn.Linear(pair_dim, self.dim_pair, bias=False)
+        self.pair_out = nn.Linear(pair_dim, self.dim_pair)
+        self.register_buffer(
+            "calvados_bin_energies",
+            build_calvados_bin_energy_table(
+                self.xt_pair_dist_min,
+                self.xt_pair_dist_max,
+                self.xt_pair_dist_dim,
+            ),
+            persistent=False,
+        )
+
+    def calvados_pair_energies(self, residue_type: torch.Tensor) -> torch.Tensor:
+        aa = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
+        return self.calvados_bin_energies[aa[:, :, None], aa[:, None, :]]
 
     def forward(
         self,
@@ -165,9 +243,7 @@ class ResidueEmbedder(nn.Module):
         residue_type_emb = F.one_hot(residue_type, num_classes=NUM_RESIDUE_TYPES).to(
             dtype=plm_emb.dtype
         )
-        residue_index_emb = get_index_embedding(
-            residue_index, self.residue_index_dim, max_len=2056)
-        
+
         chain_break_emb = (chain_index[:, 1:] != chain_index[:, :-1]).float()  # [b, n-1]
         chain_break_emb = F.pad(chain_break_emb, (0, 1), mode="constant", value=0.0)[..., None]  # [b, n, 1]
         
@@ -197,7 +273,7 @@ class ResidueEmbedder(nn.Module):
             )
 
         single_repr = self.single_out(
-            torch.cat([plm_emb, residue_type_emb, residue_index_emb, chain_break_emb], dim=-1)
+            torch.cat([plm_emb, residue_type_emb, chain_break_emb], dim=-1)
             * mask[..., None]
         )
         pair_mask = mask[..., None] * mask[..., None, :]
