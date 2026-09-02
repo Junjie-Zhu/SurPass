@@ -1,9 +1,24 @@
-
 from typing import Optional, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import Linear, LayerNorm
+
+
+def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
+    zero_index = -1 * len(inds)
+    first_inds = list(range(len(tensor.shape[:zero_index])))
+    return tensor.permute(first_inds + [zero_index + i for i in inds])
+
+
+def _stable_triangle_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Contract over K in fp32 and scale by 1/sqrt(K) so LayerNorm does not see Inf."""
+    k = int(a.shape[-1])
+    out = torch.matmul(a.float(), b.float())
+    if k > 0:
+        out = out * (float(k) ** -0.5)
+    return out
 
 
 class TriangleMultiplicativeUpdate(nn.Module):
@@ -35,15 +50,28 @@ class TriangleMultiplicativeUpdate(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
 
-    def _combine_projections(self,
+    def _combine_projections(
+        self,
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError("This method needs to be overridden")
 
-    def forward(self, 
-        z: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None
+    def _layer_norm_out(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.layer_norm_out.weight
+        bias = self.layer_norm_out.bias
+        return F.layer_norm(
+            x.float(),
+            self.layer_norm_out.normalized_shape,
+            None if weight is None else weight.float(),
+            None if bias is None else bias.float(),
+            self.layer_norm_out.eps,
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -64,9 +92,8 @@ class TriangleMultiplicativeUpdate(nn.Module):
         a = a * mask
         b = self.linear_b_p(z) * self.sigmoid(self.linear_b_g(z))
         b = b * mask
-        x = self._combine_projections(a, b)
-        x = self.layer_norm_out(x)
-        x = self.linear_z(x)
+        x = self._layer_norm_out(self._combine_projections(a, b))
+        x = self.linear_z(x.to(dtype=z.dtype))
         g = self.sigmoid(self.linear_g(z))
         z = x * g
 
@@ -77,17 +104,15 @@ class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):
     """
     Implements Algorithm 11.
     """
-    def _combine_projections(self,
+    def _combine_projections(
+        self,
         a: torch.Tensor,  # [*, N_i, N_k, C]
         b: torch.Tensor,  # [*, N_j, N_k, C]
     ):
-        # [*, C, N_i, N_j]
-        p = torch.matmul(
+        p = _stable_triangle_matmul(
             permute_final_dims(a, (2, 0, 1)),
             permute_final_dims(b, (2, 1, 0)),
         )
-
-        # [*, N_i, N_j, C]
         return permute_final_dims(p, (1, 2, 0))
 
 
@@ -95,24 +120,13 @@ class TriangleMultiplicationIncoming(TriangleMultiplicativeUpdate):
     """
     Implements Algorithm 12.
     """
-    def _combine_projections(self,
+    def _combine_projections(
+        self,
         a: torch.Tensor,  # [*, N_k, N_i, C]
         b: torch.Tensor,  # [*, N_k, N_j, C]
     ):
-        # [*, C, N_i, N_j]
-        p = torch.matmul(
+        p = _stable_triangle_matmul(
             permute_final_dims(a, (2, 1, 0)),
             permute_final_dims(b, (2, 0, 1)),
         )
-
-        # [*, N_i, N_j, C]
         return permute_final_dims(p, (1, 2, 0))
-
-
-def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
-    zero_index = -1 * len(inds)
-    first_inds = list(range(len(tensor.shape[:zero_index])))
-    return tensor.permute(first_inds + [zero_index + i for i in inds])
-
-
-    

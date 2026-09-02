@@ -105,8 +105,8 @@ def is_loss_nan_check(loss: torch.Tensor) -> bool:
 
     nan_flag = torch.tensor(
         1.0 if is_nan(loss) else 0.0,
-        device=loss.device if torch.cuda.is_available() else None,
-    )  # support cpu
+        device=loss.device,
+    )
     # avoid "Watchdog caught collective operation timeout" error
     all_reduce_tensor(nan_flag)
     if nan_flag.item() > 0.0:

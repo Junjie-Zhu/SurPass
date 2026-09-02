@@ -32,7 +32,7 @@ from src.model.loss import (
     downsample_inter_negatives,
     gaussian_label_smoothing,
 )
-from src.model.optimizer import get_lr_scheduler, get_optimizer
+from src.model.optimizer import get_lr_scheduler, get_optimizer, is_loss_nan_check
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 
@@ -415,6 +415,8 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
     term_totals: dict[str, float] = {}
     num_steps = 0
+    accum_ok = True
+    grad_accum_steps = max(1, int(grad_accum_steps))
 
     for step, step_batch in enumerate(loader):
         if max_batches is not None and step >= max_batches:
@@ -451,23 +453,41 @@ def train_epoch(
             inter_mask,
         )
 
-        loss = raw_loss / max(1, grad_accum_steps)
-        loss.backward()
+        loss = raw_loss / grad_accum_steps
+        step_bad = bool(is_loss_nan_check(raw_loss))
+        if step_bad:
+            accum_ok = False
+            log_info(f"Non-finite loss at train step {step}; skipping backward")
+        else:
+            loss.backward()
 
-        should_step = ((step + 1) % max(1, grad_accum_steps) == 0) or (
+        should_step = ((step + 1) % grad_accum_steps == 0) or (
             step + 1 == len(loader)
         )
         if should_step:
-            if max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            if accum_ok:
+                clip_limit = float(max_grad_norm) if float(max_grad_norm) > 0.0 else float("inf")
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
+                if not torch.isfinite(grad_norm):
+                    accum_ok = False
+                    log_info(
+                        f"Non-finite gradients at train step {step}; skipping optimizer step"
+                    )
+            if accum_ok:
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+            else:
+                log_info(
+                    f"Skipping optimizer step at train step {step} due to non-finite loss or gradients"
+                )
             optimizer.zero_grad(set_to_none=True)
+            accum_ok = True
 
         term_floats = _terms_to_floats(terms)
-        _accumulate_floats(term_totals, term_floats)
-        num_steps += 1
+        if not step_bad:
+            _accumulate_floats(term_totals, term_floats)
+            num_steps += 1
         _set_progress_postfix(loader, **_progress_postfix(term_floats))
         if step_logger is not None:
             step_logger(term_floats)
