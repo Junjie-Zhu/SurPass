@@ -12,7 +12,7 @@ self_conditioning_probability: 0.5
 data:
   root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
   cluster_tsv_path: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/verified_heterodimers.clustered.tsv
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   pin_memory: true
   center_coordinates: true
@@ -23,12 +23,12 @@ data:
   distance_bin_end: 22.0
   distance_bin_count: 64
   contact_threshold: 8.0
-  crop_size: 192
+  crop_size: 128
 
 model:
-  n_layers: 4
-  dim_token: 256
-  dim_pair: 128
+  n_layers: 8
+  dim_token: 128
+  dim_pair: 64
   n_heads: 8
   residual_mha: true
   residual_transition: true
@@ -37,7 +37,7 @@ model:
   dropout: 0.0
   expansion_factor: 2
   plm_in_dim: 1280
-  plm_out_dim: 256
+  plm_out_dim: 128
   r_max: 32
   xt_pair_dist_min: 2.0
   xt_pair_dist_max: 22.0
@@ -73,7 +73,7 @@ optimizer:
   decay_every_n_steps: 25000
   decay_factor: 0.95
   grad_accum_steps: 1
-  max_grad_norm: 0.0
+  max_grad_norm: 1.0
 
 metrics:
   positive_weight: 1.0

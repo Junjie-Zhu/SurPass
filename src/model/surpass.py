@@ -127,6 +127,7 @@ class ResOnly(nn.Module):
             Transition(
                 dim=dim_pair,
                 expansion_factor=expansion_factor,
+                layer_norm=True,
             ) for _ in range(n_layers)
         ])
 

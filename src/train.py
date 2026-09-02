@@ -370,6 +370,10 @@ def _set_progress_postfix(progress, **kwargs) -> None:
         set_postfix(**kwargs)
 
 
+def _release_rejected_loss_graph(loss: torch.Tensor) -> None:
+    loss.backward(gradient=torch.zeros_like(loss))
+
+
 def resolve_cuda_device(local_rank: int, device_count: int) -> torch.device:
     if device_count <= 0:
         return torch.device("cpu")
@@ -457,7 +461,8 @@ def train_epoch(
         step_bad = bool(is_loss_nan_check(raw_loss))
         if step_bad:
             accum_ok = False
-            log_info(f"Non-finite loss at train step {step}; skipping backward")
+            log_info(f"Non-finite loss at train step {step}; discarding loss graph")
+            _release_rejected_loss_graph(loss)
         else:
             loss.backward()
 
