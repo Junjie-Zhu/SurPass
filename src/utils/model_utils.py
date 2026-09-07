@@ -1,4 +1,5 @@
 from typing import Union, Tuple, List
+from functools import partial
 
 import torch
 from torch import nn
@@ -102,3 +103,30 @@ def move_final_dim_to_dim(x: torch.Tensor, dim: int) -> torch.Tensor:
         new_order = new_order + tuple(range(dim, n_dim - 1))
 
     return x.permute(new_order)
+
+
+def dict_map(fn, dic, leaf_type):
+    new_dict = {}
+    for k, v in dic.items():
+        if type(v) is dict:
+            new_dict[k] = dict_map(fn, v, leaf_type)
+        else:
+            new_dict[k] = tree_map(fn, v, leaf_type)
+
+    return new_dict
+
+
+def tree_map(fn, tree, leaf_type):
+    if isinstance(tree, dict):
+        return dict_map(fn, tree, leaf_type)
+    elif isinstance(tree, list):
+        return [tree_map(fn, x, leaf_type) for x in tree]
+    elif isinstance(tree, tuple):
+        return tuple([tree_map(fn, x, leaf_type) for x in tree])
+    elif isinstance(tree, leaf_type):
+        return fn(tree)
+    else:
+        raise ValueError(f"Tree of type {type(tree)} not supported")
+
+
+tensor_tree_map = partial(tree_map, leaf_type=torch.Tensor)

@@ -26,44 +26,9 @@ def distance_bin_centers(
     return centers
 
 
-def gaussian_label_smoothing(
-    target: torch.Tensor,
-    num_bins: int,
-    sigma: float = 0.8,
-) -> torch.Tensor:
-    """Soft distogram labels. Rows sum to 1; `sigma <= 0` is one-hot."""
-    num_bins = int(num_bins)
-    if num_bins < 1:
-        raise ValueError("num_bins must be positive.")
-    target = target.long()
-    if float(sigma) <= 0.0:
-        return F.one_hot(target.clamp(0, num_bins - 1), num_classes=num_bins).to(
-            dtype=torch.float32
-        )
-    bins = torch.arange(num_bins, device=target.device, dtype=torch.float32)
-    delta = bins - target[..., None].to(dtype=bins.dtype)
-    return torch.softmax(-0.5 * (delta / float(sigma)) ** 2, dim=-1)
-
-
 def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_float = mask.to(dtype=loss.dtype)
     return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
-
-
-def inverse_frequency_pair_weights(
-    mask: torch.Tensor,
-    is_contact: torch.Tensor,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Balanced pos/neg weights: N / (2 * N_class) over pairs in `mask`."""
-    mask_bool = mask.to(dtype=torch.bool)
-    contact_bool = is_contact.to(dtype=torch.bool) & mask_bool
-    n_pairs = mask_bool.to(dtype=dtype).sum().clamp_min(1.0)
-    n_pos = contact_bool.to(dtype=dtype).sum().clamp_min(1.0)
-    n_neg = (mask_bool & ~contact_bool).to(dtype=dtype).sum().clamp_min(1.0)
-    w_pos = n_pairs / (2.0 * n_pos)
-    w_neg = n_pairs / (2.0 * n_neg)
-    return torch.where(contact_bool, w_pos, w_neg)
 
 
 def downsample_inter_negatives(
@@ -147,7 +112,7 @@ class DistogramCELoss(nn.Module):
 
 
 class FocalCELoss(nn.Module):
-    """Focal CE: intra uses a flat contact alpha; inter uses inverse-frequency weights."""
+    """Focal CE with a flat contact-bin alpha on both intra and inter pairs."""
 
     def __init__(
         self,
@@ -176,21 +141,17 @@ class FocalCELoss(nn.Module):
             target,
             reduction="none",
         )
+
         p_t = torch.exp(-ce_loss)
         focal = ((1.0 - p_t).clamp(min=0.0) ** self.gamma) * ce_loss
         is_contact = target < self.contact_bins
-        intra_weight = torch.where(
+        pos_weight = torch.where(
             is_contact,
             focal.new_tensor(self.alpha),
             focal.new_tensor(1.0),
         )
-        inter_weight = inverse_frequency_pair_weights(
-            inter_mask, is_contact, dtype=focal.dtype
-        )
-        return (
-            _masked_mean(focal * intra_weight, intra_mask),
-            _masked_mean(focal * inter_weight, inter_mask),
-        )
+        focal = focal * pos_weight
+        return _masked_mean(focal, intra_mask), _masked_mean(focal, inter_mask)
 
 
 class DistogramMAELoss(nn.Module):

@@ -3,7 +3,7 @@ logging_dir: logs
 seed: 42
 deterministic: false
 epochs: 200
-checkpoint_interval: 10
+checkpoint_interval: 1
 ckpt_dir: null
 load_model_only: false
 recycle_rounds: 1
@@ -12,18 +12,19 @@ self_conditioning_probability: 0.5
 data:
   root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
   cluster_tsv_path: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/verified_heterodimers.clustered.tsv
-  batch_size: 8
-  num_workers: 4
+  batch_size: 6
+  num_workers: 6
   pin_memory: true
   center_coordinates: true
   random_rotation: true
-  test_fraction: 0.2
-  negative_ratio: 0
+  test_fraction: 0.15
+  negative_ratio: 1
   distance_bin_start: 2.0
   distance_bin_end: 22.0
   distance_bin_count: 64
   contact_threshold: 8.0
   crop_size: 128
+  crop_contiguous_prob: 0.3
 
 model:
   n_layers: 8
@@ -50,7 +51,6 @@ loss:
   intra: 0.3
   inter: 0.7
   inter_neg_per_pos: 0
-  gaussian_sigma: 0.8
   focal:
     weight: 1.0
     gamma: 1.5
@@ -59,18 +59,18 @@ loss:
     weight: 0.2
   tversky:
     weight: 1.0
-    alpha: 0.7
+    alpha: 0.5
     beta: 0.3
 
 optimizer:
   lr: 0.0005
-  weight_decay: 1e-5
+  weight_decay: 1e-6
   beta1: 0.9
   beta2: 0.999
   use_adamw: true
   lr_scheduler: af3
   warmup_steps: 500
-  decay_every_n_steps: 25000
+  decay_every_n_steps: 15000
   decay_factor: 0.95
   grad_accum_steps: 1
   max_grad_norm: 1.0
@@ -96,3 +96,4 @@ hydra:
   
 performance:
   empty_cache_each_step: false
+

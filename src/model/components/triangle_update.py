@@ -57,17 +57,6 @@ class TriangleMultiplicativeUpdate(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError("This method needs to be overridden")
 
-    def _layer_norm_out(self, x: torch.Tensor) -> torch.Tensor:
-        weight = self.layer_norm_out.weight
-        bias = self.layer_norm_out.bias
-        return F.layer_norm(
-            x.float(),
-            self.layer_norm_out.normalized_shape,
-            None if weight is None else weight.float(),
-            None if bias is None else bias.float(),
-            self.layer_norm_out.eps,
-        )
-
     def forward(
         self,
         z: torch.Tensor,
@@ -92,7 +81,7 @@ class TriangleMultiplicativeUpdate(nn.Module):
         a = a * mask
         b = self.linear_b_p(z) * self.sigmoid(self.linear_b_g(z))
         b = b * mask
-        x = self._layer_norm_out(self._combine_projections(a, b))
+        x = self.layer_norm_out(self._combine_projections(a, b))
         x = self.linear_z(x.to(dtype=z.dtype))
         g = self.sigmoid(self.linear_g(z))
         z = x * g

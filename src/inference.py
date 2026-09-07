@@ -15,7 +15,6 @@ from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.dataset import (
     collate_concatenated_pairs,
     get_dataloader,
-    inter_chain_pair_mask,
 )
 from src.model.surpass import ResOnly
 from src.train import (
@@ -24,6 +23,7 @@ from src.train import (
     _validate_model_bin_counts,
     contact_bin_count,
     log_info,
+    pair_bind_scores,
     resolve_cuda_device,
     resolve_dist_backend,
     to_device,
@@ -131,34 +131,6 @@ def build_residue_features(sequence: str, plm_emb: torch.Tensor) -> dict[str, to
         "mask": torch.ones(length, dtype=torch.bool),
         "residue_position": torch.zeros(length, 3, dtype=torch.float32),
     }
-
-
-def pair_bind_scores(
-    logits: torch.Tensor,
-    pair_mask: torch.Tensor,
-    p1_length: int | torch.Tensor,
-    contact_bins: int,
-    ppi_score_threshold: float = 0.5,
-    p2_length: int | torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    p_contact = torch.softmax(logits, dim=-1)[..., : int(contact_bins)].sum(dim=-1)
-    total_length = int(p_contact.shape[-1])
-    if p2_length is None:
-        if isinstance(p1_length, torch.Tensor) and p1_length.ndim > 0:
-            raise ValueError("p2_length is required when p1_length is batched.")
-        p2_length = total_length - int(p1_length)
-    inter_mask = inter_chain_pair_mask(
-        p1_length,
-        p2_length,
-        device=p_contact.device,
-        total_length=total_length,
-    )
-    if p_contact.ndim == 3 and inter_mask.ndim == 2:
-        inter_mask = inter_mask.unsqueeze(0)
-    inter_mask = inter_mask & pair_mask.to(dtype=torch.bool)
-    p_bind = p_contact.masked_fill(~inter_mask, 0.0).amax(dim=(-2, -1)).clamp(0.0, 1.0)
-    n_contacts = (p_contact.ge(float(ppi_score_threshold)) & inter_mask).sum(dim=(-2, -1))
-    return p_bind, n_contacts
 
 
 def inference_collate_fn(batch):

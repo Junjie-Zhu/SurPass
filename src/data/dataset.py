@@ -18,6 +18,7 @@ ATOM14_CB_INDEX = 4
 DEFAULT_CROP_SIZE = 256
 DEFAULT_CROP_NEIGHBORHOOD_SIZE = 10
 DEFAULT_CONTACT_THRESHOLD_A = 8.0
+DEFAULT_CROP_CONTIGUOUS_PROBABILITY = 0.3
 
 
 def distance_to_bins(
@@ -191,7 +192,7 @@ def collate_concatenated_pairs(proteins: list[dict], peptides: list[dict]) -> di
 
 
 def collate_fn(batch):
-    proteins, peptides, labels_2d_bins, labels_2d_mask = zip(*batch)
+    proteins, peptides, labels_2d_bins, labels_2d_mask, is_positive = zip(*batch)
     residue_batch = collate_concatenated_pairs(list(proteins), list(peptides))
     max_total = int(residue_batch["mask"].shape[1])
     label_batch = {
@@ -203,6 +204,7 @@ def collate_fn(batch):
             [tensor.to(dtype=torch.bool) for tensor in labels_2d_mask],
             max_total,
         ),
+        "is_positive": torch.tensor(list(is_positive), dtype=torch.bool),
     }
     return residue_batch, label_batch
 
@@ -242,6 +244,7 @@ class PepoTrainDataset(Dataset):
         distance_bin_count: int = DISTANCE_BIN_NUM,
         crop_size: int | None = DEFAULT_CROP_SIZE,
         crop_neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
+        crop_contiguous_probability: float = DEFAULT_CROP_CONTIGUOUS_PROBABILITY,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
     ):
         self.root_dir = Path(root_dir)
@@ -254,6 +257,7 @@ class PepoTrainDataset(Dataset):
         self.distance_bin_count = int(distance_bin_count)
         self.crop_size = None if crop_size is None else int(crop_size)
         self.crop_neighborhood_size = int(crop_neighborhood_size)
+        self.crop_contiguous_probability = float(crop_contiguous_probability)
         self.contact_threshold = float(contact_threshold)
 
         if self.distance_bin_count <= 0:
@@ -262,6 +266,8 @@ class PepoTrainDataset(Dataset):
             raise ValueError("crop_size must be positive when provided.")
         if self.crop_neighborhood_size <= 0:
             raise ValueError("crop_neighborhood_size must be positive.")
+        if not 0.0 <= self.crop_contiguous_probability <= 1.0:
+            raise ValueError("crop_contiguous_probability must be between 0 and 1.")
 
         self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
         required_columns = {"chain1", "chain2", "label_path", "ppi_cluster_id"}
@@ -314,7 +320,7 @@ class PepoTrainDataset(Dataset):
         )
         label_mask = pairwise_mask
 
-        sample = (p1_features, p2_features, label_bins, label_mask)
+        sample = (p1_features, p2_features, label_bins, label_mask, True)
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -338,7 +344,7 @@ class PepoTrainDataset(Dataset):
             bin_end=self.distance_bin_end,
             bin_count=self.distance_bin_count,
         )
-        sample = (p1_features, p2_features, label_bins, label_mask)
+        sample = (p1_features, p2_features, label_bins, label_mask, False)
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -404,15 +410,19 @@ class PepoTrainDataset(Dataset):
 
         p1_length = int(p1_features["mask"].shape[0])
         p2_length = int(p2_features["mask"].shape[0])
-        cross_dist = pairwise_dist[:p1_length, p1_length : p1_length + p2_length]
-        cross_mask = pairwise_mask[:p1_length, p1_length : p1_length + p2_length]
-        p1_idx, p2_idx = self._select_interface_crop_indices(
-            cross_dist,
-            cross_mask,
-            crop_size=self.crop_size,
-            contact_threshold=self.contact_threshold,
-            neighborhood_size=self.crop_neighborhood_size,
-        )
+        if self._should_use_contiguous_crop():
+            p1_idx = self._select_contiguous_crop_indices(p1_length, self.crop_size)
+            p2_idx = self._select_contiguous_crop_indices(p2_length, self.crop_size)
+        else:
+            cross_dist = pairwise_dist[:p1_length, p1_length : p1_length + p2_length]
+            cross_mask = pairwise_mask[:p1_length, p1_length : p1_length + p2_length]
+            p1_idx, p2_idx = self._select_interface_crop_indices(
+                cross_dist,
+                cross_mask,
+                crop_size=self.crop_size,
+                contact_threshold=self.contact_threshold,
+                neighborhood_size=self.crop_neighborhood_size,
+            )
         full_idx = torch.cat([p1_idx, p2_idx + p1_length], dim=0)
         p1_features = self._slice_complex_features(p1_features, p1_idx)
         p2_features = self._slice_complex_features(p2_features, p2_idx)
@@ -437,6 +447,14 @@ class PepoTrainDataset(Dataset):
             self._slice_complex_features(p2_features, p2_idx),
         )
 
+    def _should_use_contiguous_crop(self) -> bool:
+        probability = float(self.crop_contiguous_probability)
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        return random.random() < probability
+
     @staticmethod
     def _select_interface_crop_indices(
         pairwise_dist: torch.Tensor,
@@ -457,16 +475,8 @@ class PepoTrainDataset(Dataset):
             )
 
         contacts = torch.nonzero(contact_mask, as_tuple=False)
-        contact_scores_1 = contact_mask.to(dtype=torch.float32).sum(dim=1)
-        contact_scores_2 = contact_mask.to(dtype=torch.float32).sum(dim=0)
-        order = sorted(
-            range(int(contacts.shape[0])),
-            key=lambda i: (
-                -float(contact_scores_1[int(contacts[i, 0])].item() + contact_scores_2[int(contacts[i, 1])].item()),
-                int(contacts[i, 0]),
-                int(contacts[i, 1]),
-            ),
-        )
+        order = list(range(int(contacts.shape[0])))
+        random.shuffle(order)
 
         p1_selected = PepoTrainDataset._gather_neighbor_indices(
             [int(contacts[i, 0]) for i in order],

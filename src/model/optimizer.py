@@ -4,7 +4,6 @@ import warnings
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 from torch.optim.lr_scheduler import LRScheduler
 
 
@@ -83,35 +82,6 @@ def get_optimizer(
             betas=(betas[0], betas[1]),
         )
     return optimizer
-
-
-def is_loss_nan_check(loss: torch.Tensor) -> bool:
-    """check the validness of the current loss
-
-    Args:
-        loss: the loss from the model
-
-    Returns:
-        bool: if True, loss is not nan or inf
-    """
-
-    def is_nan(x):
-        return torch.isnan(x).any() or torch.isinf(x).any()
-
-    def all_reduce_tensor(tensor, op=dist.ReduceOp.SUM):
-        if dist.is_initialized():
-            dist.all_reduce(tensor, op=op)
-        return tensor
-
-    nan_flag = torch.tensor(
-        1.0 if is_nan(loss) else 0.0,
-        device=loss.device,
-    )
-    # avoid "Watchdog caught collective operation timeout" error
-    all_reduce_tensor(nan_flag)
-    if nan_flag.item() > 0.0:
-        return True
-    return False
 
 
 class CosineAnnealingWithWarmup(LRScheduler):

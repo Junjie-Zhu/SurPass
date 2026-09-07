@@ -4,7 +4,7 @@ import warnings
 from typing import Any, Callable, Dict
 
 import hydra
-from sklearn.metrics import precision_recall_curve, roc_curve, auc
+from sklearn.metrics import average_precision_score, roc_curve, auc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -30,11 +30,11 @@ from src.model.loss import (
     DistogramMAELoss,
     TverskyLoss,
     downsample_inter_negatives,
-    gaussian_label_smoothing,
 )
-from src.model.optimizer import get_lr_scheduler, get_optimizer, is_loss_nan_check
+from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
+from src.utils.nan_monitor import abort_if_nonfinite_loss
 
 try:
     import torch_npu
@@ -185,10 +185,9 @@ def _binary_classification_metrics(
         sample_weight = 1.0 + (weight - 1.0) * target_bool.astype("float64")
     fpr, tpr, _ = roc_curve(target_bool, scores, sample_weight=sample_weight)
     auroc = auc(fpr, tpr)
-    precision, recall, _ = precision_recall_curve(
+    auprc = average_precision_score(
         target_bool, scores, sample_weight=sample_weight
     )
-    auprc = auc(recall, precision)
     return {"auroc": float(auroc), "auprc": float(auprc)}
 
 
@@ -215,6 +214,55 @@ def _region_masks(
     intra_mask = valid_mask & ~inter_mask
     inter_mask = valid_mask & inter_mask
     return intra_mask, inter_mask
+
+
+def pair_bind_scores(
+    logits: torch.Tensor,
+    pair_mask: torch.Tensor,
+    p1_length: int | torch.Tensor,
+    contact_bins: int,
+    ppi_score_threshold: float = 0.5,
+    p2_length: int | torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    p_contact = torch.softmax(logits, dim=-1)[..., : int(contact_bins)].sum(dim=-1)
+    total_length = int(p_contact.shape[-1])
+    if p2_length is None:
+        if isinstance(p1_length, torch.Tensor) and p1_length.ndim > 0:
+            raise ValueError("p2_length is required when p1_length is batched.")
+        p2_length = total_length - int(p1_length)
+    inter_mask = inter_chain_pair_mask(
+        p1_length,
+        p2_length,
+        device=p_contact.device,
+        total_length=total_length,
+    )
+    if p_contact.ndim == 3 and inter_mask.ndim == 2:
+        inter_mask = inter_mask.unsqueeze(0)
+    inter_mask = inter_mask & pair_mask.to(dtype=torch.bool)
+    p_bind = p_contact.masked_fill(~inter_mask, 0.0).amax(dim=(-2, -1)).clamp(0.0, 1.0)
+    n_contacts = (p_contact.ge(float(ppi_score_threshold)) & inter_mask).sum(dim=(-2, -1))
+    return p_bind, n_contacts
+
+
+def _sample_scores_and_targets(
+    logits: torch.Tensor,
+    pair_mask: torch.Tensor,
+    p1_length: int | torch.Tensor,
+    p2_length: int | torch.Tensor,
+    is_positive: torch.Tensor,
+    contact_bins: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    p_bind, _ = pair_bind_scores(
+        logits,
+        pair_mask,
+        p1_length=p1_length,
+        p2_length=p2_length,
+        contact_bins=contact_bins,
+    )
+    return (
+        p_bind.detach().reshape(-1).cpu(),
+        is_positive.detach().reshape(-1).to(dtype=torch.bool).cpu(),
+    )
 
 
 def _compute_pair_losses(
@@ -414,12 +462,13 @@ def train_epoch(
     step_logger: Callable[[dict[str, float]], None] | None = None,
     contact_bins: int | None = None,
     inter_neg_per_pos: float = 0.0,
+    dump_dir: str | None = None,
+    epoch: int = 0,
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     term_totals: dict[str, float] = {}
     num_steps = 0
-    accum_ok = True
     grad_accum_steps = max(1, int(grad_accum_steps))
 
     for step, step_batch in enumerate(loader):
@@ -458,41 +507,38 @@ def train_epoch(
         )
 
         loss = raw_loss / grad_accum_steps
-        step_bad = bool(is_loss_nan_check(raw_loss))
-        if step_bad:
-            accum_ok = False
-            log_info(f"Non-finite loss at train step {step}; discarding loss graph")
-            _release_rejected_loss_graph(loss)
-        else:
-            loss.backward()
+        # abort_if_nonfinite_loss(
+        #     loss=loss,
+        #     residue_batch=residue_batch,
+        #     labels=labels,
+        #     logits=logits,
+        #     pair_mask=pair_mask,
+        #     intra_mask=intra_mask,
+        #     inter_mask=inter_mask,
+        #     terms=terms,
+        #     model=model,
+        #     optimizer=optimizer,
+        #     recycle_rounds=step_recycle_rounds,
+        #     epoch=epoch,
+        #     step=step,
+        #     dump_dir=dump_dir,
+        # )
+        loss.backward()
 
         should_step = ((step + 1) % grad_accum_steps == 0) or (
             step + 1 == len(loader)
         )
         if should_step:
-            if accum_ok:
-                clip_limit = float(max_grad_norm) if float(max_grad_norm) > 0.0 else float("inf")
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
-                if not torch.isfinite(grad_norm):
-                    accum_ok = False
-                    log_info(
-                        f"Non-finite gradients at train step {step}; skipping optimizer step"
-                    )
-            if accum_ok:
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-            else:
-                log_info(
-                    f"Skipping optimizer step at train step {step} due to non-finite loss or gradients"
-                )
+            clip_limit = float(max_grad_norm) if float(max_grad_norm) > 0.0 else float("inf")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            accum_ok = True
 
         term_floats = _terms_to_floats(terms)
-        if not step_bad:
-            _accumulate_floats(term_totals, term_floats)
-            num_steps += 1
+        _accumulate_floats(term_totals, term_floats)
+        num_steps += 1
         _set_progress_postfix(loader, **_progress_postfix(term_floats))
         if step_logger is not None:
             step_logger(term_floats)
@@ -555,6 +601,8 @@ def evaluate_epoch(
     inter_target_rows = []
     intra_score_rows = []
     intra_target_rows = []
+    sample_score_rows = []
+    sample_target_rows = []
     n_contact_bins = contact_bin_count(
         contact_threshold,
         distance_bin_start,
@@ -592,6 +640,16 @@ def evaluate_epoch(
             inter_target_rows.append(contacts[inter_mask].detach().cpu())
             intra_score_rows.append(probs[intra_mask].detach().cpu())
             intra_target_rows.append(contacts[intra_mask].detach().cpu())
+            sample_scores, sample_targets = _sample_scores_and_targets(
+                logits,
+                pair_mask,
+                residue_batch["p1_length"],
+                residue_batch["p2_length"],
+                labels["is_positive"],
+                n_contact_bins,
+            )
+            sample_score_rows.append(sample_scores)
+            sample_target_rows.append(sample_targets)
 
             term_floats = _terms_to_floats(terms)
             _accumulate_floats(term_totals, term_floats)
@@ -604,6 +662,9 @@ def evaluate_epoch(
     intra_metrics = _contact_metrics_from_rows(
         intra_score_rows, intra_target_rows, positive_weight=positive_weight
     )
+    sample_metrics = _contact_metrics_from_rows(
+        sample_score_rows, sample_target_rows, positive_weight=positive_weight
+    )
     metrics = _mean_floats(term_totals, num_steps)
     metrics.update(
         {
@@ -613,6 +674,9 @@ def evaluate_epoch(
             "intra_auroc": intra_metrics["auroc"],
             "intra_auprc": intra_metrics["auprc"],
             "intra_contact_prev": intra_metrics["contact_prev"],
+            "sample_auroc": sample_metrics["auroc"],
+            "sample_auprc": sample_metrics["auprc"],
+            "sample_prev": sample_metrics["contact_prev"],
         }
     )
     return metrics
@@ -677,6 +741,9 @@ def main(args: DictConfig):
         distance_bin_end=args.data.distance_bin_end,
         distance_bin_count=args.data.distance_bin_count,
         crop_size=args.data.crop_size,
+        crop_contiguous_probability=float(
+            _cfg_get(args, "data.crop_contiguous_prob", default=0.3)
+        ),
         contact_threshold=args.data.contact_threshold,
     )
     train_dataset, test_dataset = create_balanced_split_datasets(
@@ -822,6 +889,9 @@ def main(args: DictConfig):
         "test_intra_auroc",
         "test_intra_auprc",
         "test_intra_contact_prev",
+        "test_sample_auroc",
+        "test_sample_auprc",
+        "test_sample_prev",
     ]
     if DIST_WRAPPER.rank == 0:
         with open(csv_path, "w", encoding="utf-8") as f:
@@ -871,6 +941,8 @@ def main(args: DictConfig):
             step_logger=log_train_step,
             contact_bins=n_contact_bins,
             inter_neg_per_pos=float(_cfg_get(args, "loss.inter_neg_per_pos", default=4.0)),
+            dump_dir=logging_dir,
+            epoch=crt_epoch,
         )
 
         test_iter = test_loader
@@ -903,6 +975,7 @@ def main(args: DictConfig):
                     test=f"{test_metrics.get('total', float('nan')):.3f}",
                     iAUC=f"{test_metrics.get('inter_auroc', float('nan')):.3f}",
                     oAUC=f"{test_metrics.get('intra_auroc', float('nan')):.3f}",
+                    sAUPRC=f"{test_metrics.get('sample_auprc', float('nan')):.3f}",
                 )
                 epoch_progress.update()
 
@@ -933,7 +1006,8 @@ def main(args: DictConfig):
                 f"tv={train_metrics.get('tversky', float('nan')):.4f} "
                 f"inter_auroc={test_metrics.get('inter_auroc', float('nan')):.4f} "
                 f"inter_auprc={test_metrics.get('inter_auprc', float('nan')):.4f} "
-                f"intra_auroc={test_metrics.get('intra_auroc', float('nan')):.4f}"
+                f"intra_auroc={test_metrics.get('intra_auroc', float('nan')):.4f} "
+                f"sample_auprc={test_metrics.get('sample_auprc', float('nan')):.4f}"
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:

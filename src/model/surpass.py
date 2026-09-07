@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -9,6 +9,7 @@ from src.model.components.transformer import (
 )
 from src.model.components.embedder import ResidueEmbedder
 from src.model.components.triangle_update import TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming
+# from src.model.components.outer_product_mean import OuterProductMean
 
 _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
 
@@ -16,14 +17,14 @@ _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
 class OuterProductMean(nn.Module):
     def __init__(
         self,
-        dim_token=256,
-        dim_inner=32,
-        dim_pair=128,
+        c_m=256,
+        c_hidden=32,
+        c_z=128,
     ):
         super().__init__()
-        self.layernorm = nn.LayerNorm(dim_token)
-        self.linear_no_bias = nn.Linear(dim_token, dim_inner, bias=False)
-        self.linear_out = nn.Linear(dim_inner ** 2, dim_pair)
+        self.layernorm = nn.LayerNorm(c_m)
+        self.linear_no_bias = nn.Linear(c_m, c_hidden, bias=False)
+        self.linear_out = nn.Linear(c_hidden ** 2, c_z)
 
     def forward(
         self,
@@ -103,9 +104,9 @@ class ResOnly(nn.Module):
 
         self.outer_product_mean = nn.ModuleList([
             OuterProductMean(
-                dim_token=dim_token,
-                dim_inner=dim_opm_inner,
-                dim_pair=dim_pair,
+                c_m=dim_token,
+                c_z=dim_pair,
+                c_hidden=dim_opm_inner,
             ) for _ in range(n_layers)
         ])
 
@@ -113,6 +114,7 @@ class ResOnly(nn.Module):
             TriangleMultiplicationOutgoing(
                 c_z=dim_pair,
                 c_hidden=dim_triangle_hidden,
+                layer_norm=True,
             ) for _ in range(n_layers)
         ])
 
@@ -155,14 +157,10 @@ class ResOnly(nn.Module):
 
     def forward(
         self,
-        p1_batch: Dict[str, torch.Tensor],
-        p2_batch: Dict[str, torch.Tensor] | None = None,
+        residue_batch: Dict[str, torch.Tensor],
         self_conditioning_bins: torch.Tensor | None = None,
         recycle_rounds: int = 1,
     ):
-        residue_batch = (
-            p1_batch if p2_batch is None else self._concat_batches(p1_batch, p2_batch)
-        )
         recycle_rounds = max(1, int(recycle_rounds))
         if self_conditioning_bins is None:
             self_conditioning_bins = self._init_self_conditioning(residue_batch)
@@ -181,41 +179,12 @@ class ResOnly(nn.Module):
     ) -> torch.Tensor:
         return self.residue_embedder.calvados_pair_energies(residue_batch["residue_type"])
 
-    @staticmethod
-    def _concat_batches(
-        p1_batch: Dict[str, torch.Tensor],
-        p2_batch: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        concat_batch = {}
-        for key, p1_value in p1_batch.items():
-            if key in _RESIDUE_LENGTH_KEYS:
-                continue
-            p2_value = p2_batch[key]
-            if key == "chain_index":
-                p1_chain_index = p1_value.long()
-                p2_chain_index = p2_value.long() + p1_chain_index.amax(dim=1, keepdim=True) + 1
-                concat_batch[key] = torch.cat([p1_chain_index, p2_chain_index], dim=1)
-            else:
-                concat_batch[key] = torch.cat([p1_value, p2_value], dim=1)
-        return concat_batch
-
     def _forward_once(
         self,
         residue_batch: Dict[str, torch.Tensor],
         self_conditioning_bins: torch.Tensor,
+        chunk_size: Optional[int] = None,
     ):
-        expected_shape = (
-            residue_batch["mask"].shape[0],
-            residue_batch["mask"].shape[1],
-            residue_batch["mask"].shape[1],
-            self.residue_embedder.xt_pair_dist_dim,
-        )
-        if tuple(self_conditioning_bins.shape) != expected_shape:
-            raise ValueError(
-                f"self_conditioning_bins shape {tuple(self_conditioning_bins.shape)} "
-                f"does not match expected shape {expected_shape}."
-            )
-
         embedder_inputs = {
             key: value
             for key, value in residue_batch.items()
@@ -238,10 +207,11 @@ class ResOnly(nn.Module):
                 single_repr, # conditioning by itself
                 mask,
             )
-            # outer pruduct mean
+            # outer product mean
             pair_repr = pair_repr + self.outer_product_mean[i](
-                single_repr, 
-                mask,
+                single_repr.unsqueeze(-3),  # [*, 1, N_res, C_m]
+                mask.unsqueeze(-2),  # [*, 1, N_res]
+                chunk_size=chunk_size,
             ) * pair_mask_float[..., None]
             # triangle multiplication
             pair_repr = pair_repr + self.triangle_multiplication_outgoing[i](
