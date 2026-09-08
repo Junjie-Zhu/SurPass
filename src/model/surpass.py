@@ -114,7 +114,6 @@ class ResOnly(nn.Module):
             TriangleMultiplicationOutgoing(
                 c_z=dim_pair,
                 c_hidden=dim_triangle_hidden,
-                layer_norm=True,
             ) for _ in range(n_layers)
         ])
 
