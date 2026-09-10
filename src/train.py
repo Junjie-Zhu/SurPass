@@ -34,7 +34,7 @@ from src.model.loss import (
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
-from src.utils.nan_monitor import abort_if_nonfinite_loss
+# from src.utils.nan_monitor import abort_if_nonfinite_loss
 
 try:
     import torch_npu

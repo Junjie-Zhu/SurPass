@@ -50,11 +50,11 @@ model:
 loss:
   intra: 0.3
   inter: 0.7
-  inter_neg_per_pos: 0
+  inter_neg_per_pos: 5.0
   focal:
     weight: 1.0
     gamma: 1.5
-    alpha: 3.0
+    alpha: 5.0
   mae:
     weight: 0.2
   tversky:
