@@ -338,9 +338,7 @@ def evaluate_ppi(
                 if "index" in meta:
                     row["_index"] = meta["index"]
                 rows.append(row)
-            set_postfix = getattr(loader, "set_postfix", None)
-            if callable(set_postfix) and len(p_bind) > 0:
-                set_postfix(p_bind=f"{float(p_bind[0].item()):.3f}")
+            print(p_bind)
 
     return rows, metrics_from_prediction_rows(rows, positive_weight=positive_weight)
 
@@ -414,17 +412,10 @@ def main(args: DictConfig):
     model.load_state_dict(state_dict)
     del checkpoint
 
-    eval_iter = tqdm(
-        loader,
-        desc="Inference",
-        total=len(loader),
-        leave=True,
-        disable=DIST_WRAPPER.rank != 0,
-    )
     positive_weight = float(_cfg_get(args, "metrics.positive_weight", default=1.0))
     rows, _ = evaluate_ppi(
         model=model,
-        loader=eval_iter,
+        loader=loader,
         device=device,
         contact_threshold=float(args.data.contact_threshold),
         distance_bin_start=float(args.data.distance_bin_start),
