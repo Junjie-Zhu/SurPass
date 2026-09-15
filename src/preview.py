@@ -17,6 +17,7 @@ from src.train import (
     _unpack_batch,
     _validate_model_bin_counts,
     create_balanced_split_datasets,
+    resolve_chunk_size,
     resolve_cuda_device,
 )
 from src.utils.ddp_utils import seed_everything
@@ -180,6 +181,9 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    model_kwargs["checkpoint_pair_blocks"] = bool(
+        _cfg_get(args, "performance.checkpoint_pair_blocks", default=False)
+    )
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -200,6 +204,7 @@ def main(args: DictConfig):
     )
     last_bin = int(args.data.distance_bin_count) - 1
     recycle_rounds = max(1, int(args.recycle_rounds))
+    chunk_size = resolve_chunk_size(args, default=64)
     PREVIEW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -210,9 +215,10 @@ def main(args: DictConfig):
     with torch.no_grad():
         for index, step_batch in enumerate(loader):
             residue_batch, labels = _unpack_batch(step_batch, device)
-            logits, pair_mask = model(
+            logits, _, pair_mask = model(
                 residue_batch,
                 recycle_rounds=recycle_rounds,
+                chunk_size=chunk_size,
             )
             pred_bins = logits.argmax(dim=-1)
             valid_mask = pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(

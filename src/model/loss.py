@@ -193,6 +193,100 @@ class DistogramMAELoss(nn.Module):
         )
 
 
+def residue_bind_targets(
+    target_bins: torch.Tensor,
+    inter_mask: torch.Tensor,
+    contact_bins: int,
+) -> torch.Tensor:
+    """Residue is positive if it has any inter-chain contact."""
+    inter_contact = (target_bins.long() < int(contact_bins)) & inter_mask.to(dtype=torch.bool)
+    return inter_contact.any(dim=-1)
+
+
+def downsample_residue_negatives(
+    residue_mask: torch.Tensor,
+    target: torch.Tensor,
+    neg_per_pos: float = 4.0,
+) -> torch.Tensor:
+    """Keep all interface residues and ~neg_per_pos non-interface residues per positive."""
+    residue_mask = residue_mask.to(dtype=torch.bool)
+    target = target.to(dtype=torch.bool)
+    if float(neg_per_pos) <= 0.0:
+        return residue_mask
+
+    keep = residue_mask & target
+    neg = residue_mask & ~target
+    squeezed = False
+    if keep.ndim == 1:
+        keep = keep.unsqueeze(0)
+        neg = neg.unsqueeze(0)
+        squeezed = True
+
+    out = keep.clone()
+    ratio = float(neg_per_pos)
+    for batch_index in range(keep.shape[0]):
+        n_pos = int(keep[batch_index].sum().item())
+        neg_flat = torch.nonzero(neg[batch_index], as_tuple=False).flatten()
+        n_neg = int(neg_flat.numel())
+        if n_neg == 0:
+            continue
+        n_keep_neg = (
+            min(n_neg, max(1, int(round(n_pos * ratio))))
+            if n_pos > 0
+            else min(n_neg, max(1, int(round(ratio))))
+        )
+        order = torch.randperm(n_neg, device=neg_flat.device)[:n_keep_neg]
+        out[batch_index, neg_flat[order]] = True
+
+    if squeezed:
+        return out.squeeze(0)
+    return out
+
+
+class ResidueBindLoss(nn.Module):
+    """Masked BCE on per-residue interface labels. Down-weights pair-negative examples."""
+
+    def __init__(
+        self,
+        pos_weight: float = 4.0,
+        neg_per_pos: float = 4.0,
+        negative_pair_weight: float = 0.25,
+    ):
+        super().__init__()
+        self.pos_weight = float(pos_weight)
+        self.neg_per_pos = float(neg_per_pos)
+        self.negative_pair_weight = float(negative_pair_weight)
+
+    def forward(
+        self,
+        residue_logits: torch.Tensor,
+        target_bins: torch.Tensor,
+        inter_mask: torch.Tensor,
+        residue_mask: torch.Tensor,
+        is_positive: torch.Tensor,
+        contact_bins: int,
+    ) -> torch.Tensor:
+        logits = residue_logits.squeeze(-1)
+        target = residue_bind_targets(target_bins, inter_mask, contact_bins)
+        loss_mask = downsample_residue_negatives(
+            residue_mask,
+            target,
+            neg_per_pos=self.neg_per_pos,
+        )
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            target.to(dtype=logits.dtype),
+            reduction="none",
+        )
+        pair_weight = torch.where(
+            is_positive.to(device=logits.device, dtype=torch.bool).reshape(-1),
+            loss.new_tensor(1.0),
+            loss.new_tensor(self.negative_pair_weight),
+        )
+        loss = loss * pair_weight[:, None]
+        return _masked_mean(loss, loss_mask)
+
+
 class TverskyLoss(nn.Module):
     """Soft Tversky loss on P(d < threshold) versus contact-bin labels."""
 

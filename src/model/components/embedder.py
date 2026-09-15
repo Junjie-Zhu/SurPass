@@ -1,5 +1,6 @@
 import math
 import os
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 
 from src.common.residue_constants import restypes, restypes_with_x
 from src.model.components.calvados_functions import (
+    _default_residue_pickle_path,
     compute_ashbaugh_hatch,
     compute_yukawa,
     load_calvados_model,
@@ -16,15 +18,13 @@ from src.model.loss import distance_bin_centers
 
 NUM_RESIDUE_TYPES = len(restypes_with_x)
 k_BOLTZMANN = 0.0083144721  # kJ/mol/K
-CALVADOS = load_calvados_model(
-    version='CALVADOS2',
-    salt=0.150,
-    pH=7.4,
-    temp=298.15,
-    residue_pickle_path=os.path.join(os.path.dirname(__file__), "calvados_residues.pickle"),
-)
 CALVADOS_TEMP = 298.15
 _MIN_CALVADOS_DISTANCE_NM = 1e-6
+def _calvados_residue_pickle_path() -> str:
+    local_path = os.path.join(os.path.dirname(__file__), "calvados_residues.pickle")
+    if os.path.isfile(local_path):
+        return local_path
+    return _default_residue_pickle_path()
 
 
 def normalize_calvados_energy(energy_kt):
@@ -32,16 +32,22 @@ def normalize_calvados_energy(energy_kt):
     return np.arcsinh(np.asarray(energy_kt, dtype=np.float64))
 
 
-def build_calvados_bin_energy_table(
+def _build_calvados_bin_energy_table(
     min_dist: float,
     max_dist: float,
     dim: int,
-    *,
+    temp: float,
     model=None,
-    temp: float = CALVADOS_TEMP,
 ) -> torch.Tensor:
     """CALVADOS asinh(E/kT) at each pairwise-distance bin center, shape [n_aa, n_aa, dim]."""
-    model = CALVADOS if model is None else model
+    if model is None:
+        model = load_calvados_model(
+            version="CALVADOS2",
+            salt=0.150,
+            pH=7.4,
+            temp=temp,
+            residue_pickle_path=_calvados_residue_pickle_path(),
+        )
     centers_a = distance_bin_centers(min_dist, max_dist, dim).detach().cpu().numpy()
     r_nm = np.maximum(np.asarray(centers_a, dtype=np.float64) * 0.1, _MIN_CALVADOS_DISTANCE_NM)
 
@@ -73,6 +79,41 @@ def build_calvados_bin_energy_table(
     n_canonical = len(aa_names)
     table[:n_canonical, :n_canonical] = np.asarray(energy_norm, dtype=np.float32)
     return torch.from_numpy(table)
+
+
+@lru_cache(maxsize=8)
+def _cached_calvados_bin_energy_table(
+    min_dist: float,
+    max_dist: float,
+    dim: int,
+    temp: float,
+) -> torch.Tensor:
+    return _build_calvados_bin_energy_table(min_dist, max_dist, dim, temp)
+
+
+def build_calvados_bin_energy_table(
+    min_dist: float,
+    max_dist: float,
+    dim: int,
+    *,
+    model=None,
+    temp: float = CALVADOS_TEMP,
+) -> torch.Tensor:
+    """Return a cloned 20x20x64 CALVADOS lookup; physics is computed once per key."""
+    if model is not None:
+        return _build_calvados_bin_energy_table(
+            float(min_dist),
+            float(max_dist),
+            int(dim),
+            float(temp),
+            model=model,
+        )
+    return _cached_calvados_bin_energy_table(
+        float(min_dist),
+        float(max_dist),
+        int(dim),
+        float(temp),
+    ).clone()
 
 
 # Adapted from frameflow code

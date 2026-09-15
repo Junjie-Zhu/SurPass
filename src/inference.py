@@ -24,6 +24,8 @@ from src.train import (
     contact_bin_count,
     log_info,
     pair_bind_scores,
+    residue_pair_bind_scores,
+    resolve_chunk_size,
     resolve_cuda_device,
     resolve_dist_backend,
     to_device,
@@ -299,6 +301,7 @@ def evaluate_ppi(
     recycle_rounds: int,
     ppi_score_threshold: float,
     positive_weight: float = 1.0,
+    chunk_size: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     model.eval()
     contact_bins = contact_bin_count(
@@ -312,11 +315,16 @@ def evaluate_ppi(
     with torch.no_grad():
         for residue_batch, metas in loader:
             residue_batch = to_device(residue_batch, device)
-            logits, pair_mask = model(
+            logits, residue_logits, pair_mask = model(
                 residue_batch,
                 recycle_rounds=max(1, int(recycle_rounds)),
+                chunk_size=chunk_size,
             )
-            p_bind, n_contacts = pair_bind_scores(
+            p_bind = residue_pair_bind_scores(
+                residue_logits,
+                residue_batch["mask"],
+            )
+            _, n_contacts = pair_bind_scores(
                 logits,
                 pair_mask,
                 p1_length=residue_batch["p1_length"],
@@ -406,6 +414,10 @@ def main(args: DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    model_kwargs["checkpoint_pair_blocks"] = bool(
+        _cfg_get(args, "performance.checkpoint_pair_blocks", default=False)
+    )
+    chunk_size = resolve_chunk_size(args, default=32)
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
@@ -424,6 +436,7 @@ def main(args: DictConfig):
         recycle_rounds=int(args.recycle_rounds),
         ppi_score_threshold=float(args.data.ppi_score_threshold),
         positive_weight=positive_weight,
+        chunk_size=chunk_size,
     )
     rows = gather_rank_prediction_rows(rows)
 

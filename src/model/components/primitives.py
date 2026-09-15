@@ -1,6 +1,8 @@
 import torch
 from torch.nn import functional as F
 
+from src.model.components.outer_product_mean import chunk_layer
+
 # from src.utils.model_utils import (
 #     pad_at_dim,
 #     reshape_at_dim,
@@ -118,3 +120,59 @@ class Transition(torch.nn.Module):
             x = self.ln(x)
         x = self.linear_out(self.swish_linear(x))
         return x * mask[..., None]
+
+
+class PairTransition(torch.nn.Module):
+    def __init__(self, dim, expansion_factor=4, layer_norm=False):
+        super().__init__()
+
+        dim_inner = int(dim * expansion_factor)
+
+        self.use_layer_norm = layer_norm
+        if self.use_layer_norm:
+            self.ln = torch.nn.LayerNorm(dim)
+
+        self.swish_linear = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim_inner * 2, bias=False),
+            SwiGLU(),
+        )
+        self.linear_out = torch.nn.Linear(dim_inner, dim)
+    
+    def _transition(self, x, mask):
+        x = self.linear_out(self.swish_linear(x))
+        return x * mask[..., None]
+
+    @torch.jit.ignore
+    def _chunk(self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        return chunk_layer(
+            self._transition,
+            {"x": x, "mask": mask},
+            chunk_size=chunk_size,
+            no_batch_dims=len(x.shape[:-2]),
+        )
+
+    def forward(self, x, mask, chunk_size=None):
+        """
+        Args:
+            x: Input sequence representation, shape [b, n, dim]
+            mask: binary, shape [b, n]
+
+        Returns:
+            Updated sequence representation, shape [b, n, dim]
+        """
+        if self.use_layer_norm:
+            x = self.ln(x)
+
+        if chunk_size is not None:
+            x = self._chunk(x, mask, chunk_size)
+        else:
+            x = self._transition(x, mask)
+        return x
+
+
+
+

@@ -28,8 +28,10 @@ from src.data.dataset import (
 from src.model.loss import (
     FocalCELoss,
     DistogramMAELoss,
+    ResidueBindLoss,
     TverskyLoss,
     downsample_inter_negatives,
+    residue_bind_targets,
 )
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
@@ -244,6 +246,14 @@ def pair_bind_scores(
     return p_bind, n_contacts
 
 
+def residue_pair_bind_scores(
+    residue_logits: torch.Tensor,
+    residue_mask: torch.Tensor,
+) -> torch.Tensor:
+    probs = torch.sigmoid(residue_logits.squeeze(-1))
+    return probs.masked_fill(~residue_mask.to(dtype=torch.bool), 0.0).amax(dim=-1)
+
+
 def _sample_scores_and_targets(
     logits: torch.Tensor,
     pair_mask: torch.Tensor,
@@ -265,6 +275,18 @@ def _sample_scores_and_targets(
     )
 
 
+def _residue_sample_scores_and_targets(
+    residue_logits: torch.Tensor,
+    residue_mask: torch.Tensor,
+    is_positive: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    p_bind = residue_pair_bind_scores(residue_logits, residue_mask)
+    return (
+        p_bind.detach().reshape(-1).cpu(),
+        is_positive.detach().reshape(-1).to(dtype=torch.bool).cpu(),
+    )
+
+
 def _compute_pair_losses(
     loss_fn: Dict[str, torch.nn.Module],
     loss_weights: Dict[str, float],
@@ -272,10 +294,17 @@ def _compute_pair_losses(
     target_bins: torch.Tensor,
     intra_mask: torch.Tensor,
     inter_mask: torch.Tensor,
+    residue_logits: torch.Tensor | None = None,
+    residue_mask: torch.Tensor | None = None,
+    residue_inter_mask: torch.Tensor | None = None,
+    is_positive: torch.Tensor | None = None,
+    contact_bins: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     raw_loss = logits.new_zeros(())
     terms: dict[str, torch.Tensor] = {}
     for name, loss_term in loss_fn.items():
+        if name == "residue_bind":
+            continue
         term_weight = float(loss_weights[name])
         if term_weight <= 0.0:
             continue
@@ -293,6 +322,27 @@ def _compute_pair_losses(
         )
         terms[name] = weighted.detach()
         raw_loss = raw_loss + term_weight * weighted
+
+    residue_weight = float(loss_weights.get("residue_bind", 0.0))
+    if (
+        residue_weight > 0.0
+        and "residue_bind" in loss_fn
+        and residue_logits is not None
+        and residue_mask is not None
+        and is_positive is not None
+        and contact_bins is not None
+    ):
+        residue_loss = loss_fn["residue_bind"](
+            residue_logits,
+            target_bins,
+            residue_inter_mask if residue_inter_mask is not None else inter_mask,
+            residue_mask,
+            is_positive,
+            int(contact_bins),
+        )
+        terms["residue_bind"] = residue_loss.detach()
+        raw_loss = raw_loss + residue_weight * residue_loss
+
     terms["total"] = raw_loss.detach()
     return raw_loss, terms
 
@@ -327,6 +377,7 @@ def _progress_postfix(terms: dict[str, float]) -> dict[str, str]:
         ("foc_x", "focal_inter"),
         ("mae_x", "mae_inter"),
         ("tv", "tversky"),
+        ("rb", "residue_bind"),
     )
     return {
         label: f"{terms[key]:.3f}"
@@ -387,7 +438,16 @@ def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
         "focal": float(_cfg_get(cfg, "loss.focal.weight", default=1.0)),
         "mae": float(_cfg_get(cfg, "loss.mae.weight", default=1.0)),
         "tversky": float(_cfg_get(cfg, "loss.tversky.weight", default=1.0)),
+        "residue_bind": float(_cfg_get(cfg, "loss.residue_bind.weight", default=1.0)),
     }
+
+
+def resolve_chunk_size(cfg: DictConfig, default: int | None = 64) -> int | None:
+    value = _cfg_get(cfg, "performance.chunk_size", default=default)
+    if value is None:
+        return None
+    chunk_size = int(value)
+    return None if chunk_size <= 0 else chunk_size
 
 
 def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> dict:
@@ -464,6 +524,7 @@ def train_epoch(
     inter_neg_per_pos: float = 0.0,
     dump_dir: str | None = None,
     epoch: int = 0,
+    chunk_size: int | None = None,
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -480,9 +541,10 @@ def train_epoch(
             recycle_rounds=recycle_rounds,
             self_conditioning_probability=self_conditioning_probability,
         )
-        logits, pair_mask = model(
+        logits, residue_logits, pair_mask = model(
             residue_batch,
             recycle_rounds=step_recycle_rounds,
+            chunk_size=chunk_size,
         )
         intra_mask, inter_mask = _region_masks(
             pair_mask,
@@ -490,8 +552,9 @@ def train_epoch(
             p1_length=residue_batch["p1_length"],
             p2_length=residue_batch["p2_length"],
         )
+        pair_inter_mask = inter_mask
         if contact_bins is not None and float(inter_neg_per_pos) > 0.0:
-            inter_mask = downsample_inter_negatives(
+            pair_inter_mask = downsample_inter_negatives(
                 inter_mask,
                 labels["label_2d_bins"],
                 contact_bins=int(contact_bins),
@@ -503,7 +566,12 @@ def train_epoch(
             logits,
             labels["label_2d_bins"],
             intra_mask,
-            inter_mask,
+            pair_inter_mask,
+            residue_logits=residue_logits,
+            residue_mask=residue_batch["mask"],
+            residue_inter_mask=inter_mask,
+            is_positive=labels["is_positive"],
+            contact_bins=contact_bins,
         )
 
         loss = raw_loss / grad_accum_steps
@@ -593,6 +661,7 @@ def evaluate_epoch(
     max_batches: int | None = None,
     recycle_rounds: int = 2,
     positive_weight: float = 1.0,
+    chunk_size: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     term_totals: dict[str, float] = {}
@@ -603,6 +672,10 @@ def evaluate_epoch(
     intra_target_rows = []
     sample_score_rows = []
     sample_target_rows = []
+    distogram_sample_score_rows = []
+    distogram_sample_target_rows = []
+    residue_score_rows = []
+    residue_target_rows = []
     n_contact_bins = contact_bin_count(
         contact_threshold,
         distance_bin_start,
@@ -615,9 +688,10 @@ def evaluate_epoch(
             if max_batches is not None and step >= max_batches:
                 break
             residue_batch, labels = _unpack_batch(step_batch, device)
-            logits, pair_mask = model(
+            logits, residue_logits, pair_mask = model(
                 residue_batch,
                 recycle_rounds=max(1, int(recycle_rounds)),
+                chunk_size=chunk_size,
             )
             intra_mask, inter_mask = _region_masks(
                 pair_mask,
@@ -632,6 +706,11 @@ def evaluate_epoch(
                 labels["label_2d_bins"],
                 intra_mask,
                 inter_mask,
+                residue_logits=residue_logits,
+                residue_mask=residue_batch["mask"],
+                residue_inter_mask=inter_mask,
+                is_positive=labels["is_positive"],
+                contact_bins=n_contact_bins,
             )
 
             probs = torch.softmax(logits, dim=-1)[..., :n_contact_bins].sum(dim=-1)
@@ -640,7 +719,14 @@ def evaluate_epoch(
             inter_target_rows.append(contacts[inter_mask].detach().cpu())
             intra_score_rows.append(probs[intra_mask].detach().cpu())
             intra_target_rows.append(contacts[intra_mask].detach().cpu())
-            sample_scores, sample_targets = _sample_scores_and_targets(
+            sample_scores, sample_targets = _residue_sample_scores_and_targets(
+                residue_logits,
+                residue_batch["mask"],
+                labels["is_positive"],
+            )
+            sample_score_rows.append(sample_scores)
+            sample_target_rows.append(sample_targets)
+            distogram_scores, distogram_targets = _sample_scores_and_targets(
                 logits,
                 pair_mask,
                 residue_batch["p1_length"],
@@ -648,8 +734,18 @@ def evaluate_epoch(
                 labels["is_positive"],
                 n_contact_bins,
             )
-            sample_score_rows.append(sample_scores)
-            sample_target_rows.append(sample_targets)
+            distogram_sample_score_rows.append(distogram_scores)
+            distogram_sample_target_rows.append(distogram_targets)
+
+            residue_mask = residue_batch["mask"].to(dtype=torch.bool)
+            residue_target = residue_bind_targets(
+                labels["label_2d_bins"],
+                inter_mask,
+                n_contact_bins,
+            )
+            residue_prob = torch.sigmoid(residue_logits.squeeze(-1))
+            residue_score_rows.append(residue_prob[residue_mask].detach().cpu())
+            residue_target_rows.append(residue_target[residue_mask].detach().cpu())
 
             term_floats = _terms_to_floats(terms)
             _accumulate_floats(term_totals, term_floats)
@@ -665,6 +761,14 @@ def evaluate_epoch(
     sample_metrics = _contact_metrics_from_rows(
         sample_score_rows, sample_target_rows, positive_weight=positive_weight
     )
+    distogram_sample_metrics = _contact_metrics_from_rows(
+        distogram_sample_score_rows,
+        distogram_sample_target_rows,
+        positive_weight=positive_weight,
+    )
+    residue_metrics = _contact_metrics_from_rows(
+        residue_score_rows, residue_target_rows, positive_weight=positive_weight
+    )
     metrics = _mean_floats(term_totals, num_steps)
     metrics.update(
         {
@@ -677,6 +781,11 @@ def evaluate_epoch(
             "sample_auroc": sample_metrics["auroc"],
             "sample_auprc": sample_metrics["auprc"],
             "sample_prev": sample_metrics["contact_prev"],
+            "distogram_sample_auroc": distogram_sample_metrics["auroc"],
+            "distogram_sample_auprc": distogram_sample_metrics["auprc"],
+            "residue_auroc": residue_metrics["auroc"],
+            "residue_auprc": residue_metrics["auprc"],
+            "residue_prev": residue_metrics["contact_prev"],
         }
     )
     return metrics
@@ -802,6 +911,10 @@ def main(args: DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    model_kwargs["checkpoint_pair_blocks"] = bool(
+        _cfg_get(args, "performance.checkpoint_pair_blocks", default=True)
+    )
+    chunk_size = resolve_chunk_size(args, default=64)
     model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = wrap_ddp(model, device)
@@ -830,15 +943,23 @@ def main(args: DictConfig):
         alpha=float(_cfg_get(args, "loss.tversky.alpha", default=0.7)),
         beta=float(_cfg_get(args, "loss.tversky.beta", default=0.3)),
     ).to(device)
+    residue_bind_loss = ResidueBindLoss(
+        neg_per_pos=float(_cfg_get(args, "loss.residue_bind.neg_per_pos", default=4.0)),
+        negative_pair_weight=float(
+            _cfg_get(args, "loss.residue_bind.negative_pair_weight", default=0.25)
+        ),
+    ).to(device)
     loss_fn = {
         "focal": focal_loss,
         "mae": mae_loss,
         "tversky": tversky_loss,
+        "residue_bind": residue_bind_loss,
     }
     loss_weights = _build_loss_weights(args)
     log_info(
         f"Loss setup: contact_bins={n_contact_bins}, weights={loss_weights}, "
-        f"inter_neg_per_pos={float(_cfg_get(args, 'loss.inter_neg_per_pos', default=4.0))}"
+        f"inter_neg_per_pos={float(_cfg_get(args, 'loss.inter_neg_per_pos', default=4.0))}, "
+        f"chunk_size={chunk_size}"
     )
     optimizer = get_optimizer(
         model,
@@ -877,12 +998,14 @@ def main(args: DictConfig):
         "train_mae_intra",
         "train_mae_inter",
         "train_tversky",
+        "train_residue_bind",
         "test_total",
         "test_focal_intra",
         "test_focal_inter",
         "test_mae_intra",
         "test_mae_inter",
         "test_tversky",
+        "test_residue_bind",
         "test_inter_auroc",
         "test_inter_auprc",
         "test_inter_contact_prev",
@@ -892,6 +1015,11 @@ def main(args: DictConfig):
         "test_sample_auroc",
         "test_sample_auprc",
         "test_sample_prev",
+        "test_distogram_sample_auroc",
+        "test_distogram_sample_auprc",
+        "test_residue_auroc",
+        "test_residue_auprc",
+        "test_residue_prev",
     ]
     if DIST_WRAPPER.rank == 0:
         with open(csv_path, "w", encoding="utf-8") as f:
@@ -943,6 +1071,7 @@ def main(args: DictConfig):
             inter_neg_per_pos=float(_cfg_get(args, "loss.inter_neg_per_pos", default=4.0)),
             dump_dir=logging_dir,
             epoch=crt_epoch,
+            chunk_size=chunk_size,
         )
 
         test_iter = test_loader
@@ -966,6 +1095,7 @@ def main(args: DictConfig):
             distance_bin_count=args.data.distance_bin_count,
             recycle_rounds=int(args.recycle_rounds),
             positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
+            chunk_size=chunk_size,
         )
 
         if DIST_WRAPPER.rank == 0:
@@ -1004,10 +1134,12 @@ def main(args: DictConfig):
                 f"focal_x={train_metrics.get('focal_inter', float('nan')):.4f} "
                 f"mae_x={train_metrics.get('mae_inter', float('nan')):.4f} "
                 f"tv={train_metrics.get('tversky', float('nan')):.4f} "
+                f"rb={train_metrics.get('residue_bind', float('nan')):.4f} "
                 f"inter_auroc={test_metrics.get('inter_auroc', float('nan')):.4f} "
                 f"inter_auprc={test_metrics.get('inter_auprc', float('nan')):.4f} "
                 f"intra_auroc={test_metrics.get('intra_auroc', float('nan')):.4f} "
-                f"sample_auprc={test_metrics.get('sample_auprc', float('nan')):.4f}"
+                f"sample_auprc={test_metrics.get('sample_auprc', float('nan')):.4f} "
+                f"residue_auprc={test_metrics.get('residue_auprc', float('nan')):.4f}"
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:
