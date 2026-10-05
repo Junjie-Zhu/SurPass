@@ -22,6 +22,30 @@ import torch.nn as nn
 from src.utils.model_utils import tensor_tree_map
 
 
+class EfficientOuterProductMean(nn.Module):
+    """Pair update from a single representation, without an [L, L, C, C] tensor."""
+
+    def __init__(self, c_m: int, c_hidden: int, c_z: int):
+        super().__init__()
+        self.layernorm = nn.LayerNorm(c_m)
+        self.linear_no_bias = nn.Linear(c_m, c_hidden, bias=False)
+        self.linear_out = nn.Linear(c_hidden ** 2, c_z)
+
+    def forward(self, token_repr: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        token_repr = self.layernorm(token_repr)
+        token_repr = self.linear_no_bias(token_repr)
+        if mask is not None:
+            token_repr = token_repr * mask.to(dtype=token_repr.dtype)[..., None]
+
+        pair_dim, inner = self.linear_out.weight.shape[0], token_repr.shape[-1]
+        weight = self.linear_out.weight.view(pair_dim, inner, inner)
+        projected = torch.einsum("pcd,bjd->bjpc", weight, token_repr)
+        outer_product = torch.einsum("bic,bjpc->bijp", token_repr, projected)
+        if self.linear_out.bias is not None:
+            outer_product = outer_product + self.linear_out.bias
+        return outer_product
+
+
 class OuterProductMean(nn.Module):
     """
     Implements Algorithm 10.

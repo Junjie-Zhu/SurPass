@@ -6,8 +6,6 @@ epochs: 200
 checkpoint_interval: 1
 ckpt_dir: null
 load_model_only: false
-recycle_rounds: 1
-self_conditioning_probability: 0.5
 
 data:
   root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
@@ -44,8 +42,6 @@ model:
   xt_pair_dist_max: 22.0
   xt_pair_dist_dim: 64
   dim_opm_inner: 32
-  dim_triangle_hidden: 32
-  n_pair_heads: 4
   num_classes: 64
 
 loss:
@@ -66,6 +62,10 @@ loss:
     weight: 1.0
     neg_per_pos: 0.0
     negative_pair_weight: 0.25
+  protein:
+    weight: 1.0
+  consistency:
+    weight: 0.1
 
 optimizer:
   lr: 0.0005

@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, Subset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -18,23 +17,23 @@ try:
 except Exception:
     wandb = None
 
-from src.data.dataset import (
-    BalancedClusterDataset,
-    PepoTrainDataset,
-    collate_fn,
-    get_dataloader,
-    inter_chain_pair_mask,
-)
+from src.data.balancing import create_balanced_split_datasets
+from src.data.collate import collate_fn, get_dataloader
+from src.data.dataset import PepoTrainDataset
+from src.data.labels import inter_chain_pair_mask
 from src.model.loss import (
-    FocalCELoss,
+    ConsistencyLoss,
     DistogramMAELoss,
+    FocalCELoss,
+    ProteinBindLoss,
     ResidueBindLoss,
     TverskyLoss,
     downsample_inter_negatives,
+    inter_chain_contact_probability,
     residue_bind_targets,
 )
 from src.model.optimizer import get_lr_scheduler, get_optimizer
-from src.model.surpass import ResOnly
+from src.model.surpass import ResOnly, SurpassOutput
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 # from src.utils.nan_monitor import abort_if_nonfinite_loss
 
@@ -76,67 +75,6 @@ def to_device(obj, device):
     return obj
 
 
-def split_dataset(
-    dataset: Dataset,
-    test_fraction: float = 0.2,
-    seed: int = 42,
-) -> tuple[Dataset, Dataset]:
-    if not 0.0 < test_fraction < 1.0:
-        raise ValueError("test_fraction must be between 0 and 1.")
-    if len(dataset) == 0:
-        raise ValueError("Cannot split an empty dataset.")
-    if len(dataset) == 1:
-        return dataset, dataset
-
-    test_len = max(1, int(round(len(dataset) * test_fraction)))
-    train_len = len(dataset) - test_len
-    if train_len == 0:
-        train_len, test_len = 1, len(dataset) - 1
-    generator = torch.Generator().manual_seed(seed)
-    return random_split(dataset, [train_len, test_len], generator=generator)
-
-
-def _as_balanced_cluster_dataset(
-    dataset: Dataset,
-    negative_ratio: int,
-    distance_bin_count: int,
-) -> Dataset:
-    if negative_ratio <= 0:
-        return dataset
-    if isinstance(dataset, Subset) and isinstance(dataset.dataset, PepoTrainDataset):
-        if len(dataset.indices) < 2:
-            return dataset
-        return BalancedClusterDataset(
-            dataset.dataset,
-            indices=list(dataset.indices),
-            distance_bin_count=distance_bin_count,
-            negative_ratio=negative_ratio,
-        )
-    if isinstance(dataset, PepoTrainDataset):
-        if len(dataset) < 2:
-            return dataset
-        return BalancedClusterDataset(
-            dataset,
-            distance_bin_count=distance_bin_count,
-            negative_ratio=negative_ratio,
-        )
-    raise TypeError(f"Unsupported dataset type for negative sampling: {type(dataset)}")
-
-
-def create_balanced_split_datasets(
-    dataset: PepoTrainDataset,
-    test_fraction: float,
-    seed: int,
-    negative_ratio: int,
-    distance_bin_count: int,
-) -> tuple[Dataset, Dataset]:
-    train_dataset, test_dataset = split_dataset(dataset, test_fraction=test_fraction, seed=seed)
-    return (
-        _as_balanced_cluster_dataset(train_dataset, negative_ratio, distance_bin_count),
-        _as_balanced_cluster_dataset(test_dataset, negative_ratio, distance_bin_count),
-    )
-
-
 def contact_bin_count(
     contact_threshold: float,
     distance_bin_start: float,
@@ -150,24 +88,6 @@ def contact_bin_count(
     )
     count = int(torch.bucketize(torch.tensor(float(contact_threshold)), bin_limits).item())
     return max(1, min(count, int(distance_bin_count)))
-
-
-def resolve_train_recycle_rounds(
-    recycle_rounds: int,
-    self_conditioning_probability: float,
-    random_value: float | None = None,
-) -> int:
-    recycle_rounds = max(1, int(recycle_rounds))
-    if recycle_rounds <= 1:
-        return 1
-
-    probability = max(0.0, min(1.0, float(self_conditioning_probability)))
-    if probability <= 0.0:
-        return 1
-
-    if random_value is None:
-        random_value = float(torch.rand(()).item())
-    return recycle_rounds if float(random_value) < probability else 1
 
 
 def _binary_classification_metrics(
@@ -246,64 +166,23 @@ def pair_bind_scores(
     return p_bind, n_contacts
 
 
-def residue_pair_bind_scores(
-    residue_logits: torch.Tensor,
-    residue_mask: torch.Tensor,
-) -> torch.Tensor:
-    probs = torch.sigmoid(residue_logits.squeeze(-1))
-    return probs.masked_fill(~residue_mask.to(dtype=torch.bool), 0.0).amax(dim=-1)
-
-
-def _sample_scores_and_targets(
-    logits: torch.Tensor,
-    pair_mask: torch.Tensor,
-    p1_length: int | torch.Tensor,
-    p2_length: int | torch.Tensor,
-    is_positive: torch.Tensor,
-    contact_bins: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    p_bind, _ = pair_bind_scores(
-        logits,
-        pair_mask,
-        p1_length=p1_length,
-        p2_length=p2_length,
-        contact_bins=contact_bins,
-    )
-    return (
-        p_bind.detach().reshape(-1).cpu(),
-        is_positive.detach().reshape(-1).to(dtype=torch.bool).cpu(),
-    )
-
-
-def _residue_sample_scores_and_targets(
-    residue_logits: torch.Tensor,
-    residue_mask: torch.Tensor,
-    is_positive: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    p_bind = residue_pair_bind_scores(residue_logits, residue_mask)
-    return (
-        p_bind.detach().reshape(-1).cpu(),
-        is_positive.detach().reshape(-1).to(dtype=torch.bool).cpu(),
-    )
-
-
 def _compute_pair_losses(
     loss_fn: Dict[str, torch.nn.Module],
     loss_weights: Dict[str, float],
-    logits: torch.Tensor,
+    output: SurpassOutput,
     target_bins: torch.Tensor,
     intra_mask: torch.Tensor,
     inter_mask: torch.Tensor,
-    residue_logits: torch.Tensor | None = None,
     residue_mask: torch.Tensor | None = None,
     residue_inter_mask: torch.Tensor | None = None,
     is_positive: torch.Tensor | None = None,
     contact_bins: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    logits = output.pair_logits
     raw_loss = logits.new_zeros(())
     terms: dict[str, torch.Tensor] = {}
     for name, loss_term in loss_fn.items():
-        if name == "residue_bind":
+        if name in {"residue", "protein", "consistency"}:
             continue
         term_weight = float(loss_weights[name])
         if term_weight <= 0.0:
@@ -314,34 +193,52 @@ def _compute_pair_losses(
             raw_loss = raw_loss + term_weight * value
             continue
         intra_loss, inter_loss = loss_term(logits, target_bins, intra_mask, inter_mask)
-        terms[f"{name}_intra"] = intra_loss.detach()
-        terms[f"{name}_inter"] = inter_loss.detach()
-
         weighted = (
             float(loss_weights["intra"]) * intra_loss + float(loss_weights["inter"]) * inter_loss
         )
         terms[name] = weighted.detach()
         raw_loss = raw_loss + term_weight * weighted
 
-    residue_weight = float(loss_weights.get("residue_bind", 0.0))
+    residue_weight = float(loss_weights.get("residue", 0.0))
     if (
         residue_weight > 0.0
-        and "residue_bind" in loss_fn
-        and residue_logits is not None
+        and "residue" in loss_fn
         and residue_mask is not None
         and is_positive is not None
         and contact_bins is not None
     ):
-        residue_loss = loss_fn["residue_bind"](
-            residue_logits,
+        residue_loss = loss_fn["residue"](
+            output.residue_logits,
             target_bins,
             residue_inter_mask if residue_inter_mask is not None else inter_mask,
             residue_mask,
             is_positive,
             int(contact_bins),
         )
-        terms["residue_bind"] = residue_loss.detach()
+        terms["residue"] = residue_loss.detach()
         raw_loss = raw_loss + residue_weight * residue_loss
+
+    protein_weight = float(loss_weights.get("protein", 0.0))
+    if protein_weight > 0.0 and "protein" in loss_fn and is_positive is not None:
+        protein_loss = loss_fn["protein"](output.protein_logit, is_positive)
+        terms["protein"] = protein_loss.detach()
+        raw_loss = raw_loss + protein_weight * protein_loss
+
+    consistency_weight = float(loss_weights.get("consistency", 0.0))
+    if (
+        consistency_weight > 0.0
+        and "consistency" in loss_fn
+        and residue_mask is not None
+    ):
+        consistency_loss = loss_fn["consistency"](
+            output.residue_logits,
+            output.protein_logit,
+            logits,
+            residue_inter_mask if residue_inter_mask is not None else inter_mask,
+            residue_mask,
+        )
+        terms["consistency"] = consistency_loss.detach()
+        raw_loss = raw_loss + consistency_weight * consistency_loss
 
     terms["total"] = raw_loss.detach()
     return raw_loss, terms
@@ -370,14 +267,39 @@ def _mean_floats(totals: dict[str, float], count: int) -> dict[str, float]:
     return {name: value / scale for name, value in totals.items()}
 
 
+_TRAIN_LOG_KEYS = (
+    "total",
+    "focal",
+    "mae",
+    "tversky",
+    "residue",
+    "protein",
+    "consistency",
+)
+_TEST_LOG_KEYS = (
+    "total",
+    "protein_auroc",
+    "protein_auprc",
+    "residue_auroc",
+    "residue_auprc",
+    "inter_auroc",
+    "inter_auprc",
+)
+
+
+def _select_log_keys(metrics: dict[str, float], keys: tuple[str, ...]) -> dict[str, float]:
+    return {name: metrics[name] for name in keys if name in metrics}
+
+
 def _progress_postfix(terms: dict[str, float]) -> dict[str, str]:
     aliases = (
         ("loss", "total"),
-        ("foc_i", "focal_intra"),
-        ("foc_x", "focal_inter"),
-        ("mae_x", "mae_inter"),
+        ("focal", "focal"),
+        ("mae", "mae"),
         ("tv", "tversky"),
-        ("rb", "residue_bind"),
+        ("res", "residue"),
+        ("prot", "protein"),
+        ("cons", "consistency"),
     )
     return {
         label: f"{terms[key]:.3f}"
@@ -438,7 +360,9 @@ def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
         "focal": float(_cfg_get(cfg, "loss.focal.weight", default=1.0)),
         "mae": float(_cfg_get(cfg, "loss.mae.weight", default=1.0)),
         "tversky": float(_cfg_get(cfg, "loss.tversky.weight", default=1.0)),
-        "residue_bind": float(_cfg_get(cfg, "loss.residue_bind.weight", default=1.0)),
+        "residue": float(_cfg_get(cfg, "loss.residue_bind.weight", default=1.0)),
+        "protein": float(_cfg_get(cfg, "loss.protein.weight", default=1.0)),
+        "consistency": float(_cfg_get(cfg, "loss.consistency.weight", default=0.1)),
     }
 
 
@@ -517,8 +441,6 @@ def train_epoch(
     grad_accum_steps: int = 1,
     scheduler: Any | None = None,
     max_batches: int | None = None,
-    recycle_rounds: int = 2,
-    self_conditioning_probability: float = 0.5,
     step_logger: Callable[[dict[str, float]], None] | None = None,
     contact_bins: int | None = None,
     inter_neg_per_pos: float = 0.0,
@@ -537,17 +459,9 @@ def train_epoch(
             break
         residue_batch, labels = _unpack_batch(step_batch, device)
 
-        step_recycle_rounds = resolve_train_recycle_rounds(
-            recycle_rounds=recycle_rounds,
-            self_conditioning_probability=self_conditioning_probability,
-        )
-        logits, residue_logits, pair_mask = model(
-            residue_batch,
-            recycle_rounds=step_recycle_rounds,
-            chunk_size=chunk_size,
-        )
+        output = model(residue_batch, chunk_size=chunk_size)
         intra_mask, inter_mask = _region_masks(
-            pair_mask,
+            output.pair_mask,
             labels["label_2d_mask"],
             p1_length=residue_batch["p1_length"],
             p2_length=residue_batch["p2_length"],
@@ -563,11 +477,10 @@ def train_epoch(
         raw_loss, terms = _compute_pair_losses(
             loss_fn,
             loss_weights,
-            logits,
+            output,
             labels["label_2d_bins"],
             intra_mask,
             pair_inter_mask,
-            residue_logits=residue_logits,
             residue_mask=residue_batch["mask"],
             residue_inter_mask=inter_mask,
             is_positive=labels["is_positive"],
@@ -575,22 +488,6 @@ def train_epoch(
         )
 
         loss = raw_loss / grad_accum_steps
-        # abort_if_nonfinite_loss(
-        #     loss=loss,
-        #     residue_batch=residue_batch,
-        #     labels=labels,
-        #     logits=logits,
-        #     pair_mask=pair_mask,
-        #     intra_mask=intra_mask,
-        #     inter_mask=inter_mask,
-        #     terms=terms,
-        #     model=model,
-        #     optimizer=optimizer,
-        #     recycle_rounds=step_recycle_rounds,
-        #     epoch=epoch,
-        #     step=step,
-        #     dump_dir=dump_dir,
-        # )
         loss.backward()
 
         should_step = ((step + 1) % grad_accum_steps == 0) or (
@@ -659,7 +556,6 @@ def evaluate_epoch(
     distance_bin_end: float,
     distance_bin_count: int = 64,
     max_batches: int | None = None,
-    recycle_rounds: int = 2,
     positive_weight: float = 1.0,
     chunk_size: int | None = None,
 ) -> dict[str, float]:
@@ -668,14 +564,10 @@ def evaluate_epoch(
     num_steps = 0
     inter_score_rows = []
     inter_target_rows = []
-    intra_score_rows = []
-    intra_target_rows = []
-    sample_score_rows = []
-    sample_target_rows = []
-    distogram_sample_score_rows = []
-    distogram_sample_target_rows = []
     residue_score_rows = []
     residue_target_rows = []
+    protein_score_rows = []
+    protein_target_rows = []
     n_contact_bins = contact_bin_count(
         contact_threshold,
         distance_bin_start,
@@ -688,13 +580,9 @@ def evaluate_epoch(
             if max_batches is not None and step >= max_batches:
                 break
             residue_batch, labels = _unpack_batch(step_batch, device)
-            logits, residue_logits, pair_mask = model(
-                residue_batch,
-                recycle_rounds=max(1, int(recycle_rounds)),
-                chunk_size=chunk_size,
-            )
+            output = model(residue_batch, chunk_size=chunk_size)
             intra_mask, inter_mask = _region_masks(
-                pair_mask,
+                output.pair_mask,
                 labels["label_2d_mask"],
                 p1_length=residue_batch["p1_length"],
                 p2_length=residue_batch["p2_length"],
@@ -702,40 +590,20 @@ def evaluate_epoch(
             _, terms = _compute_pair_losses(
                 loss_fn,
                 loss_weights,
-                logits,
+                output,
                 labels["label_2d_bins"],
                 intra_mask,
                 inter_mask,
-                residue_logits=residue_logits,
                 residue_mask=residue_batch["mask"],
                 residue_inter_mask=inter_mask,
                 is_positive=labels["is_positive"],
                 contact_bins=n_contact_bins,
             )
 
-            probs = torch.softmax(logits, dim=-1)[..., :n_contact_bins].sum(dim=-1)
+            probs = inter_chain_contact_probability(output.pair_logits, n_contact_bins)
             contacts = labels["label_2d_bins"] < n_contact_bins
             inter_score_rows.append(probs[inter_mask].detach().cpu())
             inter_target_rows.append(contacts[inter_mask].detach().cpu())
-            intra_score_rows.append(probs[intra_mask].detach().cpu())
-            intra_target_rows.append(contacts[intra_mask].detach().cpu())
-            sample_scores, sample_targets = _residue_sample_scores_and_targets(
-                residue_logits,
-                residue_batch["mask"],
-                labels["is_positive"],
-            )
-            sample_score_rows.append(sample_scores)
-            sample_target_rows.append(sample_targets)
-            distogram_scores, distogram_targets = _sample_scores_and_targets(
-                logits,
-                pair_mask,
-                residue_batch["p1_length"],
-                residue_batch["p2_length"],
-                labels["is_positive"],
-                n_contact_bins,
-            )
-            distogram_sample_score_rows.append(distogram_scores)
-            distogram_sample_target_rows.append(distogram_targets)
 
             residue_mask = residue_batch["mask"].to(dtype=torch.bool)
             residue_target = residue_bind_targets(
@@ -743,9 +611,13 @@ def evaluate_epoch(
                 inter_mask,
                 n_contact_bins,
             )
-            residue_prob = torch.sigmoid(residue_logits.squeeze(-1))
+            residue_prob = torch.sigmoid(output.residue_logits).reshape(residue_mask.shape)
             residue_score_rows.append(residue_prob[residue_mask].detach().cpu())
             residue_target_rows.append(residue_target[residue_mask].detach().cpu())
+            protein_score_rows.append(torch.sigmoid(output.protein_logit.reshape(-1)).detach().cpu())
+            protein_target_rows.append(
+                labels["is_positive"].reshape(-1).to(dtype=torch.bool).detach().cpu()
+            )
 
             term_floats = _terms_to_floats(terms)
             _accumulate_floats(term_totals, term_floats)
@@ -755,40 +627,24 @@ def evaluate_epoch(
     inter_metrics = _contact_metrics_from_rows(
         inter_score_rows, inter_target_rows, positive_weight=positive_weight
     )
-    intra_metrics = _contact_metrics_from_rows(
-        intra_score_rows, intra_target_rows, positive_weight=positive_weight
-    )
-    sample_metrics = _contact_metrics_from_rows(
-        sample_score_rows, sample_target_rows, positive_weight=positive_weight
-    )
-    distogram_sample_metrics = _contact_metrics_from_rows(
-        distogram_sample_score_rows,
-        distogram_sample_target_rows,
-        positive_weight=positive_weight,
-    )
     residue_metrics = _contact_metrics_from_rows(
         residue_score_rows, residue_target_rows, positive_weight=positive_weight
     )
-    metrics = _mean_floats(term_totals, num_steps)
-    metrics.update(
+    protein_metrics = _contact_metrics_from_rows(
+        protein_score_rows, protein_target_rows, positive_weight=positive_weight
+    )
+    return _select_log_keys(
         {
-            "inter_auroc": inter_metrics["auroc"],
-            "inter_auprc": inter_metrics["auprc"],
-            "inter_contact_prev": inter_metrics["contact_prev"],
-            "intra_auroc": intra_metrics["auroc"],
-            "intra_auprc": intra_metrics["auprc"],
-            "intra_contact_prev": intra_metrics["contact_prev"],
-            "sample_auroc": sample_metrics["auroc"],
-            "sample_auprc": sample_metrics["auprc"],
-            "sample_prev": sample_metrics["contact_prev"],
-            "distogram_sample_auroc": distogram_sample_metrics["auroc"],
-            "distogram_sample_auprc": distogram_sample_metrics["auprc"],
+            "total": _mean_floats(term_totals, num_steps).get("total", float("nan")),
+            "protein_auroc": protein_metrics["auroc"],
+            "protein_auprc": protein_metrics["auprc"],
             "residue_auroc": residue_metrics["auroc"],
             "residue_auprc": residue_metrics["auprc"],
-            "residue_prev": residue_metrics["contact_prev"],
-        }
+            "inter_auroc": inter_metrics["auroc"],
+            "inter_auprc": inter_metrics["auprc"],
+        },
+        _TEST_LOG_KEYS,
     )
-    return metrics
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
@@ -911,6 +767,15 @@ def main(args: DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    for unused_key in ("dim_triangle_hidden", "n_pair_heads"):
+        model_kwargs.pop(unused_key, None)
+    n_contact_bins = contact_bin_count(
+        args.data.contact_threshold,
+        args.data.distance_bin_start,
+        args.data.distance_bin_end,
+        args.data.distance_bin_count,
+    )
+    model_kwargs["contact_bins"] = n_contact_bins
     model_kwargs["checkpoint_pair_blocks"] = bool(
         _cfg_get(args, "performance.checkpoint_pair_blocks", default=True)
     )
@@ -922,12 +787,6 @@ def main(args: DictConfig):
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
 
-    n_contact_bins = contact_bin_count(
-        args.data.contact_threshold,
-        args.data.distance_bin_start,
-        args.data.distance_bin_end,
-        args.data.distance_bin_count,
-    )
     focal_loss = FocalCELoss(
         contact_bins=n_contact_bins,
         gamma=float(_cfg_get(args, "loss.focal.gamma", default=1.5)),
@@ -949,11 +808,14 @@ def main(args: DictConfig):
             _cfg_get(args, "loss.residue_bind.negative_pair_weight", default=0.25)
         ),
     ).to(device)
+    consistency_loss = ConsistencyLoss(contact_bins=n_contact_bins).to(device)
     loss_fn = {
         "focal": focal_loss,
         "mae": mae_loss,
         "tversky": tversky_loss,
-        "residue_bind": residue_bind_loss,
+        "residue": residue_bind_loss,
+        "protein": ProteinBindLoss().to(device),
+        "consistency": consistency_loss,
     }
     loss_weights = _build_loss_weights(args)
     log_info(
@@ -990,37 +852,11 @@ def main(args: DictConfig):
         del checkpoint
 
     csv_path = os.path.join(logging_dir, "loss.csv")
-    csv_fields = [
-        "epoch",
-        "train_total",
-        "train_focal_intra",
-        "train_focal_inter",
-        "train_mae_intra",
-        "train_mae_inter",
-        "train_tversky",
-        "train_residue_bind",
-        "test_total",
-        "test_focal_intra",
-        "test_focal_inter",
-        "test_mae_intra",
-        "test_mae_inter",
-        "test_tversky",
-        "test_residue_bind",
-        "test_inter_auroc",
-        "test_inter_auprc",
-        "test_inter_contact_prev",
-        "test_intra_auroc",
-        "test_intra_auprc",
-        "test_intra_contact_prev",
-        "test_sample_auroc",
-        "test_sample_auprc",
-        "test_sample_prev",
-        "test_distogram_sample_auroc",
-        "test_distogram_sample_auprc",
-        "test_residue_auroc",
-        "test_residue_auprc",
-        "test_residue_prev",
-    ]
+    csv_fields = (
+        ["epoch"]
+        + [f"train_{name}" for name in _TRAIN_LOG_KEYS]
+        + [f"test_{name}" for name in _TEST_LOG_KEYS]
+    )
     if DIST_WRAPPER.rank == 0:
         with open(csv_path, "w", encoding="utf-8") as f:
             f.write(",".join(csv_fields) + "\n")
@@ -1040,8 +876,7 @@ def main(args: DictConfig):
             global_step += 1
             if DIST_WRAPPER.rank != 0 or global_step % wandb_log_interval != 0:
                 return
-            payload = _prefix_metrics("train", term_floats)
-            payload["epoch"] = crt_epoch
+            payload = _prefix_metrics("train", _select_log_keys(term_floats, _TRAIN_LOG_KEYS))
             payload["train/lr"] = float(optimizer.param_groups[0]["lr"])
             _wandb_log(payload, step=global_step)
 
@@ -1064,8 +899,6 @@ def main(args: DictConfig):
             max_grad_norm=float(args.optimizer.max_grad_norm),
             grad_accum_steps=max(1, int(args.optimizer.grad_accum_steps)),
             scheduler=scheduler,
-            recycle_rounds=int(args.recycle_rounds),
-            self_conditioning_probability=float(args.self_conditioning_probability),
             step_logger=log_train_step,
             contact_bins=n_contact_bins,
             inter_neg_per_pos=float(_cfg_get(args, "loss.inter_neg_per_pos", default=4.0)),
@@ -1093,7 +926,6 @@ def main(args: DictConfig):
             distance_bin_start=args.data.distance_bin_start,
             distance_bin_end=args.data.distance_bin_end,
             distance_bin_count=args.data.distance_bin_count,
-            recycle_rounds=int(args.recycle_rounds),
             positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
             chunk_size=chunk_size,
         )
@@ -1103,15 +935,20 @@ def main(args: DictConfig):
                 epoch_progress.set_postfix(
                     loss=f"{train_metrics.get('total', float('nan')):.3f}",
                     test=f"{test_metrics.get('total', float('nan')):.3f}",
+                    pAUC=f"{test_metrics.get('protein_auroc', float('nan')):.3f}",
+                    pAP=f"{test_metrics.get('protein_auprc', float('nan')):.3f}",
+                    rAUC=f"{test_metrics.get('residue_auroc', float('nan')):.3f}",
+                    rAP=f"{test_metrics.get('residue_auprc', float('nan')):.3f}",
                     iAUC=f"{test_metrics.get('inter_auroc', float('nan')):.3f}",
-                    oAUC=f"{test_metrics.get('intra_auroc', float('nan')):.3f}",
-                    sAUPRC=f"{test_metrics.get('sample_auprc', float('nan')):.3f}",
+                    iAP=f"{test_metrics.get('inter_auprc', float('nan')):.3f}",
                 )
                 epoch_progress.update()
 
+            logged_train = _select_log_keys(train_metrics, _TRAIN_LOG_KEYS)
+            logged_test = _select_log_keys(test_metrics, _TEST_LOG_KEYS)
             row = {"epoch": crt_epoch}
-            row.update({f"train_{name}": value for name, value in train_metrics.items()})
-            row.update({f"test_{name}": value for name, value in test_metrics.items()})
+            row.update({f"train_{name}": value for name, value in logged_train.items()})
+            row.update({f"test_{name}": value for name, value in logged_test.items()})
             with open(csv_path, "a", encoding="utf-8") as f:
                 f.write(
                     ",".join(
@@ -1121,25 +958,21 @@ def main(args: DictConfig):
                     + "\n"
                 )
             _wandb_log(
-                {
-                    "epoch": crt_epoch,
-                    **_prefix_metrics("test", test_metrics),
-                },
+                _prefix_metrics("test", logged_test),
                 step=max(global_step, 1),
             )
             log_info(
                 f"[epoch={crt_epoch}] "
-                f"train={train_metrics.get('total', float('nan')):.4f} "
-                f"test={test_metrics.get('total', float('nan')):.4f} "
-                f"focal_x={train_metrics.get('focal_inter', float('nan')):.4f} "
-                f"mae_x={train_metrics.get('mae_inter', float('nan')):.4f} "
-                f"tv={train_metrics.get('tversky', float('nan')):.4f} "
-                f"rb={train_metrics.get('residue_bind', float('nan')):.4f} "
-                f"inter_auroc={test_metrics.get('inter_auroc', float('nan')):.4f} "
-                f"inter_auprc={test_metrics.get('inter_auprc', float('nan')):.4f} "
-                f"intra_auroc={test_metrics.get('intra_auroc', float('nan')):.4f} "
-                f"sample_auprc={test_metrics.get('sample_auprc', float('nan')):.4f} "
-                f"residue_auprc={test_metrics.get('residue_auprc', float('nan')):.4f}"
+                + " ".join(
+                    f"train/{name}={logged_train.get(name, float('nan')):.4f}"
+                    for name in _TRAIN_LOG_KEYS
+                    if name in logged_train
+                )
+                + " "
+                + " ".join(
+                    f"test/{name}={logged_test.get(name, float('nan')):.4f}"
+                    for name in _TEST_LOG_KEYS
+                )
             )
 
             if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:

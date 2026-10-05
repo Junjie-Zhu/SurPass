@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
@@ -5,51 +6,19 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from src.model.components.embedder import ResidueEmbedder
-from src.model.components.outer_product_mean import OuterProductMean
+from src.model.components.outer_product_mean import EfficientOuterProductMean
 from src.model.components.primitives import PairTransition
 from src.model.components.transformer import ResidueTransformer
-from src.model.components.triangle_attention import (
-    TriangleAttentionEndingNode,
-    TriangleAttentionStartingNode,
-)
-from src.model.components.triangle_update import (
-    TriangleMultiplicationIncoming,
-    TriangleMultiplicationOutgoing,
-)
 
 _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
 
 
-# class OuterProductMean(nn.Module):
-#     def __init__(
-#         self,
-#         c_m=256,
-#         c_hidden=32,
-#         c_z=128,
-#     ):
-#         super().__init__()
-#         self.layernorm = nn.LayerNorm(c_m)
-#         self.linear_no_bias = nn.Linear(c_m, c_hidden, bias=False)
-#         self.linear_out = nn.Linear(c_hidden ** 2, c_z)
-
-#     def forward(
-#         self,
-#         token_repr: torch.Tensor,
-#         mask: torch.Tensor,
-#     ):
-#         token_repr = self.layernorm(token_repr)
-#         token_repr = self.linear_no_bias(token_repr)
-#         if mask is not None:
-#             token_repr = token_repr * mask.to(dtype=token_repr.dtype)[..., None]
-
-#         # Project a_i ⊗ a_j without materializing [B, L, L, C, C].
-#         pair_dim, inner = self.linear_out.weight.shape[0], token_repr.shape[-1]
-#         weight = self.linear_out.weight.view(pair_dim, inner, inner)
-#         projected = torch.einsum("pcd,bjd->bjpc", weight, token_repr)
-#         outer_product = torch.einsum("bic,bjpc->bijp", token_repr, projected)
-#         if self.linear_out.bias is not None:
-#             outer_product = outer_product + self.linear_out.bias
-#         return outer_product
+@dataclass
+class SurpassOutput:
+    pair_logits: torch.Tensor
+    residue_logits: torch.Tensor
+    protein_logit: torch.Tensor
+    pair_mask: torch.Tensor
 
 
 class ResOnly(nn.Module):
@@ -66,19 +35,14 @@ class ResOnly(nn.Module):
         dropout=0.0,
         expansion_factor=2,
         dim_opm_inner=32,
-        dim_triangle_hidden=32,
-        n_pair_heads=4,
         checkpoint_pair_blocks=True,
+        contact_bins: int = 1,
         **kwargs,
     ):
         super().__init__()
         if int(dim_token) % int(n_heads) != 0:
             raise ValueError(
                 f"n_heads ({n_heads}) must divide dim_token ({dim_token})."
-            )
-        if int(dim_pair) % int(n_pair_heads) != 0:
-            raise ValueError(
-                f"n_pair_heads ({n_pair_heads}) must divide dim_pair ({dim_pair})."
             )
         xt_pair_dist_dim = int(kwargs.get("xt_pair_dist_dim", 64))
         num_classes = int(kwargs.get("num_classes", xt_pair_dist_dim))
@@ -87,18 +51,21 @@ class ResOnly(nn.Module):
                 f"num_classes ({num_classes}) must equal "
                 f"xt_pair_dist_dim ({xt_pair_dist_dim})."
             )
+        if int(contact_bins) <= 0 or int(contact_bins) > num_classes:
+            raise ValueError(
+                f"contact_bins ({contact_bins}) must be in 1..{num_classes}."
+            )
         self.dim_token = dim_token
         self.dim_pair = dim_pair
+        self.contact_bins = int(contact_bins)
         self.checkpoint_pair_blocks = bool(checkpoint_pair_blocks)
 
-        # feature embedders
         self.residue_embedder = ResidueEmbedder(
             dim_token=dim_token,
             dim_pair=dim_pair,
             **kwargs,
         )
 
-        # main trunk
         self.n_layers = n_layers
         self.residue_blocks = nn.ModuleList([
             ResidueTransformer(
@@ -116,42 +83,10 @@ class ResOnly(nn.Module):
         ])
 
         self.outer_product_mean = nn.ModuleList([
-            OuterProductMean(
+            EfficientOuterProductMean(
                 c_m=dim_token,
                 c_z=dim_pair,
                 c_hidden=dim_opm_inner,
-            ) for _ in range(n_layers)
-        ])
-
-        self.triangle_multiplication_outgoing = nn.ModuleList([
-            TriangleMultiplicationOutgoing(
-                c_z=dim_pair,
-                c_hidden=dim_triangle_hidden,
-            ) for _ in range(n_layers)
-        ])
-
-        self.triangle_multiplication_incoming = nn.ModuleList([
-            TriangleMultiplicationIncoming(
-                c_z=dim_pair,
-                c_hidden=dim_triangle_hidden,
-            ) for _ in range(n_layers)
-        ])
-
-        self.triangle_attention_starting = nn.ModuleList([
-            TriangleAttentionStartingNode(
-                c_in=dim_pair,
-                c_hidden=dim_pair,
-                no_heads=n_pair_heads,
-                dropout=dropout,
-            ) for _ in range(n_layers)
-        ])
-
-        self.triangle_attention_ending = nn.ModuleList([
-            TriangleAttentionEndingNode(
-                c_in=dim_pair,
-                c_hidden=dim_pair,
-                no_heads=n_pair_heads,
-                dropout=dropout,
             ) for _ in range(n_layers)
         ])
 
@@ -163,11 +98,17 @@ class ResOnly(nn.Module):
             ) for _ in range(n_layers)
         ])
 
-        # prediction heads
         self.pair_out_layernorm = nn.LayerNorm(dim_pair)
         self.pair_out_linear = nn.Linear(dim_pair, num_classes)
         self.residue_bind_norm = nn.LayerNorm(dim_token)
         self.residue_bind_linear = nn.Linear(dim_token, 1)
+        self.protein_head = nn.Sequential(
+            nn.LayerNorm(dim_token * 3),
+            nn.Linear(dim_token * 3, dim_token),
+            nn.GELU(),
+            nn.Linear(dim_token, 1),
+        )
+        self.residue_contact_gate = nn.Parameter(torch.zeros(()))
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -179,54 +120,85 @@ class ResOnly(nn.Module):
             nn.init.zeros_(block.linear_out.weight)
             if block.linear_out.bias is not None:
                 nn.init.zeros_(block.linear_out.bias)
-        for module in (
-            *self.triangle_multiplication_outgoing,
-            *self.triangle_multiplication_incoming,
-        ):
-            nn.init.zeros_(module.linear_z.weight)
-            if module.linear_z.bias is not None:
-                nn.init.zeros_(module.linear_z.bias)
-        for module in (
-            *self.triangle_attention_starting,
-            *self.triangle_attention_ending,
-        ):
-            nn.init.zeros_(module.mha.to_out.weight)
-            if module.mha.to_out.bias is not None:
-                nn.init.zeros_(module.mha.to_out.bias)
 
     def forward(
         self,
         residue_batch: Dict[str, torch.Tensor],
-        self_conditioning_bins: torch.Tensor | None = None,
-        recycle_rounds: int = 1,
         chunk_size: Optional[int] = None,
-    ):
-        recycle_rounds = max(1, int(recycle_rounds))
+    ) -> SurpassOutput:
         chunk_size = _normalize_chunk_size(chunk_size)
-        if self_conditioning_bins is None:
-            self_conditioning_bins = self._init_self_conditioning(residue_batch)
+        embedder_inputs = {
+            key: value
+            for key, value in residue_batch.items()
+            if key not in _RESIDUE_LENGTH_KEYS
+        }
+        single_repr, pair_repr, mask = self.residue_embedder(**embedder_inputs)
+        mask = mask.to(dtype=torch.bool)
+        pair_mask = mask[:, :, None] & mask[:, None, :]
+        pair_mask_float = pair_mask.to(dtype=pair_repr.dtype)
 
-        recycled_bins = self_conditioning_bins
-        for _ in range(recycle_rounds - 1):
-            with torch.no_grad():
-                logits, _, _ = self._forward_once(
-                    residue_batch,
-                    recycled_bins,
-                    chunk_size=chunk_size,
-                )
-                recycled_bins = torch.softmax(logits, dim=-1).detach()
+        for i in range(self.n_layers):
+            single_repr = self.residue_blocks[i](
+                single_repr,
+                pair_repr,
+                single_repr,
+                mask,
+            )
+            pair_repr = self._apply_pair_stack(
+                i,
+                single_repr,
+                pair_repr,
+                mask,
+                pair_mask_float,
+                chunk_size,
+            )
 
-        return self._forward_once(
-            residue_batch,
-            recycled_bins,
-            chunk_size=chunk_size,
+        pair_logits = self.pair_out_linear(self.pair_out_layernorm(pair_repr))
+        pair_logits = pair_logits + pair_logits.transpose(-2, -3)
+        pair_logits = pair_logits / 2
+        residue_logits = self.residue_bind_linear(
+            self.residue_bind_norm(single_repr)
+        ).squeeze(-1)
+        residue_logits = residue_logits.masked_fill(~mask, 0.0)
+        pair_logits = pair_logits + self._contact_bin_bias(residue_logits)
+        pair_mask = pair_mask | pair_mask.transpose(-1, -2)
+        protein_logit = self._protein_logit(
+            single_repr,
+            mask,
+            residue_batch["p1_length"],
+            residue_batch["p2_length"],
+        )
+        return SurpassOutput(
+            pair_logits=pair_logits,
+            residue_logits=residue_logits,
+            protein_logit=protein_logit,
+            pair_mask=pair_mask,
         )
 
-    def _init_self_conditioning(
+    def _contact_bin_bias(self, residue_logits: torch.Tensor) -> torch.Tensor:
+        pair_bias = residue_logits[:, :, None] + residue_logits[:, None, :]
+        pair_bias = pair_bias * self.residue_contact_gate
+        class_count = self.pair_out_linear.out_features
+        far_bins = class_count - self.contact_bins
+        contact_bias = pair_bias.unsqueeze(-1).expand(
+            *pair_bias.shape, self.contact_bins
+        )
+        if far_bins <= 0:
+            return contact_bias
+        far_bias = pair_bias.new_zeros(*pair_bias.shape, far_bins)
+        return torch.cat([contact_bias, far_bias], dim=-1)
+
+    def _protein_logit(
         self,
-        residue_batch: Dict[str, torch.Tensor],
+        single_repr: torch.Tensor,
+        mask: torch.Tensor,
+        p1_length: torch.Tensor,
+        p2_length: torch.Tensor,
     ) -> torch.Tensor:
-        return self.residue_embedder.calvados_pair_energies(residue_batch["residue_type"])
+        h1 = _masked_chain_mean(single_repr, mask, p1_length, p2_length, chain=1)
+        h2 = _masked_chain_mean(single_repr, mask, p1_length, p2_length, chain=2)
+        features = torch.cat([h1, h2, h1 * h2], dim=-1)
+        return self.protein_head(features).squeeze(-1)
 
     def _pair_stack(
         self,
@@ -238,28 +210,9 @@ class ResOnly(nn.Module):
         chunk_size: Optional[int],
     ) -> torch.Tensor:
         pair_repr = pair_repr + self.outer_product_mean[layer_index](
-            single_repr.unsqueeze(-3),
-            mask.unsqueeze(-2),
-            chunk_size=chunk_size,
+            single_repr,
+            mask,
         ) * pair_mask_float[..., None]
-        pair_repr = pair_repr + self.triangle_multiplication_outgoing[layer_index](
-            pair_repr,
-            pair_mask_float,
-        )
-        pair_repr = pair_repr + self.triangle_multiplication_incoming[layer_index](
-            pair_repr,
-            pair_mask_float,
-        )
-        pair_repr = pair_repr + self.triangle_attention_starting[layer_index](
-            pair_repr,
-            pair_mask_float,
-            chunk_size=chunk_size,
-        )
-        pair_repr = pair_repr + self.triangle_attention_ending[layer_index](
-            pair_repr,
-            pair_mask_float,
-            chunk_size=chunk_size,
-        )
         pair_repr = pair_repr + self.pair_blocks[layer_index](
             pair_repr,
             pair_mask_float,
@@ -310,52 +263,25 @@ class ResOnly(nn.Module):
             use_reentrant=False,
         )
 
-    def _forward_once(
-        self,
-        residue_batch: Dict[str, torch.Tensor],
-        self_conditioning_bins: torch.Tensor,
-        chunk_size: Optional[int] = None,
-    ):
-        embedder_inputs = {
-            key: value
-            for key, value in residue_batch.items()
-            if key not in _RESIDUE_LENGTH_KEYS
-        }
-        single_repr, pair_repr, mask = self.residue_embedder(
-            **embedder_inputs,
-            pairwise_dist_bins=self_conditioning_bins,
-        )
-        mask = mask.to(dtype=torch.bool)
-        pair_mask = mask[:, :, None] & mask[:, None, :]
-        pair_mask_float = pair_mask.to(dtype=pair_repr.dtype)
-        chunk_size = _normalize_chunk_size(chunk_size)
 
-        for i in range(self.n_layers):
-            single_repr = self.residue_blocks[i](
-                single_repr,
-                pair_repr,
-                single_repr,
-                mask,
-            )
-            pair_repr = self._apply_pair_stack(
-                i,
-                single_repr,
-                pair_repr,
-                mask,
-                pair_mask_float,
-                chunk_size,
-            )
-
-        pair_logits = self.pair_out_linear(self.pair_out_layernorm(pair_repr))
-        pair_logits = pair_logits + pair_logits.transpose(-2, -3)
-        pair_logits = pair_logits / 2
-        pair_mask = pair_mask | pair_mask.transpose(-1, -2)
-        
-        residue_logits = self.residue_bind_linear(
-            self.residue_bind_norm(single_repr)
-        ).squeeze(-1)
-        residue_logits = residue_logits.masked_fill(~mask, 0.0)
-        return pair_logits, residue_logits, pair_mask
+def _masked_chain_mean(
+    single_repr: torch.Tensor,
+    mask: torch.Tensor,
+    p1_length: torch.Tensor,
+    p2_length: torch.Tensor,
+    chain: int,
+) -> torch.Tensor:
+    length = single_repr.shape[1]
+    index = torch.arange(length, device=single_repr.device).view(1, length)
+    p1 = p1_length.to(device=single_repr.device).view(-1, 1)
+    p2 = p2_length.to(device=single_repr.device).view(-1, 1)
+    if chain == 1:
+        selected = (index < p1) & mask
+    else:
+        selected = (index >= p1) & (index < p1 + p2) & mask
+    weight = selected.to(dtype=single_repr.dtype)
+    denom = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (single_repr * weight[..., None]).sum(dim=1) / denom
 
 
 def _normalize_chunk_size(chunk_size: Optional[int]) -> Optional[int]:

@@ -10,13 +10,15 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Subset
 
-from src.data.dataset import PepoTrainDataset, collate_fn, get_dataloader
+from src.data.balancing import create_balanced_split_datasets
+from src.data.collate import collate_fn, get_dataloader
+from src.data.dataset import PepoTrainDataset
 from src.model.surpass import ResOnly
 from src.train import (
     _cfg_get,
     _unpack_batch,
     _validate_model_bin_counts,
-    create_balanced_split_datasets,
+    contact_bin_count,
     resolve_chunk_size,
     resolve_cuda_device,
 )
@@ -181,6 +183,14 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    for unused_key in ("dim_triangle_hidden", "n_pair_heads"):
+        model_kwargs.pop(unused_key, None)
+    model_kwargs["contact_bins"] = contact_bin_count(
+        args.data.contact_threshold,
+        args.data.distance_bin_start,
+        args.data.distance_bin_end,
+        args.data.distance_bin_count,
+    )
     model_kwargs["checkpoint_pair_blocks"] = bool(
         _cfg_get(args, "performance.checkpoint_pair_blocks", default=False)
     )
@@ -203,7 +213,6 @@ def main(args: DictConfig):
         args.data.distance_bin_count,
     )
     last_bin = int(args.data.distance_bin_count) - 1
-    recycle_rounds = max(1, int(args.recycle_rounds))
     chunk_size = resolve_chunk_size(args, default=64)
     PREVIEW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -215,13 +224,9 @@ def main(args: DictConfig):
     with torch.no_grad():
         for index, step_batch in enumerate(loader):
             residue_batch, labels = _unpack_batch(step_batch, device)
-            logits, _, pair_mask = model(
-                residue_batch,
-                recycle_rounds=recycle_rounds,
-                chunk_size=chunk_size,
-            )
-            pred_bins = logits.argmax(dim=-1)
-            valid_mask = pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(
+            output = model(residue_batch, chunk_size=chunk_size)
+            pred_bins = output.pair_logits.argmax(dim=-1)
+            valid_mask = output.pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(
                 dtype=torch.bool
             )
             label_map = masked_distance_map(labels["label_2d_bins"], centers, valid_mask)

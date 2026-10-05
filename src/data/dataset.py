@@ -2,233 +2,27 @@ import pickle
 import random
 from math import prod
 from pathlib import Path
-from typing import Sequence
 
 import pandas as pd
 import torch
 from scipy.spatial.transform import Rotation as Scipy_Rotation
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
-DISTANCE_BIN_START_A = 2.0
-DISTANCE_BIN_END_A = 22.0
-DISTANCE_BIN_WIDTH_A = 0.5
-DISTANCE_BIN_NUM = 64
-ATOM14_CA_INDEX = 1
-ATOM14_CB_INDEX = 4
-DEFAULT_CROP_SIZE = 256
-DEFAULT_CROP_NEIGHBORHOOD_SIZE = 10
-DEFAULT_CONTACT_THRESHOLD_A = 8.0
-DEFAULT_CROP_CONTIGUOUS_PROBABILITY = 0.3
-
-
-def distance_to_bins(
-    distance: torch.Tensor,
-    bin_start: float = DISTANCE_BIN_START_A,
-    bin_end: float = DISTANCE_BIN_END_A,
-    bin_count: int = DISTANCE_BIN_NUM,
-) -> torch.Tensor:
-    bin_limits = torch.linspace(
-        float(bin_start),
-        float(bin_end),
-        int(bin_count) - 1,
-        device=distance.device,
-    )
-    return torch.bucketize(distance.to(dtype=torch.float32), bin_limits).to(dtype=torch.long)
-
-
-def inter_chain_pair_mask(
-    p1_length: int | torch.Tensor,
-    p2_length: int | torch.Tensor,
-    device: torch.device | None = None,
-    total_length: int | None = None,
-) -> torch.Tensor:
-    if isinstance(p1_length, torch.Tensor) or isinstance(p2_length, torch.Tensor):
-        p1 = torch.as_tensor(p1_length, dtype=torch.long)
-        p2 = torch.as_tensor(p2_length, dtype=torch.long)
-        if device is not None:
-            p1 = p1.to(device=device)
-            p2 = p2.to(device=device)
-        if p1.ndim == 0:
-            p1 = p1.unsqueeze(0)
-        if p2.ndim == 0:
-            p2 = p2.unsqueeze(0)
-        if p1.shape != p2.shape:
-            raise ValueError(
-                f"p1_length shape {tuple(p1.shape)} does not match "
-                f"p2_length shape {tuple(p2.shape)}."
-            )
-        batch_size = int(p1.shape[0])
-        padded_total = (
-            int(total_length)
-            if total_length is not None
-            else int((p1 + p2).max().item())
-        )
-        idx = torch.arange(padded_total, device=p1.device)
-        i_idx = idx.view(1, padded_total, 1)
-        j_idx = idx.view(1, 1, padded_total)
-        length_1 = p1.view(batch_size, 1, 1)
-        length_2 = p2.view(batch_size, 1, 1)
-        in_p1_i = i_idx < length_1
-        in_p2_i = (i_idx >= length_1) & (i_idx < length_1 + length_2)
-        in_p1_j = j_idx < length_1
-        in_p2_j = (j_idx >= length_1) & (j_idx < length_1 + length_2)
-        mask = (in_p1_i & in_p2_j) | (in_p2_i & in_p1_j)
-        if batch_size == 1 and not isinstance(p1_length, torch.Tensor):
-            return mask[0]
-        return mask
-
-    p1_length = int(p1_length)
-    p2_length = int(p2_length)
-    total = p1_length + p2_length if total_length is None else int(total_length)
-    mask = torch.zeros((total, total), dtype=torch.bool, device=device)
-    mask[:p1_length, p1_length : p1_length + p2_length] = True
-    mask[p1_length : p1_length + p2_length, :p1_length] = True
-    return mask
-
-
-def build_negative_pair_labels(
-    p1_positions: torch.Tensor,
-    p1_mask: torch.Tensor,
-    p2_positions: torch.Tensor,
-    p2_mask: torch.Tensor,
-    *,
-    bin_start: float,
-    bin_end: float,
-    bin_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    p1_mask = p1_mask.to(dtype=torch.bool)
-    p2_mask = p2_mask.to(dtype=torch.bool)
-    p1_length = int(p1_mask.shape[0])
-    p2_length = int(p2_mask.shape[0])
-    p1_positions = p1_positions.to(dtype=torch.float32)
-    p2_positions = p2_positions.to(dtype=torch.float32)
-
-    combined = p1_positions.new_full(
-        (p1_length + p2_length, p1_length + p2_length),
-        float(bin_end) + 1.0,
-    )
-    combined[:p1_length, :p1_length] = torch.cdist(p1_positions, p1_positions)
-    combined[p1_length:, p1_length:] = torch.cdist(p2_positions, p2_positions)
-
-    label_bins = distance_to_bins(
-        combined,
-        bin_start=bin_start,
-        bin_end=bin_end,
-        bin_count=bin_count,
-    )
-    residue_mask = torch.cat([p1_mask, p2_mask], dim=0)
-    label_mask = residue_mask[:, None] & residue_mask[None, :]
-    return label_bins, label_mask
-
-
-def _pad_value(tensor: torch.Tensor):
-    if tensor.dtype == torch.bool:
-        return False
-    if torch.is_floating_point(tensor):
-        return 0.0
-    return 0
-
-
-def pad_first_dim(tensors: list[torch.Tensor]) -> torch.Tensor:
-    max_n = max(int(tensor.shape[0]) for tensor in tensors)
-    out = tensors[0].new_full(
-        (len(tensors), max_n, *tensors[0].shape[1:]),
-        fill_value=_pad_value(tensors[0]),
-    )
-    for index, tensor in enumerate(tensors):
-        out[index, : tensor.shape[0]] = tensor
-    return out
-
-
-def concat_pair_residue_features(p1: dict, p2: dict) -> dict:
-    concatenated = {}
-    for key, p1_value in p1.items():
-        p2_value = p2[key]
-        if not isinstance(p1_value, torch.Tensor):
-            concatenated[key] = p1_value
-            continue
-        if key == "chain_index":
-            p1_chain = p1_value.long()
-            p2_chain = p2_value.long() + p1_chain.amax() + 1
-            concatenated[key] = torch.cat([p1_chain, p2_chain], dim=0)
-        else:
-            concatenated[key] = torch.cat([p1_value, p2_value], dim=0)
-    return concatenated
-
-
-def pad_residue_dicts(samples: list[dict]) -> dict:
-    feature_batch = {}
-    for key in samples[0].keys():
-        values = [sample[key] for sample in samples]
-        if not isinstance(values[0], torch.Tensor):
-            feature_batch[key] = values
-            continue
-        feature_batch[key] = pad_first_dim(values)
-    return feature_batch
-
-
-def pad_pair_maps(tensors: list[torch.Tensor], max_total: int) -> torch.Tensor:
-    out = tensors[0].new_full(
-        (len(tensors), max_total, max_total, *tensors[0].shape[2:]),
-        fill_value=_pad_value(tensors[0]),
-    )
-    for index, tensor in enumerate(tensors):
-        length = int(tensor.shape[0])
-        out[index, :length, :length] = tensor
-    return out
-
-
-def collate_concatenated_pairs(proteins: list[dict], peptides: list[dict]) -> dict:
-    p1_lengths = [int(sample["mask"].shape[0]) for sample in proteins]
-    p2_lengths = [int(sample["mask"].shape[0]) for sample in peptides]
-    concatenated = [
-        concat_pair_residue_features(protein, peptide)
-        for protein, peptide in zip(proteins, peptides)
-    ]
-    residue_batch = pad_residue_dicts(concatenated)
-    residue_batch["p1_length"] = torch.tensor(p1_lengths, dtype=torch.long)
-    residue_batch["p2_length"] = torch.tensor(p2_lengths, dtype=torch.long)
-    return residue_batch
-
-
-def collate_fn(batch):
-    proteins, peptides, labels_2d_bins, labels_2d_mask, is_positive = zip(*batch)
-    residue_batch = collate_concatenated_pairs(list(proteins), list(peptides))
-    max_total = int(residue_batch["mask"].shape[1])
-    label_batch = {
-        "label_2d_bins": pad_pair_maps(
-            [tensor.to(dtype=torch.long) for tensor in labels_2d_bins],
-            max_total,
-        ),
-        "label_2d_mask": pad_pair_maps(
-            [tensor.to(dtype=torch.bool) for tensor in labels_2d_mask],
-            max_total,
-        ),
-        "is_positive": torch.tensor(list(is_positive), dtype=torch.bool),
-    }
-    return residue_batch, label_batch
-
-
-def get_dataloader(
-    dataset,
-    collate_fn,
-    batch_size,
-    shuffle=True,
-    num_workers=4,
-    sampler=None,
-    pin_memory=True,
-    drop_last=False,
-):
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle if sampler is None else False,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        sampler=sampler,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-    )
+from src.data.cropping import (
+    DEFAULT_CONTACT_THRESHOLD_A,
+    DEFAULT_CROP_CONTIGUOUS_PROBABILITY,
+    DEFAULT_CROP_NEIGHBORHOOD_SIZE,
+    DEFAULT_CROP_SIZE,
+    crop_negative_pair,
+    crop_positive_pair,
+)
+from src.data.labels import (
+    DISTANCE_BIN_END_A,
+    DISTANCE_BIN_NUM,
+    DISTANCE_BIN_START_A,
+    build_negative_pair_labels,
+    distance_to_bins,
+)
 
 
 class PepoTrainDataset(Dataset):
@@ -300,30 +94,45 @@ class PepoTrainDataset(Dataset):
         return p1_features, p2_features
 
     def get_positive_item(self, idx):
-        row = self._sample_row(idx)
+        cluster_rows = self.cluster_to_rows[self.items[idx]]
+        order = list(range(len(cluster_rows)))
+        random.shuffle(order)
+        for row_index in order:
+            sample = self._positive_sample_from_row(cluster_rows.iloc[row_index])
+            if sample is not None:
+                if self.transform is not None:
+                    sample = self.transform(sample)
+                return sample
+        raise RuntimeError(
+            f"Cluster {self.items[idx]} has no structure with an inter-chain contact."
+        )
+
+    def _positive_sample_from_row(self, row):
         p1_features, p2_features = self._load_pair_features(row)
         label_path = self.root_dir / "labels" / Path(row["label_path"]).name
         pairwise_dist, pairwise_mask = self._load_pair_distance_and_mask(
             label_path, p1_features["mask"].shape[0], p2_features["mask"].shape[0]
         )
-        p1_features, p2_features, pairwise_dist, pairwise_mask = self._crop_positive_pair(
+        cropped = crop_positive_pair(
             p1_features,
             p2_features,
             pairwise_dist,
             pairwise_mask,
+            crop_size=self.crop_size,
+            crop_contiguous_probability=self.crop_contiguous_probability,
+            crop_neighborhood_size=self.crop_neighborhood_size,
+            contact_threshold=self.contact_threshold,
         )
+        if cropped is None:
+            return None
+        p1_features, p2_features, pairwise_dist, pairwise_mask = cropped
         label_bins = distance_to_bins(
             pairwise_dist,
             bin_start=self.distance_bin_start,
             bin_end=self.distance_bin_end,
             bin_count=self.distance_bin_count,
         )
-        label_mask = pairwise_mask
-
-        sample = (p1_features, p2_features, label_bins, label_mask, True)
-        if self.transform is not None:
-            sample = self.transform(sample)
-        return sample
+        return (p1_features, p2_features, label_bins, pairwise_mask, True)
 
     def get_negative_item(self, p1_idx: int, p2_idx: int):
         if self.items[p1_idx] == self.items[p2_idx]:
@@ -333,7 +142,11 @@ class PepoTrainDataset(Dataset):
         p2_row = self._sample_row(p2_idx)
         p1_features = self._process_complex(self._load_chain_features(p1_row["chain1"]))
         p2_features = self._process_complex(self._load_chain_features(p2_row["chain2"]))
-        p1_features, p2_features = self._crop_negative_pair(p1_features, p2_features)
+        p1_features, p2_features = crop_negative_pair(
+            p1_features,
+            p2_features,
+            crop_size=self.crop_size,
+        )
 
         label_bins, label_mask = build_negative_pair_labels(
             p1_features["residue_position"],
@@ -398,178 +211,6 @@ class PepoTrainDataset(Dataset):
 
         return pairwise_dist, pairwise_mask
 
-    def _crop_positive_pair(
-        self,
-        p1_features: dict,
-        p2_features: dict,
-        pairwise_dist: torch.Tensor,
-        pairwise_mask: torch.Tensor,
-    ) -> tuple[dict, dict, torch.Tensor, torch.Tensor]:
-        if self.crop_size is None:
-            return p1_features, p2_features, pairwise_dist, pairwise_mask
-
-        p1_length = int(p1_features["mask"].shape[0])
-        p2_length = int(p2_features["mask"].shape[0])
-        if self._should_use_contiguous_crop():
-            p1_idx = self._select_contiguous_crop_indices(p1_length, self.crop_size)
-            p2_idx = self._select_contiguous_crop_indices(p2_length, self.crop_size)
-        else:
-            cross_dist = pairwise_dist[:p1_length, p1_length : p1_length + p2_length]
-            cross_mask = pairwise_mask[:p1_length, p1_length : p1_length + p2_length]
-            p1_idx, p2_idx = self._select_interface_crop_indices(
-                cross_dist,
-                cross_mask,
-                crop_size=self.crop_size,
-                contact_threshold=self.contact_threshold,
-                neighborhood_size=self.crop_neighborhood_size,
-            )
-        full_idx = torch.cat([p1_idx, p2_idx + p1_length], dim=0)
-        p1_features = self._slice_complex_features(p1_features, p1_idx)
-        p2_features = self._slice_complex_features(p2_features, p2_idx)
-        pairwise_dist = pairwise_dist.index_select(0, full_idx).index_select(1, full_idx)
-        pairwise_mask = pairwise_mask.index_select(0, full_idx).index_select(1, full_idx)
-        return p1_features, p2_features, pairwise_dist, pairwise_mask
-
-    def _crop_negative_pair(self, p1_features: dict, p2_features: dict) -> tuple[dict, dict]:
-        if self.crop_size is None:
-            return p1_features, p2_features
-
-        p1_idx = self._select_contiguous_crop_indices(
-            int(p1_features["mask"].shape[0]),
-            self.crop_size,
-        )
-        p2_idx = self._select_contiguous_crop_indices(
-            int(p2_features["mask"].shape[0]),
-            self.crop_size,
-        )
-        return (
-            self._slice_complex_features(p1_features, p1_idx),
-            self._slice_complex_features(p2_features, p2_idx),
-        )
-
-    def _should_use_contiguous_crop(self) -> bool:
-        probability = float(self.crop_contiguous_probability)
-        if probability <= 0.0:
-            return False
-        if probability >= 1.0:
-            return True
-        return random.random() < probability
-
-    @staticmethod
-    def _select_interface_crop_indices(
-        pairwise_dist: torch.Tensor,
-        pairwise_mask: torch.Tensor,
-        crop_size: int,
-        contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
-        neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        n1, n2 = int(pairwise_dist.shape[0]), int(pairwise_dist.shape[1])
-        if n1 <= crop_size and n2 <= crop_size:
-            return torch.arange(n1, dtype=torch.long), torch.arange(n2, dtype=torch.long)
-
-        contact_mask = (pairwise_dist < float(contact_threshold)) & pairwise_mask.to(dtype=torch.bool)
-        if not contact_mask.any():
-            return (
-                PepoTrainDataset._select_contiguous_crop_indices(n1, crop_size),
-                PepoTrainDataset._select_contiguous_crop_indices(n2, crop_size),
-            )
-
-        contacts = torch.nonzero(contact_mask, as_tuple=False)
-        order = list(range(int(contacts.shape[0])))
-        random.shuffle(order)
-
-        p1_selected = PepoTrainDataset._gather_neighbor_indices(
-            [int(contacts[i, 0]) for i in order],
-            length=n1,
-            crop_size=crop_size,
-            neighborhood_size=neighborhood_size,
-        )
-        p2_selected = PepoTrainDataset._gather_neighbor_indices(
-            [int(contacts[i, 1]) for i in order],
-            length=n2,
-            crop_size=crop_size,
-            neighborhood_size=neighborhood_size,
-        )
-        return p1_selected, p2_selected
-
-    @staticmethod
-    def _gather_neighbor_indices(
-        seeds: list[int],
-        length: int,
-        crop_size: int,
-        neighborhood_size: int,
-    ) -> torch.Tensor:
-        if length <= crop_size:
-            return torch.arange(length, dtype=torch.long)
-
-        selected: set[int] = set()
-        window_size = max(1, int(neighborhood_size))
-        for seed in seeds:
-            start = max(0, min(int(seed) - window_size // 2, length - window_size))
-            end = min(length, start + window_size)
-            window = list(range(start, end))
-            new_indices = [idx for idx in window if idx not in selected]
-            if len(selected) + len(new_indices) > crop_size:
-                break
-            selected.update(new_indices)
-            if len(selected) >= crop_size:
-                break
-
-        if not selected:
-            return PepoTrainDataset._select_contiguous_crop_indices(length, crop_size)
-
-        target = min(int(length), int(crop_size))
-        if len(selected) < target:
-            selected = PepoTrainDataset._fill_crop_indices(selected, length, target)
-        return torch.tensor(sorted(selected), dtype=torch.long)
-
-    @staticmethod
-    def _fill_crop_indices(selected: set[int], length: int, crop_size: int) -> set[int]:
-        filled = set(selected)
-        left = min(filled)
-        right = max(filled)
-        while len(filled) < crop_size and (left > 0 or right + 1 < length):
-            if left > 0:
-                left -= 1
-                filled.add(left)
-                if len(filled) >= crop_size:
-                    break
-            if right + 1 < length and len(filled) < crop_size:
-                right += 1
-                filled.add(right)
-        if len(filled) < crop_size:
-            for idx in range(length):
-                if idx not in filled:
-                    filled.add(idx)
-                    if len(filled) >= crop_size:
-                        break
-        return filled
-
-    @staticmethod
-    def _select_contiguous_crop_indices(
-        length: int,
-        crop_size: int,
-        start: int | None = None,
-    ) -> torch.Tensor:
-        if length <= crop_size:
-            return torch.arange(length, dtype=torch.long)
-
-        max_start = length - crop_size
-        if start is None:
-            start = random.randint(0, max_start)
-        start = max(0, min(int(start), max_start))
-        return torch.arange(start, start + crop_size, dtype=torch.long)
-
-    @staticmethod
-    def _slice_complex_features(features: dict, indices: torch.Tensor) -> dict:
-        residue_count = int(features["mask"].shape[0])
-        return {
-            key: value.index_select(0, indices.to(device=value.device))
-            if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == residue_count
-            else value
-            for key, value in features.items()
-        }
-
     @staticmethod
     def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
         return torch.tensor(
@@ -632,7 +273,6 @@ class PepoTrainDataset(Dataset):
             residue_features["plm_emb"], dtype=torch.float32
         )
 
-        # use CA to center the proteins
         residue_position = residue_features["atom14_positions"][:, 1, :]
         residue_mask = residue_features["atom14_mask"][:, 1]
         center = (
@@ -666,36 +306,3 @@ class PepoTrainDataset(Dataset):
             "atom14_positions": residue_features["atom14_positions"],
             "atom14_mask": residue_features["atom14_mask"],
         }
-
-
-class BalancedClusterDataset(Dataset):
-    def __init__(
-        self,
-        dataset: PepoTrainDataset,
-        indices: Sequence[int] | None = None,
-        distance_bin_count: int = DISTANCE_BIN_NUM,
-        negative_ratio: int = 1,
-    ):
-        self.dataset = dataset
-        self.indices = list(range(len(dataset))) if indices is None else list(indices)
-        self.distance_bin_count = int(distance_bin_count)
-        self.negative_ratio = int(negative_ratio)
-        if self.negative_ratio < 0:
-            raise ValueError("negative_ratio must be non-negative.")
-        if self.negative_ratio > 0 and len(self.indices) < 2:
-            raise ValueError("At least two PPI clusters are required to create negatives.")
-
-    def __len__(self):
-        return len(self.indices) * (1 + self.negative_ratio)
-
-    def __getitem__(self, idx):
-        positive_count = len(self.indices)
-        if idx < positive_count:
-            return self.dataset[self.indices[idx]]
-
-        negative_idx = idx - positive_count
-        source_pos = negative_idx % positive_count
-        source_idx = self.indices[source_pos]
-        candidate_indices = [i for i in self.indices if i != source_idx]
-        target_idx = random.choice(candidate_indices)
-        return self.dataset.get_negative_item(source_idx, target_idx)

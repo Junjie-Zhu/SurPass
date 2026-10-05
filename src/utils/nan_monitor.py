@@ -21,8 +21,6 @@ WATCH_ATTRS = ("residue_embedder", "pair_out_layernorm", "pair_out_linear")
 WATCH_LISTS = (
     "residue_blocks",
     "outer_product_mean",
-    "triangle_multiplication_outgoing",
-    "triangle_multiplication_incoming",
     "pair_blocks",
 )
 
@@ -124,7 +122,6 @@ def _modules_to_watch(model: nn.Module) -> list[tuple[str, nn.Module]]:
 def probe_first_nonfinite_module(
     model: nn.Module,
     residue_batch: dict[str, torch.Tensor],
-    recycle_rounds: int = 1,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
 
@@ -153,7 +150,7 @@ def probe_first_nonfinite_module(
         hooks.append(module.register_forward_hook(_hook(name)))
     try:
         with torch.no_grad():
-            model(residue_batch, recycle_rounds=recycle_rounds)
+            model(residue_batch)
     except Exception as exc:
         findings.append(
             {
@@ -235,7 +232,6 @@ def collect_training_nan_report(
     terms: dict[str, torch.Tensor],
     loss: torch.Tensor,
     model: nn.Module | None = None,
-    recycle_rounds: int = 1,
     stage: str = "loss",
     epoch: int | None = None,
     step: int | None = None,
@@ -258,7 +254,6 @@ def collect_training_nan_report(
         "epoch": epoch,
         "step": step,
         "lr": lr,
-        "recycle_rounds": recycle_rounds,
         "rank": int(DIST_WRAPPER.rank),
         "inputs": inputs,
         "logits": finite_stats("logits", logits),
@@ -308,9 +303,7 @@ def collect_training_nan_report(
         }
         inputs_finite = all(stats.get("finite", True) for stats in inputs.values())
         if probe_modules and inputs_finite:
-            report["module_findings"] = probe_first_nonfinite_module(
-                model, residue_batch, recycle_rounds=recycle_rounds
-            )
+            report["module_findings"] = probe_first_nonfinite_module(model, residue_batch)
     report["cause"] = classify_nan_cause(report)
     return report
 
@@ -322,7 +315,7 @@ def format_nan_report(report: dict[str, Any]) -> str:
         (
             f"stage={report.get('stage')} epoch={report.get('epoch')} "
             f"step={report.get('step')} rank={report.get('rank')} "
-            f"lr={report.get('lr')} recycle={report.get('recycle_rounds')}"
+            f"lr={report.get('lr')}"
         ),
         f"batch: {report.get('batch_shapes')}",
         "",
@@ -434,7 +427,6 @@ def diagnose_nonfinite_step(
     terms: dict[str, torch.Tensor],
     loss: torch.Tensor,
     model: nn.Module | None = None,
-    recycle_rounds: int = 1,
     stage: str = "loss",
     epoch: int | None = None,
     step: int | None = None,
@@ -461,7 +453,6 @@ def diagnose_nonfinite_step(
         terms=terms,
         loss=loss,
         model=model,
-        recycle_rounds=recycle_rounds,
         stage=stage,
         epoch=epoch,
         step=step,
@@ -490,7 +481,6 @@ def abort_if_nonfinite_loss(
     terms: dict[str, torch.Tensor],
     model: nn.Module | None = None,
     optimizer: torch.optim.Optimizer | None = None,
-    recycle_rounds: int = 1,
     epoch: int | None = None,
     step: int | None = None,
     dump_dir: str | Path | None = None,
@@ -510,7 +500,6 @@ def abort_if_nonfinite_loss(
         terms=terms,
         loss=loss,
         model=model,
-        recycle_rounds=recycle_rounds,
         stage="loss",
         epoch=epoch,
         step=step,

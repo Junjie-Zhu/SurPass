@@ -12,10 +12,8 @@ from torch.utils.data import Dataset, Subset
 from tqdm import tqdm
 
 from src.common.residue_constants import restype_order, unk_restype_index
-from src.data.dataset import (
-    collate_concatenated_pairs,
-    get_dataloader,
-)
+from src.data.collate import collate_concatenated_pairs, get_dataloader
+from src.model.loss import distance_bin_centers
 from src.model.surpass import ResOnly
 from src.train import (
     _binary_classification_metrics,
@@ -24,7 +22,6 @@ from src.train import (
     contact_bin_count,
     log_info,
     pair_bind_scores,
-    residue_pair_bind_scores,
     resolve_chunk_size,
     resolve_cuda_device,
     resolve_dist_backend,
@@ -275,6 +272,37 @@ def write_predictions(path: str | Path, rows: list[dict[str, Any]]) -> None:
     frame.to_csv(path, sep="\t", index=False)
 
 
+def distance_map_from_logits(
+    pair_logits: torch.Tensor,
+    centers: torch.Tensor,
+) -> torch.Tensor:
+    bins = pair_logits.argmax(dim=-1)
+    centers = centers.to(device=bins.device)
+    return centers[bins.long()]
+
+
+def write_pair_maps(
+    directory: str | Path,
+    pair_name: str,
+    residue_probability: torch.Tensor,
+    distance: torch.Tensor,
+    p1_length: int,
+) -> Path:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_name = str(pair_name).replace(os.sep, "_").replace("/", "_")
+    path = directory / f"{safe_name}.pt"
+    torch.save(
+        {
+            "residue_probability": residue_probability.detach().to(device="cpu", dtype=torch.float32),
+            "distance": distance.detach().to(device="cpu", dtype=torch.float32),
+            "p1_length": int(p1_length),
+        },
+        path,
+    )
+    return path
+
+
 def write_metrics(path: str | Path, metrics: dict[str, Any]) -> None:
     frame = pd.DataFrame(
         [
@@ -298,14 +326,19 @@ def evaluate_ppi(
     distance_bin_start: float,
     distance_bin_end: float,
     distance_bin_count: int,
-    recycle_rounds: int,
     ppi_score_threshold: float,
     positive_weight: float = 1.0,
     chunk_size: int | None = None,
+    map_dir: str | Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     model.eval()
     contact_bins = contact_bin_count(
         contact_threshold,
+        distance_bin_start,
+        distance_bin_end,
+        distance_bin_count,
+    )
+    centers = distance_bin_centers(
         distance_bin_start,
         distance_bin_end,
         distance_bin_count,
@@ -315,18 +348,13 @@ def evaluate_ppi(
     with torch.no_grad():
         for residue_batch, metas in loader:
             residue_batch = to_device(residue_batch, device)
-            logits, residue_logits, pair_mask = model(
-                residue_batch,
-                recycle_rounds=max(1, int(recycle_rounds)),
-                chunk_size=chunk_size,
-            )
-            p_bind = residue_pair_bind_scores(
-                residue_logits,
-                residue_batch["mask"],
-            )
+            output = model(residue_batch, chunk_size=chunk_size)
+            p_bind = torch.sigmoid(output.protein_logit.reshape(-1))
+            residue_probability = torch.sigmoid(output.residue_logits)
+            distance = distance_map_from_logits(output.pair_logits, centers)
             _, n_contacts = pair_bind_scores(
-                logits,
-                pair_mask,
+                output.pair_logits,
+                output.pair_mask,
                 p1_length=residue_batch["p1_length"],
                 p2_length=residue_batch["p2_length"],
                 contact_bins=contact_bins,
@@ -346,6 +374,19 @@ def evaluate_ppi(
                 if "index" in meta:
                     row["_index"] = meta["index"]
                 rows.append(row)
+                if map_dir is not None:
+                    p1_length = int(residue_batch["p1_length"][index].item())
+                    p2_length = int(residue_batch["p2_length"][index].item())
+                    length = p1_length + p2_length
+                    residue_mask = residue_batch["mask"][index, :length].to(dtype=torch.bool)
+                    pair_valid = output.pair_mask[index, :length, :length].to(dtype=torch.bool)
+                    write_pair_maps(
+                        map_dir,
+                        meta["pair"],
+                        residue_probability[index, :length].masked_fill(~residue_mask, float("nan")),
+                        distance[index, :length, :length].masked_fill(~pair_valid, float("nan")),
+                        p1_length,
+                    )
             print(p_bind)
 
     return rows, metrics_from_prediction_rows(rows, positive_weight=positive_weight)
@@ -368,6 +409,7 @@ def main(args: DictConfig):
         args.logging_dir,
         f"{str(args.task_prefix).upper()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
     )
+    logging_dir = DIST_WRAPPER.all_gather_object(logging_dir)[0]
     if DIST_WRAPPER.rank == 0:
         os.makedirs(args.logging_dir, exist_ok=True)
         os.makedirs(logging_dir, exist_ok=True)
@@ -414,6 +456,14 @@ def main(args: DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
     model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
+    for unused_key in ("dim_triangle_hidden", "n_pair_heads"):
+        model_kwargs.pop(unused_key, None)
+    model_kwargs["contact_bins"] = contact_bin_count(
+        float(args.data.contact_threshold),
+        float(args.data.distance_bin_start),
+        float(args.data.distance_bin_end),
+        int(args.data.distance_bin_count),
+    )
     model_kwargs["checkpoint_pair_blocks"] = bool(
         _cfg_get(args, "performance.checkpoint_pair_blocks", default=False)
     )
@@ -433,10 +483,10 @@ def main(args: DictConfig):
         distance_bin_start=float(args.data.distance_bin_start),
         distance_bin_end=float(args.data.distance_bin_end),
         distance_bin_count=int(args.data.distance_bin_count),
-        recycle_rounds=int(args.recycle_rounds),
         ppi_score_threshold=float(args.data.ppi_score_threshold),
         positive_weight=positive_weight,
         chunk_size=chunk_size,
+        map_dir=os.path.join(logging_dir, "maps"),
     )
     rows = gather_rank_prediction_rows(rows)
 
@@ -456,6 +506,7 @@ def main(args: DictConfig):
         )
         print(f"Wrote {predictions_path}")
         print(f"Wrote {metrics_path}")
+        print(f"Wrote residue probabilities and distance maps to {os.path.join(logging_dir, 'maps')}")
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

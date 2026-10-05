@@ -31,48 +31,48 @@ def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (loss * mask_float).sum() / mask_float.sum().clamp_min(1.0)
 
 
-def downsample_inter_negatives(
-    inter_mask: torch.Tensor,
-    target_bins: torch.Tensor,
-    contact_bins: int,
-    neg_per_pos: float = 4.0,
-) -> torch.Tensor:
-    """Keep all inter contacts and ~neg_per_pos random inter non-contacts per contact."""
-    if float(neg_per_pos) <= 0.0:
-        return inter_mask.to(dtype=torch.bool)
+# def downsample_inter_negatives(
+#     inter_mask: torch.Tensor,
+#     target_bins: torch.Tensor,
+#     contact_bins: int,
+#     neg_per_pos: float = 4.0,
+# ) -> torch.Tensor:
+#     """Keep all inter contacts and ~neg_per_pos random inter non-contacts per contact."""
+#     if float(neg_per_pos) <= 0.0:
+#         return inter_mask.to(dtype=torch.bool)
 
-    inter_mask = inter_mask.to(dtype=torch.bool)
-    is_contact = target_bins.long() < int(contact_bins)
-    keep = inter_mask & is_contact
-    neg = inter_mask & ~is_contact
-    squeezed = False
-    if keep.ndim == 2:
-        keep = keep.unsqueeze(0)
-        neg = neg.unsqueeze(0)
-        squeezed = True
+#     inter_mask = inter_mask.to(dtype=torch.bool)
+#     is_contact = target_bins.long() < int(contact_bins)
+#     keep = inter_mask & is_contact
+#     neg = inter_mask & ~is_contact
+#     squeezed = False
+#     if keep.ndim == 2:
+#         keep = keep.unsqueeze(0)
+#         neg = neg.unsqueeze(0)
+#         squeezed = True
 
-    out = keep.clone()
-    ratio = float(neg_per_pos)
-    for batch_index in range(keep.shape[0]):
-        n_pos = int(keep[batch_index].sum().item())
-        neg_flat = torch.nonzero(neg[batch_index].reshape(-1), as_tuple=False).flatten()
-        n_neg = int(neg_flat.numel())
-        if n_neg == 0:
-            continue
-        n_keep_neg = (
-            min(n_neg, max(1, int(round(n_pos * ratio))))
-            if n_pos > 0
-            else min(n_neg, max(1, int(round(ratio))))
-        )
-        order = torch.randperm(n_neg, device=neg_flat.device)[:n_keep_neg]
-        selected = neg_flat[order]
-        flat = out[batch_index].reshape(-1)
-        flat[selected] = True
-        out[batch_index] = flat.view_as(out[batch_index])
+#     out = keep.clone()
+#     ratio = float(neg_per_pos)
+#     for batch_index in range(keep.shape[0]):
+#         n_pos = int(keep[batch_index].sum().item())
+#         neg_flat = torch.nonzero(neg[batch_index].reshape(-1), as_tuple=False).flatten()
+#         n_neg = int(neg_flat.numel())
+#         if n_neg == 0:
+#             continue
+#         n_keep_neg = (
+#             min(n_neg, max(1, int(round(n_pos * ratio))))
+#             if n_pos > 0
+#             else min(n_neg, max(1, int(round(ratio))))
+#         )
+#         order = torch.randperm(n_neg, device=neg_flat.device)[:n_keep_neg]
+#         selected = neg_flat[order]
+#         flat = out[batch_index].reshape(-1)
+#         flat[selected] = True
+#         out[batch_index] = flat.view_as(out[batch_index])
 
-    if squeezed:
-        return out.squeeze(0)
-    return out
+#     if squeezed:
+#         return out.squeeze(0)
+#     return out
 
 
 def _validate_pair_shapes(
@@ -193,6 +193,45 @@ class DistogramMAELoss(nn.Module):
         )
 
 
+class TverskyLoss(nn.Module):
+    """Soft Tversky loss on P(d < threshold) versus contact-bin labels."""
+
+    def __init__(
+        self,
+        contact_bins: int,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        smooth: float = 1.0,
+    ):
+        super().__init__()
+        if int(contact_bins) <= 0:
+            raise ValueError("contact_bins must be positive.")
+        self.contact_bins = int(contact_bins)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_bins: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # _validate_pair_shapes(logits, target_bins, mask)
+        if logits.shape[-1] < self.contact_bins:
+            raise ValueError(
+                f"contact_bins {self.contact_bins} exceeds logit classes {logits.shape[-1]}."
+            )
+        mask_float = mask.to(dtype=logits.dtype)
+        p_contact = torch.softmax(logits, dim=-1)[..., : self.contact_bins].sum(dim=-1)
+        y_contact = (target_bins.long() < self.contact_bins).to(dtype=logits.dtype)
+        tp = (p_contact * y_contact * mask_float).sum()
+        fp = (p_contact * (1.0 - y_contact) * mask_float).sum()
+        fn = ((1.0 - p_contact) * y_contact * mask_float).sum()
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        return 1.0 - tversky
+
+
 def residue_bind_targets(
     target_bins: torch.Tensor,
     inter_mask: torch.Tensor,
@@ -266,13 +305,9 @@ class ResidueBindLoss(nn.Module):
         is_positive: torch.Tensor,
         contact_bins: int,
     ) -> torch.Tensor:
-        logits = residue_logits.squeeze(-1)
+        logits = residue_logits.reshape(target_bins.shape[0], -1)
         target = residue_bind_targets(target_bins, inter_mask, contact_bins)
-        loss_mask = downsample_residue_negatives(
-            residue_mask,
-            target,
-            neg_per_pos=self.neg_per_pos,
-        )
+
         loss = F.binary_cross_entropy_with_logits(
             logits,
             target.to(dtype=logits.dtype),
@@ -284,43 +319,71 @@ class ResidueBindLoss(nn.Module):
             loss.new_tensor(self.negative_pair_weight),
         )
         loss = loss * pair_weight[:, None]
-        return _masked_mean(loss, loss_mask)
+        return _masked_mean(loss, residue_mask)
 
 
-class TverskyLoss(nn.Module):
-    """Soft Tversky loss on P(d < threshold) versus contact-bin labels."""
 
-    def __init__(
+def inter_chain_contact_probability(
+    pair_logits: torch.Tensor,
+    contact_bins: int,
+) -> torch.Tensor:
+    return torch.softmax(pair_logits, dim=-1)[..., : int(contact_bins)].sum(dim=-1)
+
+
+def noisy_or_over_partners(
+    contact_probability: torch.Tensor,
+    inter_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Per-residue probability that any inter-chain partner is in contact."""
+    probability = contact_probability.clamp(0.0, 1.0 - 1e-4)
+    log_keep = torch.where(
+        inter_mask.to(dtype=torch.bool),
+        torch.log1p(-probability),
+        torch.zeros_like(probability),
+    )
+    return (1.0 - torch.exp(log_keep.sum(dim=-1))).clamp(0.0, 1.0)
+
+
+class ProteinBindLoss(nn.Module):
+    """BCE on the complex-level interaction logit."""
+
+    def forward(
         self,
-        contact_bins: int,
-        alpha: float = 0.7,
-        beta: float = 0.3,
-        smooth: float = 1.0,
-    ):
+        protein_logit: torch.Tensor,
+        is_positive: torch.Tensor,
+    ) -> torch.Tensor:
+        target = is_positive.reshape(-1).to(dtype=protein_logit.dtype)
+        return F.binary_cross_entropy_with_logits(protein_logit.reshape(-1), target)
+
+
+class ConsistencyLoss(nn.Module):
+    """Residue head tracks the distogram, and a visible contact lifts the protein score."""
+
+    def __init__(self, contact_bins: int):
         super().__init__()
         if int(contact_bins) <= 0:
             raise ValueError("contact_bins must be positive.")
         self.contact_bins = int(contact_bins)
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.smooth = float(smooth)
 
     def forward(
         self,
-        logits: torch.Tensor,
-        target_bins: torch.Tensor,
-        mask: torch.Tensor,
+        residue_logits: torch.Tensor,
+        protein_logit: torch.Tensor,
+        pair_logits: torch.Tensor,
+        inter_mask: torch.Tensor,
+        residue_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # _validate_pair_shapes(logits, target_bins, mask)
-        if logits.shape[-1] < self.contact_bins:
-            raise ValueError(
-                f"contact_bins {self.contact_bins} exceeds logit classes {logits.shape[-1]}."
-            )
-        mask_float = mask.to(dtype=logits.dtype)
-        p_contact = torch.softmax(logits, dim=-1)[..., : self.contact_bins].sum(dim=-1)
-        y_contact = (target_bins.long() < self.contact_bins).to(dtype=logits.dtype)
-        tp = (p_contact * y_contact * mask_float).sum()
-        fp = (p_contact * (1.0 - y_contact) * mask_float).sum()
-        fn = ((1.0 - p_contact) * y_contact * mask_float).sum()
-        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
-        return 1.0 - tversky
+        contact_probability = inter_chain_contact_probability(pair_logits, self.contact_bins)
+        residue_target = noisy_or_over_partners(contact_probability, inter_mask).detach()
+        residue_loss = F.binary_cross_entropy_with_logits(
+            residue_logits.reshape(residue_target.shape),
+            residue_target,
+            reduction="none",
+        )
+        residue_loss = _masked_mean(residue_loss, residue_mask)
+
+        inter_contact = contact_probability.masked_fill(~inter_mask.to(dtype=torch.bool), 0.0)
+        max_contact = inter_contact.amax(dim=(-2, -1)).detach()
+        protein_probability = torch.sigmoid(protein_logit.reshape(-1))
+        hinge = torch.relu(max_contact - protein_probability).mean()
+        return residue_loss + hinge
