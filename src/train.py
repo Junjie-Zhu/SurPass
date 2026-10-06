@@ -28,8 +28,8 @@ from src.model.loss import (
     ProteinBindLoss,
     ResidueBindLoss,
     TverskyLoss,
+    distogram_supervision,
     downsample_inter_negatives,
-    inter_chain_contact_probability,
     residue_bind_targets,
 )
 from src.model.optimizer import get_lr_scheduler, get_optimizer
@@ -173,14 +173,18 @@ def _compute_pair_losses(
     target_bins: torch.Tensor,
     intra_mask: torch.Tensor,
     inter_mask: torch.Tensor,
+    is_contact: torch.Tensor,
+    pair_probs: torch.Tensor,
+    contact_probability: torch.Tensor,
+    residue_target: torch.Tensor,
     residue_mask: torch.Tensor | None = None,
     residue_inter_mask: torch.Tensor | None = None,
     is_positive: torch.Tensor | None = None,
-    contact_bins: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     logits = output.pair_logits
     raw_loss = logits.new_zeros(())
     terms: dict[str, torch.Tensor] = {}
+    full_inter_mask = residue_inter_mask if residue_inter_mask is not None else inter_mask
     for name, loss_term in loss_fn.items():
         if name in {"residue", "protein", "consistency"}:
             continue
@@ -188,16 +192,27 @@ def _compute_pair_losses(
         if term_weight <= 0.0:
             continue
         if name == "tversky":
-            value = loss_term(logits, target_bins, inter_mask)
-            terms[name] = value.detach()
-            raw_loss = raw_loss + term_weight * value
-            continue
-        intra_loss, inter_loss = loss_term(logits, target_bins, intra_mask, inter_mask)
-        weighted = (
-            float(loss_weights["intra"]) * intra_loss + float(loss_weights["inter"]) * inter_loss
-        )
-        terms[name] = weighted.detach()
-        raw_loss = raw_loss + term_weight * weighted
+            value = loss_term(contact_probability, is_contact, inter_mask)
+        elif name == "focal":
+            intra_loss, inter_loss = loss_term(
+                logits, target_bins, intra_mask, inter_mask, is_contact
+            )
+            value = (
+                float(loss_weights["intra"]) * intra_loss
+                + float(loss_weights["inter"]) * inter_loss
+            )
+        elif name == "mae":
+            intra_loss, inter_loss = loss_term(
+                pair_probs, target_bins, intra_mask, inter_mask
+            )
+            value = (
+                float(loss_weights["intra"]) * intra_loss
+                + float(loss_weights["inter"]) * inter_loss
+            )
+        else:
+            raise KeyError(f"Unknown pair loss {name}.")
+        terms[name] = value.detach()
+        raw_loss = raw_loss + term_weight * value
 
     residue_weight = float(loss_weights.get("residue", 0.0))
     if (
@@ -205,15 +220,12 @@ def _compute_pair_losses(
         and "residue" in loss_fn
         and residue_mask is not None
         and is_positive is not None
-        and contact_bins is not None
     ):
         residue_loss = loss_fn["residue"](
             output.residue_logits,
-            target_bins,
-            residue_inter_mask if residue_inter_mask is not None else inter_mask,
+            residue_target,
             residue_mask,
             is_positive,
-            int(contact_bins),
         )
         terms["residue"] = residue_loss.detach()
         raw_loss = raw_loss + residue_weight * residue_loss
@@ -233,8 +245,8 @@ def _compute_pair_losses(
         consistency_loss = loss_fn["consistency"](
             output.residue_logits,
             output.protein_logit,
-            logits,
-            residue_inter_mask if residue_inter_mask is not None else inter_mask,
+            contact_probability,
+            full_inter_mask,
             residue_mask,
         )
         terms["consistency"] = consistency_loss.detach()
@@ -466,12 +478,16 @@ def train_epoch(
             p1_length=residue_batch["p1_length"],
             p2_length=residue_batch["p2_length"],
         )
+        is_contact, pair_probs, contact_probability = distogram_supervision(
+            output.pair_logits,
+            labels["label_2d_bins"],
+            int(contact_bins),
+        )
         pair_inter_mask = inter_mask
-        if contact_bins is not None and float(inter_neg_per_pos) > 0.0:
+        if float(inter_neg_per_pos) > 0.0:
             pair_inter_mask = downsample_inter_negatives(
                 inter_mask,
-                labels["label_2d_bins"],
-                contact_bins=int(contact_bins),
+                is_contact,
                 neg_per_pos=float(inter_neg_per_pos),
             )
         raw_loss, terms = _compute_pair_losses(
@@ -481,10 +497,13 @@ def train_epoch(
             labels["label_2d_bins"],
             intra_mask,
             pair_inter_mask,
+            is_contact,
+            pair_probs,
+            contact_probability,
+            residue_bind_targets(is_contact, inter_mask),
             residue_mask=residue_batch["mask"],
             residue_inter_mask=inter_mask,
             is_positive=labels["is_positive"],
-            contact_bins=contact_bins,
         )
 
         loss = raw_loss / grad_accum_steps
@@ -551,10 +570,7 @@ def evaluate_epoch(
     loss_fn: Dict[str, torch.nn.Module],
     loss_weights: Dict[str, float],
     device: torch.device,
-    contact_threshold: float,
-    distance_bin_start: float,
-    distance_bin_end: float,
-    distance_bin_count: int = 64,
+    contact_bins: int,
     max_batches: int | None = None,
     positive_weight: float = 1.0,
     chunk_size: int | None = None,
@@ -568,12 +584,6 @@ def evaluate_epoch(
     residue_target_rows = []
     protein_score_rows = []
     protein_target_rows = []
-    n_contact_bins = contact_bin_count(
-        contact_threshold,
-        distance_bin_start,
-        distance_bin_end,
-        distance_bin_count,
-    )
 
     with torch.no_grad():
         for step, step_batch in enumerate(loader):
@@ -587,6 +597,12 @@ def evaluate_epoch(
                 p1_length=residue_batch["p1_length"],
                 p2_length=residue_batch["p2_length"],
             )
+            is_contact, pair_probs, contact_probability = distogram_supervision(
+                output.pair_logits,
+                labels["label_2d_bins"],
+                int(contact_bins),
+            )
+            residue_target = residue_bind_targets(is_contact, inter_mask)
             _, terms = _compute_pair_losses(
                 loss_fn,
                 loss_weights,
@@ -594,23 +610,19 @@ def evaluate_epoch(
                 labels["label_2d_bins"],
                 intra_mask,
                 inter_mask,
+                is_contact,
+                pair_probs,
+                contact_probability,
+                residue_target,
                 residue_mask=residue_batch["mask"],
                 residue_inter_mask=inter_mask,
                 is_positive=labels["is_positive"],
-                contact_bins=n_contact_bins,
             )
 
-            probs = inter_chain_contact_probability(output.pair_logits, n_contact_bins)
-            contacts = labels["label_2d_bins"] < n_contact_bins
-            inter_score_rows.append(probs[inter_mask].detach().cpu())
-            inter_target_rows.append(contacts[inter_mask].detach().cpu())
+            inter_score_rows.append(contact_probability[inter_mask].detach().cpu())
+            inter_target_rows.append(is_contact[inter_mask].detach().cpu())
 
             residue_mask = residue_batch["mask"].to(dtype=torch.bool)
-            residue_target = residue_bind_targets(
-                labels["label_2d_bins"],
-                inter_mask,
-                n_contact_bins,
-            )
             residue_prob = torch.sigmoid(output.residue_logits).reshape(residue_mask.shape)
             residue_score_rows.append(residue_prob[residue_mask].detach().cpu())
             residue_target_rows.append(residue_target[residue_mask].detach().cpu())
@@ -922,10 +934,7 @@ def main(args: DictConfig):
             loss_fn=loss_fn,
             loss_weights=loss_weights,
             device=device,
-            contact_threshold=args.data.contact_threshold,
-            distance_bin_start=args.data.distance_bin_start,
-            distance_bin_end=args.data.distance_bin_end,
-            distance_bin_count=args.data.distance_bin_count,
+            contact_bins=n_contact_bins,
             positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
             chunk_size=chunk_size,
         )

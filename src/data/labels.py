@@ -108,14 +108,29 @@ def build_negative_pair_labels(
     return label_bins, label_mask
 
 
+def inter_chain_contact_mask(
+    pairwise_dist: torch.Tensor,
+    pairwise_mask: torch.Tensor,
+    p1_length: int,
+    contact_threshold: float,
+) -> torch.Tensor:
+    """Inter-chain pairs closer than the contact cutoff. Shape [n1, n2]."""
+    p1_length = int(p1_length)
+    cross_dist = pairwise_dist[:p1_length, p1_length:]
+    cross_mask = pairwise_mask[:p1_length, p1_length:]
+    return (cross_dist < float(contact_threshold)) & cross_mask.to(dtype=torch.bool)
+
+
 def has_inter_chain_contact(
     pairwise_dist: torch.Tensor,
     pairwise_mask: torch.Tensor,
     p1_length: int,
     contact_threshold: float,
 ) -> bool:
-    p1_length = int(p1_length)
-    cross_dist = pairwise_dist[:p1_length, p1_length:]
-    cross_mask = pairwise_mask[:p1_length, p1_length:]
-    contact = (cross_dist < float(contact_threshold)) & cross_mask.to(dtype=torch.bool)
+    contact = inter_chain_contact_mask(
+        pairwise_dist,
+        pairwise_mask,
+        p1_length,
+        contact_threshold,
+    )
     return bool(contact.any().item())

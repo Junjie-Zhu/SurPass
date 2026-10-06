@@ -75,6 +75,23 @@ def _masked_mean(loss: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 #     return out
 
 
+def distogram_supervision(
+    logits: torch.Tensor,
+    target_bins: torch.Tensor,
+    contact_bins: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One contact label and one softmax, shared by every pair loss and metric."""
+    contact_bins = int(contact_bins)
+    if logits.shape[-1] < contact_bins:
+        raise ValueError(
+            f"contact_bins {contact_bins} exceeds logit classes {logits.shape[-1]}."
+        )
+    is_contact = target_bins.long() < contact_bins
+    pair_probs = torch.softmax(logits, dim=-1)
+    contact_probability = inter_chain_contact_probability(pair_probs, contact_bins)
+    return is_contact, pair_probs, contact_probability
+
+
 def _validate_pair_shapes(
     logits: torch.Tensor,
     target_bins: torch.Tensor,
@@ -133,6 +150,7 @@ class FocalCELoss(nn.Module):
         target_bins: torch.Tensor,
         intra_mask: torch.Tensor,
         inter_mask: torch.Tensor,
+        is_contact: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # _validate_pair_shapes(logits, target_bins, intra_mask, inter_mask)
         target = target_bins.long()
@@ -144,9 +162,8 @@ class FocalCELoss(nn.Module):
 
         p_t = torch.exp(-ce_loss)
         focal = ((1.0 - p_t).clamp(min=0.0) ** self.gamma) * ce_loss
-        is_contact = target < self.contact_bins
         pos_weight = torch.where(
-            is_contact,
+            is_contact.to(dtype=torch.bool),
             focal.new_tensor(self.alpha),
             focal.new_tensor(1.0),
         )
@@ -171,20 +188,19 @@ class DistogramMAELoss(nn.Module):
 
     def forward(
         self,
-        logits: torch.Tensor,
+        pair_probs: torch.Tensor,
         target_bins: torch.Tensor,
         intra_mask: torch.Tensor,
         inter_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # _validate_pair_shapes(logits, target_bins, intra_mask, inter_mask)
-        centers = self.bin_centers.to(device=logits.device, dtype=logits.dtype)
-        if logits.shape[-1] != int(centers.shape[0]):
+        # _validate_pair_shapes(pair_probs, target_bins, intra_mask, inter_mask)
+        centers = self.bin_centers.to(device=pair_probs.device, dtype=pair_probs.dtype)
+        if pair_probs.shape[-1] != int(centers.shape[0]):
             raise ValueError(
-                f"Logit class count {logits.shape[-1]} does not match "
+                f"Logit class count {pair_probs.shape[-1]} does not match "
                 f"bin_centers {int(centers.shape[0])}."
             )
-        probs = torch.softmax(logits, dim=-1)
-        pred_dist = (probs * centers).sum(dim=-1)
+        pred_dist = (pair_probs * centers).sum(dim=-1)
         target_dist = centers[target_bins.long().clamp(0, centers.shape[0] - 1)]
         loss = F.l1_loss(pred_dist, target_dist, reduction="none")
         return (
@@ -213,18 +229,13 @@ class TverskyLoss(nn.Module):
 
     def forward(
         self,
-        logits: torch.Tensor,
-        target_bins: torch.Tensor,
+        contact_probability: torch.Tensor,
+        is_contact: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        # _validate_pair_shapes(logits, target_bins, mask)
-        if logits.shape[-1] < self.contact_bins:
-            raise ValueError(
-                f"contact_bins {self.contact_bins} exceeds logit classes {logits.shape[-1]}."
-            )
-        mask_float = mask.to(dtype=logits.dtype)
-        p_contact = torch.softmax(logits, dim=-1)[..., : self.contact_bins].sum(dim=-1)
-        y_contact = (target_bins.long() < self.contact_bins).to(dtype=logits.dtype)
+        mask_float = mask.to(dtype=contact_probability.dtype)
+        p_contact = contact_probability
+        y_contact = is_contact.to(dtype=contact_probability.dtype)
         tp = (p_contact * y_contact * mask_float).sum()
         fp = (p_contact * (1.0 - y_contact) * mask_float).sum()
         fn = ((1.0 - p_contact) * y_contact * mask_float).sum()
@@ -233,12 +244,11 @@ class TverskyLoss(nn.Module):
 
 
 def residue_bind_targets(
-    target_bins: torch.Tensor,
+    is_contact: torch.Tensor,
     inter_mask: torch.Tensor,
-    contact_bins: int,
 ) -> torch.Tensor:
     """Residue is positive if it has any inter-chain contact."""
-    inter_contact = (target_bins.long() < int(contact_bins)) & inter_mask.to(dtype=torch.bool)
+    inter_contact = is_contact.to(dtype=torch.bool) & inter_mask.to(dtype=torch.bool)
     return inter_contact.any(dim=-1)
 
 
@@ -299,14 +309,12 @@ class ResidueBindLoss(nn.Module):
     def forward(
         self,
         residue_logits: torch.Tensor,
-        target_bins: torch.Tensor,
-        inter_mask: torch.Tensor,
+        residue_target: torch.Tensor,
         residue_mask: torch.Tensor,
         is_positive: torch.Tensor,
-        contact_bins: int,
     ) -> torch.Tensor:
-        logits = residue_logits.reshape(target_bins.shape[0], -1)
-        target = residue_bind_targets(target_bins, inter_mask, contact_bins)
+        logits = residue_logits.reshape(residue_target.shape)
+        target = residue_target
 
         loss = F.binary_cross_entropy_with_logits(
             logits,
@@ -324,10 +332,10 @@ class ResidueBindLoss(nn.Module):
 
 
 def inter_chain_contact_probability(
-    pair_logits: torch.Tensor,
+    pair_probs: torch.Tensor,
     contact_bins: int,
 ) -> torch.Tensor:
-    return torch.softmax(pair_logits, dim=-1)[..., : int(contact_bins)].sum(dim=-1)
+    return pair_probs[..., : int(contact_bins)].sum(dim=-1)
 
 
 def noisy_or_over_partners(
@@ -369,11 +377,10 @@ class ConsistencyLoss(nn.Module):
         self,
         residue_logits: torch.Tensor,
         protein_logit: torch.Tensor,
-        pair_logits: torch.Tensor,
+        contact_probability: torch.Tensor,
         inter_mask: torch.Tensor,
         residue_mask: torch.Tensor,
     ) -> torch.Tensor:
-        contact_probability = inter_chain_contact_probability(pair_logits, self.contact_bins)
         residue_target = noisy_or_over_partners(contact_probability, inter_mask).detach()
         residue_loss = F.binary_cross_entropy_with_logits(
             residue_logits.reshape(residue_target.shape),

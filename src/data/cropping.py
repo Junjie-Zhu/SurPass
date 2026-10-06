@@ -2,7 +2,7 @@ import random
 
 import torch
 
-from src.data.labels import has_inter_chain_contact
+from src.data.labels import inter_chain_contact_mask
 
 DEFAULT_CROP_SIZE = 256
 DEFAULT_CROP_NEIGHBORHOOD_SIZE = 10
@@ -95,20 +95,15 @@ def _gather_neighbor_indices(
 
 
 def select_interface_crop_indices(
-    pairwise_dist: torch.Tensor,
-    pairwise_mask: torch.Tensor,
+    contacts: torch.Tensor,
+    n1: int,
+    n2: int,
     crop_size: int,
-    contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
     neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    n1, n2 = int(pairwise_dist.shape[0]), int(pairwise_dist.shape[1])
-    contact_mask = (pairwise_dist < float(contact_threshold)) & pairwise_mask.to(dtype=torch.bool)
-    if not bool(contact_mask.any().item()):
-        return None
+) -> tuple[torch.Tensor, torch.Tensor]:
     if n1 <= crop_size and n2 <= crop_size:
         return torch.arange(n1, dtype=torch.long), torch.arange(n2, dtype=torch.long)
 
-    contacts = torch.nonzero(contact_mask, as_tuple=False)
     order = list(range(int(contacts.shape[0])))
     random.shuffle(order)
 
@@ -128,17 +123,12 @@ def select_interface_crop_indices(
 
 
 def select_contact_centered_crop_indices(
-    pairwise_dist: torch.Tensor,
-    pairwise_mask: torch.Tensor,
+    contacts: torch.Tensor,
+    n1: int,
+    n2: int,
     crop_size: int,
-    contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    contact_mask = (pairwise_dist < float(contact_threshold)) & pairwise_mask.to(dtype=torch.bool)
-    if not bool(contact_mask.any().item()):
-        return None
-    contacts = torch.nonzero(contact_mask, as_tuple=False)
+) -> tuple[torch.Tensor, torch.Tensor]:
     choice = contacts[random.randrange(int(contacts.shape[0]))]
-    n1, n2 = int(pairwise_dist.shape[0]), int(pairwise_dist.shape[1])
     return (
         select_centered_contiguous_crop_indices(n1, crop_size, int(choice[0])),
         select_centered_contiguous_crop_indices(n2, crop_size, int(choice[1])),
@@ -185,34 +175,37 @@ def crop_positive_pair(
     contact_threshold: float,
 ) -> tuple[dict, dict, torch.Tensor, torch.Tensor] | None:
     p1_length = int(p1_features["mask"].shape[0])
-    if not has_inter_chain_contact(pairwise_dist, pairwise_mask, p1_length, contact_threshold):
+    contact_mask = inter_chain_contact_mask(
+        pairwise_dist,
+        pairwise_mask,
+        p1_length,
+        contact_threshold,
+    )
+    contacts = torch.nonzero(contact_mask, as_tuple=False)
+    if int(contacts.shape[0]) == 0:
         return None
     if crop_size is None:
         return p1_features, p2_features, pairwise_dist, pairwise_mask
 
-    cross_dist = pairwise_dist[:p1_length, p1_length:]
-    cross_mask = pairwise_mask[:p1_length, p1_length:]
+    n1, n2 = int(contact_mask.shape[0]), int(contact_mask.shape[1])
     probability = float(crop_contiguous_probability)
     use_contiguous = probability >= 1.0 or (probability > 0.0 and random.random() < probability)
     if use_contiguous:
-        selected = select_contact_centered_crop_indices(
-            cross_dist,
-            cross_mask,
-            crop_size=crop_size,
-            contact_threshold=contact_threshold,
+        p1_idx, p2_idx = select_contact_centered_crop_indices(
+            contacts,
+            n1,
+            n2,
+            crop_size,
         )
     else:
-        selected = select_interface_crop_indices(
-            cross_dist,
-            cross_mask,
-            crop_size=crop_size,
-            contact_threshold=contact_threshold,
+        p1_idx, p2_idx = select_interface_crop_indices(
+            contacts,
+            n1,
+            n2,
+            crop_size,
             neighborhood_size=crop_neighborhood_size,
         )
-    if selected is None:
-        return None
-    p1_idx, p2_idx = selected
-    cropped = _slice_pair_maps(
+    return _slice_pair_maps(
         p1_features,
         p2_features,
         pairwise_dist,
@@ -221,10 +214,6 @@ def crop_positive_pair(
         p2_idx,
         p1_length,
     )
-    cropped_p1_length = int(cropped[0]["mask"].shape[0])
-    if not has_inter_chain_contact(cropped[2], cropped[3], cropped_p1_length, contact_threshold):
-        return None
-    return cropped
 
 
 def crop_negative_pair(
