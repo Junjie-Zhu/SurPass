@@ -234,11 +234,11 @@ class ResOnly(nn.Module):
         ) * pair_mask_float[..., None]
         pair_repr = pair_repr + self.triangle_multiplication_outgoing[layer_index](
             pair_repr,
-            mask,
+            pair_mask_float,
         ) * pair_mask_float[..., None]
         pair_repr = pair_repr + self.triangle_multiplication_incoming[layer_index](
             pair_repr,
-            mask,
+            pair_mask_float,
         ) * pair_mask_float[..., None]
         pair_repr = pair_repr + self.pair_blocks[layer_index](
             pair_repr,

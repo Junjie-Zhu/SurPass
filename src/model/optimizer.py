@@ -93,13 +93,12 @@ class CosineAnnealingWithWarmup(LRScheduler):
         lr: float,
         min_lr: float,
         last_epoch: int = -1,
-        verbose: bool = False,
     ):
         self.warmup_steps = warmup_steps
         self.decay_steps = decay_steps
         self.lr = lr
         self.min_lr = min_lr
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def _get_step_lr(self, step):
         if step <= self.warmup_steps:
@@ -135,7 +134,6 @@ class AlphaFold3LRScheduler(LRScheduler):
         self,
         optimizer: torch.optim.Optimizer,
         last_epoch: int = -1,
-        verbose: bool = False,
         warmup_steps: int = 1000,
         lr: float = 1.8e-3,
         decay_every_n_steps: int = 50000,
@@ -146,7 +144,7 @@ class AlphaFold3LRScheduler(LRScheduler):
         self.lr = lr
         self.decay_factor = decay_factor
         super(AlphaFold3LRScheduler, self).__init__(
-            optimizer=optimizer, last_epoch=last_epoch, verbose=verbose
+            optimizer=optimizer, last_epoch=last_epoch
         )
 
     def _get_step_lr(self, step):

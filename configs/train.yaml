@@ -33,7 +33,7 @@ data:
       assemble_negatives: false
       is_positive: false
       weight: 25
-  batch_size: 8
+  batch_size: 2
   num_workers: 16
   pin_memory: true
   test_fraction: 0.15
@@ -99,7 +99,7 @@ optimizer:
   warmup_steps: 500
   decay_every_n_steps: 15000
   decay_factor: 0.95
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   max_grad_norm: 1.0
 
 metrics:
@@ -122,6 +122,6 @@ hydra:
   output_subdir: null
   
 performance:
-  chunk_size: 64
+  chunk_size: null
   checkpoint_pair_blocks: false
 

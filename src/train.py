@@ -28,7 +28,6 @@ from src.model.loss import (
     ResidueBindLoss,
     TverskyLoss,
     distogram_supervision,
-    downsample_inter_negatives,
     residue_bind_targets,
 )
 from src.model.ema import EMAWrapper
@@ -519,12 +518,6 @@ def train_epoch(
             int(contact_bins),
         )
         pair_inter_mask = inter_mask
-        if float(inter_neg_per_pos) > 0.0:
-            pair_inter_mask = downsample_inter_negatives(
-                inter_mask,
-                is_contact,
-                neg_per_pos=float(inter_neg_per_pos),
-            )
         raw_loss, terms = _compute_pair_losses(
             loss_fn,
             loss_weights,
