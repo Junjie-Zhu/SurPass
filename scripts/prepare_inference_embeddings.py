@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.prepare_plm_embeddings import generate_embeddings_from_request
+from scripts.prepare_plm_embeddings import DEFAULT_MODEL, embed_sequences, load_esmc
 
 
 def parse_fasta(fasta_path: str | Path) -> list[tuple[str, str]]:
@@ -78,9 +78,8 @@ def extract_embeddings(
     fasta_path: str | Path,
     output_dir: str | Path,
     model: Any,
-    device: Any,
+    tokenizer: Any,
     skip_existing: bool = False,
-    batch_preparer: Any = None,
 ) -> dict[str, Any]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -101,14 +100,7 @@ def extract_embeddings(
             stats["skipped"] += 1
             continue
         try:
-            embedding = generate_embeddings_from_request(
-                request_payload={"chain_id": protein_id, "sequence": sequence},
-                model=model,
-                device=device,
-                msa_directory="",
-                embed_mode="single",
-                batch_preparer=batch_preparer,
-            )
+            embedding = embed_sequences(model, tokenizer, [sequence])[0]
             if int(embedding.shape[0]) != len(sequence):
                 raise ValueError(
                     f"embedding length {int(embedding.shape[0])} does not match "
@@ -134,7 +126,7 @@ def _resolve_device(device: str | None) -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract E1 embeddings from a FASTA file for SurPass inference."
+        description="Extract ESMC embeddings from a FASTA file for SurPass inference."
     )
     parser.add_argument("--fasta", required=True, help="Input FASTA file.")
     parser.add_argument("--root-dir", default="./pdb_metadata", help="Dataset root directory.")
@@ -160,22 +152,16 @@ def main(argv: Iterable[str] | None = None) -> None:
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     args = build_arg_parser().parse_args(argv)
 
-    from E1.batch_preparer import E1BatchPreparer
-    from E1.modeling import E1ForMaskedLM
-
     device = _resolve_device(args.device)
     output_dir = resolve_output_dir(args.root_dir, args.output_dir)
-    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-600m").to(device)
-    model.eval()
-    batch_preparer = E1BatchPreparer()
+    model, tokenizer = load_esmc(DEFAULT_MODEL, device)
 
     stats = extract_embeddings(
         fasta_path=args.fasta,
         output_dir=output_dir,
         model=model,
-        device=device,
+        tokenizer=tokenizer,
         skip_existing=args.skip_existing,
-        batch_preparer=batch_preparer,
     )
 
     print("\nEmbedding extraction summary")

@@ -17,9 +17,8 @@ try:
 except Exception:
     wandb = None
 
-from src.data.balancing import create_balanced_split_datasets
+from src.data.balancing import DistributedWeightedSampler, build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
-from src.data.dataset import PepoTrainDataset
 from src.data.labels import inter_chain_pair_mask
 from src.model.loss import (
     ConsistencyLoss,
@@ -32,6 +31,7 @@ from src.model.loss import (
     downsample_inter_negatives,
     residue_bind_targets,
 )
+from src.model.ema import EMAWrapper
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly, SurpassOutput
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
@@ -401,6 +401,40 @@ def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> d
     return model_kwargs
 
 
+def build_model_kwargs(cfg: DictConfig, *, checkpoint_default: bool = True) -> dict:
+    model_kwargs = _cfg_get(cfg, "model", default={})
+    if isinstance(model_kwargs, DictConfig):
+        model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
+    model_kwargs = dict(model_kwargs or {})
+    model_kwargs = _validate_model_bin_counts(model_kwargs, cfg.data.distance_bin_count)
+    model_kwargs.pop("n_pair_heads", None)
+    model_kwargs["contact_bins"] = contact_bin_count(
+        cfg.data.contact_threshold,
+        cfg.data.distance_bin_start,
+        cfg.data.distance_bin_end,
+        cfg.data.distance_bin_count,
+    )
+    model_kwargs["checkpoint_pair_blocks"] = bool(
+        _cfg_get(cfg, "performance.checkpoint_pair_blocks", default=checkpoint_default)
+    )
+    return model_kwargs
+
+
+def _live_model(model: torch.nn.Module) -> torch.nn.Module:
+    if DIST_WRAPPER.world_size > 1:
+        return model.module
+    return model
+
+
+def _ema_keywords(cfg: DictConfig) -> list:
+    keywords = _cfg_get(cfg, "ema.mutable_param_keywords", default=[""])
+    if keywords is None:
+        return [""]
+    if OmegaConf.is_config(keywords):
+        keywords = OmegaConf.to_container(keywords, resolve=True)
+    return list(keywords)
+
+
 def _unpack_batch(step_batch, device):
     residue_batch, labels = step_batch
     residue_batch = to_device(residue_batch, device)
@@ -459,6 +493,7 @@ def train_epoch(
     dump_dir: str | None = None,
     epoch: int = 0,
     chunk_size: int | None = None,
+    ema_wrapper: EMAWrapper | None = None,
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -516,6 +551,8 @@ def train_epoch(
             clip_limit = float(max_grad_norm) if float(max_grad_norm) > 0.0 else float("inf")
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
             optimizer.step()
+            if ema_wrapper is not None:
+                ema_wrapper.update()
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -709,41 +746,76 @@ def main(args: DictConfig):
             f"({getattr(wandb_run, 'id', None)})"
         )
 
-    full_dataset = PepoTrainDataset(
+    sources = _cfg_get(args, "data.datasets", default=None)
+    if sources is None:
+        raise ValueError("data.datasets must list at least one cluster source.")
+    sources = OmegaConf.to_container(sources, resolve=True)
+    train_dataset, test_dataset, train_weights, source_info = build_multi_source_split(
+        sources,
         root_dir=args.data.root_dir,
-        cluster_tsv_path=args.data.cluster_tsv_path,
-        center_coordinates=args.data.center_coordinates,
-        random_rotation=args.data.random_rotation,
-        distance_bin_start=args.data.distance_bin_start,
-        distance_bin_end=args.data.distance_bin_end,
-        distance_bin_count=args.data.distance_bin_count,
-        crop_size=args.data.crop_size,
-        crop_contiguous_probability=float(
-            _cfg_get(args, "data.crop_contiguous_prob", default=0.3)
-        ),
-        contact_threshold=args.data.contact_threshold,
-    )
-    train_dataset, test_dataset = create_balanced_split_datasets(
-        full_dataset,
         test_fraction=args.data.test_fraction,
         seed=args.seed,
         negative_ratio=int(_cfg_get(args, "data.negative_ratio", default=1)),
-        distance_bin_count=args.data.distance_bin_count,
+        dataset_kwargs={
+            "distance_bin_start": args.data.distance_bin_start,
+            "distance_bin_end": args.data.distance_bin_end,
+            "distance_bin_count": args.data.distance_bin_count,
+            "crop_size": args.data.crop_size,
+            "crop_contiguous_probability": float(
+                _cfg_get(args, "data.crop_contiguous_prob", default=0.3)
+            ),
+            "contact_threshold": args.data.contact_threshold,
+        },
     )
-    log_info(
-        f"Loaded {len(full_dataset)} clusters: {len(train_dataset)} train, {len(test_dataset)} test"
-    )
-
-    train_sampler = (
-        DistributedSampler(
-            train_dataset,
+    single_source = len(sources) == 1
+    if single_source:
+        train_sampler = (
+            DistributedSampler(
+                train_dataset,
+                num_replicas=DIST_WRAPPER.world_size,
+                rank=DIST_WRAPPER.rank,
+                shuffle=True,
+            )
+            if DIST_WRAPPER.world_size > 1
+            else None
+        )
+    else:
+        epoch_size = int(_cfg_get(args, "data.epoch_size", default=30000))
+        train_sampler = DistributedWeightedSampler(
+            train_weights,
+            num_samples=epoch_size,
             num_replicas=DIST_WRAPPER.world_size,
             rank=DIST_WRAPPER.rank,
-            shuffle=True,
+            seed=args.seed,
         )
-        if DIST_WRAPPER.world_size > 1
-        else None
-    )
+    for info in source_info:
+        if info["assemble_negatives"]:
+            kind = "on-the-fly negatives"
+        elif info["is_positive"]:
+            kind = "static positive"
+        else:
+            kind = "static negative"
+        if single_source:
+            log_info(
+                f"Source {info['name']}: train={info['train_length']} test={info['test_length']} "
+                f"({kind}); one shuffled pass per epoch"
+            )
+        else:
+            log_info(
+                f"Source {info['name']}: train={info['train_length']} test={info['test_length']} "
+                f"probability={info['probability']:.3f} ({kind})"
+            )
+    if single_source:
+        samples_per_rank = len(train_dataset) if train_sampler is None else len(train_sampler)
+        log_info(
+            f"One shuffled pass: {samples_per_rank} samples per rank "
+            f"across {DIST_WRAPPER.world_size} ranks"
+        )
+    else:
+        log_info(
+            f"Epoch size {epoch_size}: {len(train_sampler)} samples per rank "
+            f"across {DIST_WRAPPER.world_size} ranks"
+        )
     test_sampler = (
         DistributedSampler(
             test_dataset,
@@ -774,27 +846,21 @@ def main(args: DictConfig):
         pin_memory=args.data.pin_memory,
     )
 
-    model_kwargs = _cfg_get(args, "model", default={})
-    if isinstance(model_kwargs, DictConfig):
-        model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
-    model_kwargs = dict(model_kwargs or {})
-    model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
-    for unused_key in ("dim_triangle_hidden", "n_pair_heads"):
-        model_kwargs.pop(unused_key, None)
-    n_contact_bins = contact_bin_count(
-        args.data.contact_threshold,
-        args.data.distance_bin_start,
-        args.data.distance_bin_end,
-        args.data.distance_bin_count,
-    )
-    model_kwargs["contact_bins"] = n_contact_bins
-    model_kwargs["checkpoint_pair_blocks"] = bool(
-        _cfg_get(args, "performance.checkpoint_pair_blocks", default=True)
-    )
+    model_kwargs = build_model_kwargs(args, checkpoint_default=True)
+    n_contact_bins = int(model_kwargs["contact_bins"])
     chunk_size = resolve_chunk_size(args, default=64)
     model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = wrap_ddp(model, device)
+    ema_decay = float(_cfg_get(args, "ema.decay", default=0.0))
+    ema_wrapper = None
+    if ema_decay > 0:
+        ema_wrapper = EMAWrapper(
+            model=model,
+            decay=ema_decay,
+            mutable_param_keywords=_ema_keywords(args),
+        )
+        ema_wrapper.register()
     log_info(
         f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
     )
@@ -853,10 +919,16 @@ def main(args: DictConfig):
     )
 
     start_epoch = 1
+    ema_dir = _cfg_get(args, "ema_dir", default=None)
+    if ema_dir is not None and ema_wrapper is not None:
+        ema_checkpoint = torch.load(ema_dir, map_location=device)
+        _live_model(model).load_state_dict(ema_checkpoint["model_state_dict"])
+        ema_wrapper.register()
+        del ema_checkpoint
+
     if args.ckpt_dir is not None:
         checkpoint = torch.load(args.ckpt_dir, map_location=device)
-        target_model = model.module if DIST_WRAPPER.world_size > 1 else model
-        target_model.load_state_dict(checkpoint["model_state_dict"])
+        _live_model(model).load_state_dict(checkpoint["model_state_dict"])
         if not args.load_model_only:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -917,6 +989,7 @@ def main(args: DictConfig):
             dump_dir=logging_dir,
             epoch=crt_epoch,
             chunk_size=chunk_size,
+            ema_wrapper=ema_wrapper,
         )
 
         test_iter = test_loader
@@ -928,6 +1001,8 @@ def main(args: DictConfig):
                 leave=True,
                 position=1,
             )
+        if ema_wrapper is not None:
+            ema_wrapper.apply_shadow()
         test_metrics = evaluate_epoch(
             model=model,
             loader=test_iter,
@@ -938,6 +1013,8 @@ def main(args: DictConfig):
             positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
             chunk_size=chunk_size,
         )
+        if ema_wrapper is not None:
+            ema_wrapper.restore()
 
         if DIST_WRAPPER.rank == 0:
             if epoch_progress is not None:
@@ -989,16 +1066,23 @@ def main(args: DictConfig):
                 torch.save(
                     {
                         "epoch": crt_epoch,
-                        "model_state_dict": (
-                            model.module.state_dict()
-                            if DIST_WRAPPER.world_size > 1
-                            else model.state_dict()
-                        ),
+                        "model_state_dict": _live_model(model).state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                     },
                     checkpoint_path,
                 )
+                if ema_wrapper is not None:
+                    ema_wrapper.apply_shadow()
+                    ema_path = os.path.join(
+                        logging_dir,
+                        f"checkpoints/_ema_{ema_wrapper.decay}_{crt_epoch}.pth",
+                    )
+                    torch.save(
+                        {"model_state_dict": _live_model(model).state_dict()},
+                        ema_path,
+                    )
+                    ema_wrapper.restore()
 
     if wandb is not None and wandb.run is not None:
         wandb.finish()

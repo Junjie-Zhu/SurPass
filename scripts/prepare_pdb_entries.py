@@ -614,13 +614,37 @@ def _extract_pdb_features_from_model(
     return pdb_dict
 
 
+def _load_structure(pdb_path):
+    # biotite.structure.io.load_structure keys off the final suffix, so
+    # ".cif.gz" / ".bcif.gz" are rejected as an unknown ".gz" format.
+    path = Path(pdb_path)
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    if not suffixes or suffixes[-1] != ".gz":
+        return strucio.load_structure(os.fspath(path))
+
+    inner_suffix = suffixes[-2] if len(suffixes) > 1 else ""
+    if inner_suffix in {".cif", ".mmcif", ".pdbx"}:
+        from biotite.structure.io.pdbx import CIFFile, get_structure
+
+        with gzip.open(path, "rt") as handle:
+            pdbx_file = CIFFile.read(handle)
+        return get_structure(pdbx_file)
+    if inner_suffix == ".bcif":
+        from biotite.structure.io.pdbx import BinaryCIFFile, get_structure
+
+        with gzip.open(path, "rb") as handle:
+            pdbx_file = BinaryCIFFile.read(handle)
+        return get_structure(pdbx_file)
+    raise ValueError(f"Unsupported compressed structure format '{path.name}'")
+
+
 def extract_pdb_features(
     pdb_path: str,
     min_chain_length: int = 30,
     max_chain_length: int = 1024,
     process_all_model: bool = False,
 ):
-    structure = strucio.load_structure(pdb_path)
+    structure = _load_structure(pdb_path)
     try:
         struc_depth = structure.stack_depth()
     except AttributeError:
@@ -781,42 +805,167 @@ class PDBVerifier:
             # print(f"Error downloading {pdb_id}: {e}")
             return None
 
+    def _completed_pdb_ids_path(self) -> Path:
+        return self.root_dir / "verified_pdb_ids.txt"
+
+    def _read_completed_pdb_ids(self) -> set:
+        path = self._completed_pdb_ids_path()
+        if not path.is_file():
+            return set()
+        with open(path, encoding="utf-8") as handle:
+            return {line.strip() for line in handle if line.strip()}
+
+    def _write_completed_pdb_ids(self, pdb_ids: set) -> None:
+        path = self._completed_pdb_ids_path()
+        with open(path, "w", encoding="utf-8") as handle:
+            for pdb_id in sorted(pdb_ids):
+                handle.write(f"{pdb_id}\n")
+
+    def _verified_outputs_exist(self, pair_rows: pd.DataFrame) -> bool:
+        if pair_rows.empty or not {"chain1", "chain2", "label_path"}.issubset(pair_rows.columns):
+            return False
+        processed_dir = self.root_dir / "processed"
+        chain_names = pd.unique(pair_rows[["chain1", "chain2"]].to_numpy().ravel())
+        for chain_name in chain_names:
+            if not (processed_dir / f"{chain_name}.pkl").is_file():
+                return False
+        for label_path in pair_rows["label_path"].astype(str):
+            if not Path(label_path).is_file():
+                return False
+        return True
+
+    def _reuse_verified_pdb_ids(self, pdb_ids: List[str]):
+        output_path = self.root_dir / "verified_pdb_pairs.tsv"
+        if self.overwrite or not output_path.is_file():
+            existing_pairs = pd.DataFrame()
+        else:
+            try:
+                existing_pairs = pd.read_csv(output_path, sep="\t", dtype={"pdb": str})
+            except pd.errors.EmptyDataError:
+                existing_pairs = pd.DataFrame()
+
+        existing_by_pdb = {}
+        if not existing_pairs.empty and "pdb" in existing_pairs.columns:
+            for pdb_id, group in existing_pairs.groupby("pdb", sort=False):
+                existing_by_pdb[str(pdb_id)] = group
+
+        # The id list records successes that produced no pairs. It is only
+        # meaningful together with the pair table: a missing table means the
+        # previous pairs still need to be rebuilt.
+        if self.overwrite or not output_path.is_file():
+            completed_ids = set()
+        else:
+            completed_ids = self._read_completed_pdb_ids()
+        pdb_ids_to_verify: List[str] = []
+        skipped_ids: List[str] = []
+        reused_pairs: List[pd.DataFrame] = []
+        for pdb_id in pdb_ids:
+            pdb_key = str(pdb_id).strip()
+            pair_rows = existing_by_pdb.get(pdb_key)
+            if pair_rows is not None and self._verified_outputs_exist(pair_rows):
+                skipped_ids.append(pdb_key)
+                reused_pairs.append(pair_rows)
+                continue
+            if pair_rows is None and pdb_key in completed_ids:
+                skipped_ids.append(pdb_key)
+                continue
+            pdb_ids_to_verify.append(pdb_id)
+        return pdb_ids_to_verify, skipped_ids, reused_pairs
+
+    def _load_skipped_chain_sequences(
+        self,
+        skipped_ids: set,
+        reused_pairs: List[pd.DataFrame],
+    ) -> Dict[str, str]:
+        sequences: Dict[str, str] = {}
+        fasta_path = self.root_dir / "processed_chains.fasta"
+        if skipped_ids and fasta_path.is_file():
+            current_name = None
+            chunks: List[str] = []
+            with open(fasta_path, encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith(">"):
+                        if current_name is not None and current_name.split("_", 1)[0] in skipped_ids:
+                            sequences[current_name] = "".join(chunks)
+                        current_name = line[1:].split()[0]
+                        chunks = []
+                    else:
+                        chunks.append(line)
+            if current_name is not None and current_name.split("_", 1)[0] in skipped_ids:
+                sequences[current_name] = "".join(chunks)
+
+        processed_dir = self.root_dir / "processed"
+        for pair_rows in reused_pairs:
+            chain_names = pd.unique(pair_rows[["chain1", "chain2"]].to_numpy().ravel())
+            for chain_name in chain_names:
+                chain_name = str(chain_name)
+                if chain_name in sequences:
+                    continue
+                pickle_path = processed_dir / f"{chain_name}.pkl"
+                if not pickle_path.is_file():
+                    continue
+                with open(pickle_path, "rb") as handle:
+                    chain_dict = pickle.load(handle)
+                sequences[chain_name] = chain_dict["resseq"]
+        return sequences
+
     def verify_multiple_pdbs(self, pdb_ids: List[str]):
         os.makedirs(self.root_dir / "processed", exist_ok=True)  # save processed chain features
         os.makedirs(self.root_dir / "labels", exist_ok=True)  # save pairwise labels as separate files
+        pdb_ids_to_verify, skipped_ids, reused_pairs = self._reuse_verified_pdb_ids(pdb_ids)
+        if skipped_ids:
+            print(f"Skipping {len(skipped_ids)} already verified PDB files")
+
         pair_records: List[Dict[str, str]] = []
         error_records: List[Dict[str, str]] = []
-        chain_fasta_records: Dict[str, str] = {}
+        chain_fasta_records = self._load_skipped_chain_sequences(set(skipped_ids), reused_pairs)
+        completed_ids = set(skipped_ids)
 
-        if self.num_workers > 1:
+        if pdb_ids_to_verify and self.num_workers > 1:
             with mp.Pool(self.num_workers) as pool:
                 result_iter = pool.imap_unordered(
                     self.verify_single_pdb,
-                    pdb_ids,
+                    pdb_ids_to_verify,
                     chunksize=self.chunksize,
                 )
-                for result in tqdm(result_iter, total=len(pdb_ids), desc="Verifying PDB files", unit="file"):
+                for result in tqdm(
+                    result_iter,
+                    total=len(pdb_ids_to_verify),
+                    desc="Verifying PDB files",
+                    unit="file",
+                ):
                     if result is None:
                         continue
                     if result.get("error") is not None:
                         error_records.append(result["error"])
                         continue
+                    completed_ids.add(str(result["pdb"]))
                     pair_records.extend(result["pairs"])
                     for chain_name, chain_seq in result.get("chain_fasta_records", []):
                         chain_fasta_records[chain_name] = chain_seq
-        else:
-            for pdb_id in tqdm(pdb_ids, desc="Verifying PDB files", unit="file"):
+        elif pdb_ids_to_verify:
+            for pdb_id in tqdm(pdb_ids_to_verify, desc="Verifying PDB files", unit="file"):
                 result = self.verify_single_pdb(pdb_id)
                 if result is None:
                     continue
                 if result.get("error") is not None:
                     error_records.append(result["error"])
                     continue
+                completed_ids.add(str(result["pdb"]))
                 pair_records.extend(result["pairs"])
                 for chain_name, chain_seq in result.get("chain_fasta_records", []):
                     chain_fasta_records[chain_name] = chain_seq
 
-        verified_pairs = pd.DataFrame.from_records(pair_records)
+        pair_frames = list(reused_pairs)
+        if pair_records:
+            pair_frames.append(pd.DataFrame.from_records(pair_records))
+        if pair_frames:
+            verified_pairs = pd.concat(pair_frames, ignore_index=True)
+        else:
+            verified_pairs = pd.DataFrame(columns=["pdb", "chain1", "chain2", "label_path"])
         output_path = self.root_dir / "verified_pdb_pairs.tsv"
         verified_pairs.to_csv(output_path, sep="\t", index=False)
         print(f"Verified PDB pairs written: {output_path} ({len(verified_pairs)} pairs)")
@@ -827,6 +976,8 @@ class PDBVerifier:
                 f.write(f">{chain_name}\n{chain_fasta_records[chain_name]}\n")
         print(f"Processed chain FASTA written: {chain_fasta_path} ({len(chain_fasta_records)} chains)")
 
+        self._write_completed_pdb_ids(completed_ids)
+
         error_output_path = self.root_dir / "verify_errors.csv"
         error_df = pd.DataFrame.from_records(
             error_records,
@@ -835,7 +986,7 @@ class PDBVerifier:
         error_df.to_csv(error_output_path, index=False)
         print(
             f"Verification errors: {len(error_records)}/{len(pdb_ids)} PDB systems "
-            f"(saved to {error_output_path})"
+            f"({len(skipped_ids)} skipped, saved to {error_output_path})"
         )
         if not error_df.empty:
             print("Example verification errors:")
@@ -911,12 +1062,14 @@ class PDBVerifier:
                         pair_record["model_id"] = model_id
                     verified_pairs.append(pair_record)
             return {
+                "pdb": pdb_id,
                 "pairs": verified_pairs,
                 "chain_fasta_records": chain_fasta_records,
                 "error": None,
             }
         except Exception as e:
             return {
+                "pdb": pdb_id,
                 "pairs": [],
                 "chain_fasta_records": [],
                 "error": {
@@ -1051,13 +1204,33 @@ def cluster_heterodimer_ppi_pairs(
     return df_hetero
 
 
+def cluster_homodimer_ppi_pairs(
+    homodimer_tsv: str,
+    member_to_rep30: Dict[str, str],
+    output_clustered_tsv: str,
+) -> pd.DataFrame:
+    # just need one chain for homodimer clustering
+    df_homo = pd.read_csv(homodimer_tsv, sep="\t")
+    rep1 = df_homo["chain1"].map(lambda x: member_to_rep30.get(x, x))
+    pair_keys = [tuple(sorted((a, a))) for a in rep1]
+    unique_keys = sorted(set(pair_keys))
+    key_to_id = {key: f"ppi_cluster_{i:06d}" for i, key in enumerate(unique_keys, start=1)}
+    df_homo["ppi_cluster_id"] = [key_to_id[key] for key in pair_keys]
+    df_homo.to_csv(output_clustered_tsv, sep="\t", index=False)
+    print(
+        f"Homodimer PPI clusters written: {output_clustered_tsv} "
+        f"({len(df_homo)} pairs, {len(unique_keys)} clusters)"
+    )
+    return df_homo
+
+
 def _parse_experiment_types(value: str) -> List[str]:
     return [exp_type.strip() for exp_type in value.split(",") if exp_type.strip()]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare PDB entries for SurPass training.")
-    parser.add_argument("-r", "--root-dir", default="./pdb_metadata", help="Metadata/output root directory.")
+    parser.add_argument("-r", "--root-dir", default="./PDB_PPI", help="Metadata/output root directory.")
     parser.add_argument(
         "-b",
         "--benchmark-tsv",
@@ -1073,13 +1246,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-f",
         "--pdb-format",
-        default="pdb",
+        default="cif",
         choices=["pdb", "mmtf", "cif", "mmcif", "bcif"],
         help="Downloaded PDB structure format.",
     )
-    parser.add_argument("-w", "--workers", type=int, default=32, help="Number of worker processes.")
+    parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(), help="Number of worker processes.")
     parser.add_argument("-k", "--chunksize", type=int, default=32, help="Chunk size for multiprocessing.")
-    parser.add_argument("-m", "--min-chain-len", type=int, default=30, help="Minimum chain length to keep.")
+    parser.add_argument("-m", "--min-chain-len", type=int, default=20, help="Minimum chain length to keep.")
     parser.add_argument("-M", "--max-chain-len", type=int, default=1024, help="Maximum chain length to keep.")
     parser.add_argument("-Z", "--max-pdb-residues", type=int, default=10000, help="Skip PDB entries above this total residue count.")
     parser.add_argument("-P", "--max-pair-elements", type=int, default=4000000, help="Skip chain pairs where len(chain1)*len(chain2) exceeds this value.")
@@ -1111,12 +1284,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="test_vs_pdb_subset",
         help="Output prefix for MMSeqs2 intermediate/result files.",
     )
-    parser.add_argument("-O", "--overwrite-pdb", action="store_true", help="Re-download PDB files if present.")
+    parser.add_argument(
+        "-O",
+        "--overwrite-pdb",
+        action="store_true",
+        help="Re-download and re-verify PDB files that are already present.",
+    )
     return parser
 
 
 def main(args: argparse.Namespace):
     root_dir = Path(args.root_dir)
+    root_dir.mkdir(parents=True, exist_ok=True)
     experiment_types = _parse_experiment_types(args.experiment_types)
 
     # first retrieve metadata
@@ -1275,11 +1454,27 @@ def main(args: argparse.Namespace):
         member_to_rep30=member_to_rep90,
         output_clustered_tsv=str(heterodimer_duplicate_path),
     )
+
+    homodimer_clustered_path = root_dir / "verified_homodimers.clustered.tsv"
+    homodimer_duplicate_path = root_dir / "verified_homodimers.duplicate.tsv"
+    df_homo_clustered = cluster_homodimer_ppi_pairs(
+        homodimer_tsv=str(homodimer_path),
+        member_to_rep30=member_to_rep30,
+        output_clustered_tsv=str(homodimer_clustered_path),
+    )
+    df_homo_duplicate = cluster_homodimer_ppi_pairs(
+        homodimer_tsv=str(homodimer_path),
+        member_to_rep30=member_to_rep90,
+        output_clustered_tsv=str(homodimer_duplicate_path),
+    )
+
     print(
         "Step 10 complete: "
         f"{len(df_homo)} homodimers, {len(df_hetero)} heterodimers, "
         f"{df_hetero_clustered['ppi_cluster_id'].nunique() if not df_hetero_clustered.empty else 0} heterodimer clusters."
         f"{df_hetero_duplicate['ppi_cluster_id'].nunique() if not df_hetero_duplicate.empty else 0} heterodimer duplicate clusters."
+        f"{df_homo_clustered['ppi_cluster_id'].nunique() if not df_homo_clustered.empty else 0} homodimer clusters."
+        f"{df_homo_duplicate['ppi_cluster_id'].nunique() if not df_homo_duplicate.empty else 0} homodimer duplicate clusters."
     )
 
 if __name__ == "__main__":

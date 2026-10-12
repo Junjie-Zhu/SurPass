@@ -1,5 +1,8 @@
 from src.data.balancing import (
     BalancedClusterDataset,
+    DistributedWeightedSampler,
+    StaticClusterDataset,
+    build_multi_source_split,
     create_balanced_split_datasets,
     split_dataset,
 )
@@ -9,7 +12,10 @@ from src.data.labels import inter_chain_pair_mask
 
 __all__ = [
     "BalancedClusterDataset",
+    "DistributedWeightedSampler",
     "PepoTrainDataset",
+    "StaticClusterDataset",
+    "build_multi_source_split",
     "collate_concatenated_pairs",
     "collate_fn",
     "create_balanced_split_datasets",

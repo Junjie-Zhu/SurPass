@@ -1,11 +1,9 @@
 import pickle
 import random
-from math import prod
 from pathlib import Path
 
 import pandas as pd
 import torch
-from scipy.spatial.transform import Rotation as Scipy_Rotation
 from torch.utils.data import Dataset
 
 from src.data.cropping import (
@@ -31,8 +29,6 @@ class PepoTrainDataset(Dataset):
         root_dir: str,
         cluster_tsv_path=None,
         transform=None,
-        center_coordinates: bool = True,
-        random_rotation: bool = True,
         distance_bin_start: float = DISTANCE_BIN_START_A,
         distance_bin_end: float = DISTANCE_BIN_END_A,
         distance_bin_count: int = DISTANCE_BIN_NUM,
@@ -40,12 +36,12 @@ class PepoTrainDataset(Dataset):
         crop_neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
         crop_contiguous_probability: float = DEFAULT_CROP_CONTIGUOUS_PROBABILITY,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
+        require_labels: bool = True,
     ):
         self.root_dir = Path(root_dir)
         self.cluster_tsv_path = Path(cluster_tsv_path)
         self.transform = transform
-        self.center_coordinates = center_coordinates
-        self.random_rotation = random_rotation
+        self.require_labels = bool(require_labels)
         self.distance_bin_start = float(distance_bin_start)
         self.distance_bin_end = float(distance_bin_end)
         self.distance_bin_count = int(distance_bin_count)
@@ -64,7 +60,9 @@ class PepoTrainDataset(Dataset):
             raise ValueError("crop_contiguous_probability must be between 0 and 1.")
 
         self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
-        required_columns = {"chain1", "chain2", "label_path", "ppi_cluster_id"}
+        required_columns = {"chain1", "chain2", "ppi_cluster_id"}
+        if self.require_labels:
+            required_columns.add("label_path")
         missing_columns = required_columns.difference(self.metadata.columns)
         if missing_columns:
             raise ValueError(
@@ -142,12 +140,19 @@ class PepoTrainDataset(Dataset):
         p2_row = self._sample_row(p2_idx)
         p1_features = self._process_complex(self._load_chain_features(p1_row["chain1"]))
         p2_features = self._process_complex(self._load_chain_features(p2_row["chain2"]))
+        return self._finalize_negative_sample(p1_features, p2_features)
+
+    def get_static_negative_item(self, idx):
+        row = self._sample_row(idx)
+        p1_features, p2_features = self._load_pair_features(row)
+        return self._finalize_negative_sample(p1_features, p2_features)
+
+    def _finalize_negative_sample(self, p1_features: dict, p2_features: dict):
         p1_features, p2_features = crop_negative_pair(
             p1_features,
             p2_features,
             crop_size=self.crop_size,
         )
-
         label_bins, label_mask = build_negative_pair_labels(
             p1_features["residue_position"],
             p1_features["mask"],
@@ -211,31 +216,6 @@ class PepoTrainDataset(Dataset):
 
         return pairwise_dist, pairwise_mask
 
-    @staticmethod
-    def sample_uniform_rotation(shape=(), dtype=None, device=None) -> torch.Tensor:
-        return torch.tensor(
-            Scipy_Rotation.random(prod(shape)).as_matrix(),
-            device=device,
-            dtype=dtype,
-        ).reshape(*shape, 3, 3)
-
-    @staticmethod
-    def _masked_center(coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        mask_bool = mask.to(dtype=torch.bool)
-        mask_float = mask_bool.to(dtype=coords.dtype)
-        denom = mask_float.sum().clamp_min(1.0)
-        return (coords * mask_float[..., None]).sum(dim=0) / denom
-
-    @staticmethod
-    def _apply_rigid(
-        coords: torch.Tensor,
-        center: torch.Tensor,
-        rot: torch.Tensor,
-        translate: bool = True,
-    ) -> torch.Tensor:
-        shifted = coords - center if translate else coords
-        return torch.matmul(shifted, rot)
-
     def _process_complex(self, residue_features: dict) -> dict:
         residue_features = {
             key: value.copy() if hasattr(value, "copy") else value
@@ -262,38 +242,8 @@ class PepoTrainDataset(Dataset):
         residue_features["chain_index"] = self._encode_chain_index(
             residue_features["chain_index"]
         )
-        if "plm_emb" not in residue_features:
-            residue_count = int(
-                self._to_tensor(residue_features["cb_positions"]).shape[0]
-            )
-            residue_features["plm_emb"] = torch.zeros(
-                residue_count, 1280, dtype=torch.float32
-            )
         residue_features["plm_emb"] = self._to_tensor(
             residue_features["plm_emb"], dtype=torch.float32
-        )
-
-        residue_position = residue_features["atom14_positions"][:, 1, :]
-        residue_mask = residue_features["atom14_mask"][:, 1]
-        center = (
-            self._masked_center(residue_position, residue_mask)
-            if self.center_coordinates
-            else torch.zeros(3, dtype=residue_position.dtype, device=residue_position.device)
-        )
-
-        if self.random_rotation:
-            rot = self.sample_uniform_rotation(
-                dtype=residue_position.dtype,
-                device=residue_position.device,
-            )
-        else:
-            rot = torch.eye(3, dtype=residue_position.dtype, device=residue_position.device)
-
-        residue_features["atom14_positions"] = self._apply_rigid(
-            residue_features["atom14_positions"], center, rot
-        )
-        residue_features["cb_positions"] = self._apply_rigid(
-            residue_features["cb_positions"], center, rot
         )
 
         return {

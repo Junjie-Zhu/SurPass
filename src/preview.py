@@ -10,15 +10,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Subset
 
-from src.data.balancing import create_balanced_split_datasets
+from src.data.balancing import build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
-from src.data.dataset import PepoTrainDataset
 from src.model.surpass import ResOnly
 from src.train import (
     _cfg_get,
     _unpack_batch,
-    _validate_model_bin_counts,
-    contact_bin_count,
+    build_model_kwargs,
     resolve_chunk_size,
     resolve_cuda_device,
 )
@@ -139,23 +137,23 @@ def resolve_device() -> torch.device:
 
 
 def build_preview_loader(args: DictConfig):
-    full_dataset = PepoTrainDataset(
+    sources = _cfg_get(args, "data.datasets", default=None)
+    if sources is None:
+        raise ValueError("data.datasets must list at least one cluster source.")
+    sources = OmegaConf.to_container(sources, resolve=True)
+    train_dataset, _, _, _ = build_multi_source_split(
+        sources,
         root_dir=args.data.root_dir,
-        cluster_tsv_path=args.data.cluster_tsv_path,
-        center_coordinates=args.data.center_coordinates,
-        random_rotation=args.data.random_rotation,
-        distance_bin_start=args.data.distance_bin_start,
-        distance_bin_end=args.data.distance_bin_end,
-        distance_bin_count=args.data.distance_bin_count,
-        crop_size=None,
-        contact_threshold=args.data.contact_threshold,
-    )
-    train_dataset, _ = create_balanced_split_datasets(
-        full_dataset,
         test_fraction=args.data.test_fraction,
         seed=args.seed,
         negative_ratio=int(_cfg_get(args, "data.negative_ratio", default=1)),
-        distance_bin_count=args.data.distance_bin_count,
+        dataset_kwargs={
+            "distance_bin_start": args.data.distance_bin_start,
+            "distance_bin_end": args.data.distance_bin_end,
+            "distance_bin_count": args.data.distance_bin_count,
+            "crop_size": None,
+            "contact_threshold": args.data.contact_threshold,
+        },
     )
     sample_count = min(PREVIEW_SAMPLE_COUNT, len(train_dataset))
     if sample_count == 0:
@@ -178,22 +176,7 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
             "ckpt_dir is required. Example: "
             "python -m src.preview ckpt_dir=logs/<run>/checkpoints/epoch_N.pth"
         )
-    model_kwargs = _cfg_get(args, "model", default={})
-    if isinstance(model_kwargs, DictConfig):
-        model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
-    model_kwargs = dict(model_kwargs or {})
-    model_kwargs = _validate_model_bin_counts(model_kwargs, args.data.distance_bin_count)
-    for unused_key in ("dim_triangle_hidden", "n_pair_heads"):
-        model_kwargs.pop(unused_key, None)
-    model_kwargs["contact_bins"] = contact_bin_count(
-        args.data.contact_threshold,
-        args.data.distance_bin_start,
-        args.data.distance_bin_end,
-        args.data.distance_bin_count,
-    )
-    model_kwargs["checkpoint_pair_blocks"] = bool(
-        _cfg_get(args, "performance.checkpoint_pair_blocks", default=False)
-    )
+    model_kwargs = build_model_kwargs(args, checkpoint_default=False)
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])

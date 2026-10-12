@@ -9,6 +9,10 @@ from src.model.components.embedder import ResidueEmbedder
 from src.model.components.outer_product_mean import EfficientOuterProductMean
 from src.model.components.primitives import PairTransition
 from src.model.components.transformer import ResidueTransformer
+from src.model.components.triangle_update import (
+    TriangleMultiplicationIncoming,
+    TriangleMultiplicationOutgoing,
+)
 
 _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
 
@@ -35,6 +39,7 @@ class ResOnly(nn.Module):
         dropout=0.0,
         expansion_factor=2,
         dim_opm_inner=32,
+        dim_triangle_hidden=32,
         checkpoint_pair_blocks=True,
         contact_bins: int = 1,
         **kwargs,
@@ -87,6 +92,20 @@ class ResOnly(nn.Module):
                 c_m=dim_token,
                 c_z=dim_pair,
                 c_hidden=dim_opm_inner,
+            ) for _ in range(n_layers)
+        ])
+
+        self.triangle_multiplication_outgoing = nn.ModuleList([
+            TriangleMultiplicationOutgoing(
+                c_z=dim_pair,
+                c_hidden=dim_triangle_hidden,
+            ) for _ in range(n_layers)
+        ])
+
+        self.triangle_multiplication_incoming = nn.ModuleList([
+            TriangleMultiplicationIncoming(
+                c_z=dim_pair,
+                c_hidden=dim_triangle_hidden,
             ) for _ in range(n_layers)
         ])
 
@@ -211,6 +230,14 @@ class ResOnly(nn.Module):
     ) -> torch.Tensor:
         pair_repr = pair_repr + self.outer_product_mean[layer_index](
             single_repr,
+            mask,
+        ) * pair_mask_float[..., None]
+        pair_repr = pair_repr + self.triangle_multiplication_outgoing[layer_index](
+            pair_repr,
+            mask,
+        ) * pair_mask_float[..., None]
+        pair_repr = pair_repr + self.triangle_multiplication_incoming[layer_index](
+            pair_repr,
             mask,
         ) * pair_mask_float[..., None]
         pair_repr = pair_repr + self.pair_blocks[layer_index](

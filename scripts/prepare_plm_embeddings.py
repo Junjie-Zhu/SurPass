@@ -1,18 +1,39 @@
+"""Attach ESMC residue embeddings to prepared PDB or AFDB chain features.
 
+PDB chain ids come from the heterodimer table, and each sequence is read from
+that chain's processed pickle. AFDB sequences are read from the FASTA written
+during domain preparation, so those pickles are opened only for coordinates.
+
+Saved files live in ``<source>/embedded/<chain_id>.pt`` and keep the structure
+tensors used by training, plus ``plm_emb`` of shape ``[length, hidden]``.
+
+``--num-gpus`` or ``--devices`` splits the pending chains into contiguous shards
+and embeds one shard per GPU, each in its own process.
+"""
+
+import argparse
+import fcntl
+import multiprocessing as mp
 import os
 import pickle
-from contextlib import nullcontext
+import sys
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from E1.batch_preparer import E1BatchPreparer
-from E1.modeling import E1ForMaskedLM
-
+DEFAULT_ROOT = Path("/groups/sbinlab/clschf/datasets")
+DEFAULT_MODEL = "biohub/ESMC-6B"
+SOURCE_SUBDIRS = {
+    "pdb": "PDB_PPI",
+    "afdb": "AFDB_DDI",
+}
 FEATURE_DTYPES = {
     "atom14_positions": torch.float32,
     "atom14_mask": torch.bool,
@@ -23,88 +44,78 @@ FEATURE_DTYPES = {
 }
 
 
-def main():
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+def read_fasta_sequences(fasta_path: Path) -> dict[str, str]:
+    sequences: dict[str, str] = {}
+    header: Optional[str] = None
+    chunks: list[str] = []
 
-    device = "cuda:0"
-    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-600m").to(device)
-    model.eval()
+    def _flush() -> None:
+        if header is None:
+            return
+        sequence = _clean_sequence("".join(chunks))
+        if not sequence:
+            raise ValueError(f"FASTA record {header!r} has an empty sequence.")
+        if header in sequences:
+            raise ValueError(f"Duplicate FASTA id {header!r} in {fasta_path}.")
+        sequences[header] = sequence
 
-    verified_ppi_pairs = pd.read_csv("/lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/verified_heterodimers.tsv", sep="\t")
-    all_chains = set(verified_ppi_pairs["chain1"].tolist() + verified_ppi_pairs["chain2"].tolist())
+    with fasta_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                _flush()
+                header_text = line[1:].strip()
+                if not header_text:
+                    raise ValueError(f"FASTA header in {fasta_path} is missing an id.")
+                header = header_text.split()[0]
+                chunks = []
+                continue
+            if header is None:
+                raise ValueError(f"FASTA sequence found before a header in {fasta_path}.")
+            chunks.append(line)
+    _flush()
+    if not sequences:
+        raise ValueError(f"No FASTA records found in {fasta_path}.")
+    return sequences
 
-    print(f"all chains: {len(all_chains)}")
 
-    # feed verified seqs to model and get embeddings
-    feature_path = Path("/lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/processed")
-    embedding_path = Path("/lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata/embedded")
-    embedding_path.mkdir(parents=True, exist_ok=True)
+def load_esmc(model_name: str, device: str):
+    from esm.models.esmc import EsmcForMaskedLM, EsmcTokenizer
 
-    stats = {
-        "verified": len(all_chains),
-        "saved": 0,
-        "missing_features": 0,
-        "failed": 0,
-        "residues": 0,
-        "embedding_dim": None,
-    }
-    batch_preparer = E1BatchPreparer()
-    errors = []
+    model = EsmcForMaskedLM.from_pretrained(model_name, device=device).eval()
+    tokenizer = EsmcTokenizer()
+    return model, tokenizer
 
-    for chain_id in tqdm(sorted(all_chains), desc="Extracting PLM embeddings"):
-        feature_file = feature_path / f"{chain_id}.pkl"
-        output_file = embedding_path / f"{chain_id}.pt"
 
-        if not feature_file.exists():
-            stats["missing_features"] += 1
-            errors.append(f"{chain_id}: missing feature file {feature_file}")
-            continue
-
-        try:
-            with open(feature_file, "rb") as f:
-                feature_dict = pickle.load(f)
-            seq = feature_dict["resseq"]
-
-            plm_emb = generate_embeddings_from_request(
-                request_payload={"chain_id": chain_id, "sequence": seq},
-                model=model,
-                device=device,
-                msa_directory="",
-                embed_mode="single",
-                batch_preparer=batch_preparer,
+def embed_sequences(model, tokenizer, sequences: list[str]) -> list[torch.Tensor]:
+    """Residue embeddings for one batch, with BOS, EOS, and padding removed."""
+    if not sequences:
+        return []
+    inputs = tokenizer(sequences, return_tensors="pt", padding=True)
+    inputs = {key: value.to(model.device) for key, value in inputs.items()}
+    attention_mask = inputs["attention_mask"]
+    with torch.inference_mode():
+        output = model(**inputs)
+    hidden = _hidden_states(output)
+    residues = []
+    for index, sequence in enumerate(sequences):
+        real = attention_mask[index].bool()
+        tokens = hidden[index][real]
+        if tokens.shape[0] < 2:
+            raise ValueError(f"Sequence of length {len(sequence)} returned no BOS/EOS span.")
+        matrix = tokens[1:-1].to(dtype=torch.float32, device="cpu").contiguous()
+        if matrix.shape[0] != len(sequence):
+            raise ValueError(
+                f"ESMC residue rows ({matrix.shape[0]}) do not match sequence length "
+                f"({len(sequence)})."
             )
-            features = tensorize_feature_dict(feature_dict)
-            features["plm_emb"] = plm_emb
-
-            feature_len = _infer_feature_length(features)
-            if feature_len is not None and feature_len != plm_emb.shape[0]:
-                raise ValueError(
-                    f"feature length {feature_len} does not match embedding length {plm_emb.shape[0]}"
-                )
-
-            torch.save(features, output_file)
-            stats["saved"] += 1
-            stats["residues"] += int(plm_emb.shape[0])
-            stats["embedding_dim"] = int(plm_emb.shape[-1])
-        except Exception as exc:
-            stats["failed"] += 1
-            errors.append(f"{chain_id}: {type(exc).__name__}: {exc}")
-
-    print("\nEmbedding extraction summary")
-    print(f"verified chains with sequences: {stats['verified']}")
-    print(f"saved chains: {stats['saved']}")
-    print(f"missing feature files: {stats['missing_features']}")
-    print(f"failed chains: {stats['failed']}")
-    print(f"total embedded residues: {stats['residues']}")
-    print(f"embedding dim: {stats['embedding_dim']}")
-    print(f"output directory: {embedding_path}")
-    if errors:
-        print("example errors:")
-        for error in errors[:10]:
-            print(f"  - {error}")
+        residues.append(matrix)
+    return residues
 
 
-def tensorize_feature_dict(feature_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+def tensorize_feature_dict(feature_dict: dict[str, Any]) -> dict[str, torch.Tensor]:
     features = {}
     for key, value in feature_dict.items():
         tensor = _to_feature_tensor(key, value)
@@ -113,17 +124,639 @@ def tensorize_feature_dict(feature_dict: Dict[str, Any]) -> Dict[str, torch.Tens
     return features
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract ESMC embeddings for prepared PDB or AFDB chains. "
+            "Use --num-gpus or --devices to run one contiguous shard per GPU."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  # single visible GPU (default)\n"
+            "  python prepare_plm_embeddings.py --source pdb --skip-existing\n"
+            "\n"
+            "  # every GPU visible to this process\n"
+            "  python prepare_plm_embeddings.py --source pdb --num-gpus -1 --skip-existing\n"
+            "\n"
+            "  # the first 4 GPUs, or an explicit subset\n"
+            "  python prepare_plm_embeddings.py --source afdb --num-gpus 4 --batch-size 2\n"
+            "  python prepare_plm_embeddings.py --source afdb --devices cuda:0,cuda:1,cuda:3\n"
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        choices=tuple(SOURCE_SUBDIRS),
+        default="pdb",
+        help="PDB reads sequences from processed pickles. AFDB reads the prepared FASTA.",
+    )
+    parser.add_argument(
+        "--root-dir",
+        type=Path,
+        default=DEFAULT_ROOT,
+        help="Directory that contains the PDB_PPI and AFDB_DDI datasets.",
+    )
+    parser.add_argument("--pdb-subdir", default=SOURCE_SUBDIRS["pdb"])
+    parser.add_argument("--afdb-subdir", default=SOURCE_SUBDIRS["afdb"])
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        default=None,
+        help="Dataset directory. Defaults to <root-dir>/<pdb-subdir or afdb-subdir>.",
+    )
+    parser.add_argument(
+        "--pairs-tsv",
+        default="verified_heterodimers.tsv",
+        help="PDB pair table, relative to the PDB directory, used to collect chain ids.",
+    )
+    parser.add_argument(
+        "--fasta",
+        default="processed_domains.fasta",
+        help="AFDB sequence FASTA, relative to the AFDB directory or absolute.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Sequences per forward pass on each GPU.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Processes used to read PDB chain sequences from pickles.",
+    )
+    parser.add_argument("--model-name", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Single device. Defaults to cuda when CUDA is visible, otherwise cpu.",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help=(
+            "Split pending chains across this many GPUs (cuda:0 .. cuda:N-1), "
+            "one process per card. Use -1 for every visible GPU. "
+            "Omit to keep single-device inference."
+        ),
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated devices, one shard each, for example cuda:0,cuda:1,cuda:3.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip chains whose embedded .pt file already exists.",
+    )
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    if args.batch_size < 1:
+        raise ValueError("batch-size must be positive.")
+    if args.workers < 1:
+        raise ValueError("workers must be positive.")
+
+    source_dir = _source_dir(args)
+    processed_dir = source_dir / "processed"
+    embedding_dir = source_dir / "embedded"
+    embedding_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.source == "pdb":
+        pending, missing, skipped = _pdb_entries(
+            source_dir,
+            processed_dir,
+            embedding_dir,
+            args.pairs_tsv,
+            skip_existing=args.skip_existing,
+            workers=args.workers,
+        )
+    else:
+        pending, missing, skipped = _afdb_entries(
+            source_dir,
+            embedding_dir,
+            args.fasta,
+            skip_existing=args.skip_existing,
+        )
+    entries_count = len(pending) + skipped + len(missing)
+
+    print(f"source: {args.source}")
+    print(f"source directory: {source_dir}")
+    print(f"chains: {entries_count}")
+    print(f"pending: {len(pending)}")
+    print(f"skipped existing: {skipped}")
+    print(f"missing inputs: {len(missing)}")
+
+    devices = _resolve_inference_devices(args)
+    errors = list(missing)
+    if not pending:
+        stats = _empty_stats()
+    elif len(devices) == 1:
+        device = devices[0]
+        print(f"Loading {args.model_name} on {device}")
+        model, tokenizer = load_esmc(args.model_name, device)
+        stats, embed_errors = _embed_pending(
+            pending,
+            model,
+            tokenizer,
+            args.batch_size,
+            processed_dir,
+            embedding_dir,
+            progress_desc="Extracting ESMC embeddings",
+        )
+        errors.extend(embed_errors)
+    else:
+        print(
+            f"Splitting {len(pending)} pending chains across {len(devices)} GPUs: "
+            + ", ".join(devices)
+        )
+        stats, embed_errors = _embed_on_devices(
+            devices,
+            pending,
+            args.batch_size,
+            args.model_name,
+            processed_dir,
+            embedding_dir,
+        )
+        errors.extend(embed_errors)
+
+    print("\nEmbedding extraction summary")
+    print(f"saved chains: {stats['saved']}")
+    print(f"skipped existing: {skipped}")
+    print(f"missing inputs: {len(missing)}")
+    print(f"failed chains: {stats['failed']}")
+    print(f"total embedded residues: {stats['residues']}")
+    print(f"embedding dim: {stats['embedding_dim']}")
+    print(f"output directory: {embedding_dir}")
+    if errors:
+        print("example errors:")
+        for error in errors[:10]:
+            print(f"  - {error}")
+
+
+def _source_dir(args: argparse.Namespace) -> Path:
+    if args.source_dir is not None:
+        return Path(args.source_dir)
+    subdir = args.pdb_subdir if args.source == "pdb" else args.afdb_subdir
+    return Path(args.root_dir) / subdir
+
+
+def _empty_stats() -> dict[str, Any]:
+    return {
+        "saved": 0,
+        "failed": 0,
+        "residues": 0,
+        "embedding_dim": None,
+    }
+
+
+def _merge_stats(parts: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    merged = _empty_stats()
+    for part in parts:
+        merged["saved"] += part["saved"]
+        merged["failed"] += part["failed"]
+        merged["residues"] += part["residues"]
+        if part["embedding_dim"] is not None:
+            merged["embedding_dim"] = part["embedding_dim"]
+    return merged
+
+
+def _contiguous_shards(items: list, num_shards: int) -> list[list]:
+    """Split items into num_shards contiguous slices that differ in length by at most one."""
+    if num_shards < 1:
+        raise ValueError("num_shards must be positive.")
+    count = len(items)
+    return [
+        items[(count * index) // num_shards : (count * (index + 1)) // num_shards]
+        for index in range(num_shards)
+    ]
+
+
+def _cuda_index(device: str) -> Optional[int]:
+    if device == "cuda":
+        return 0
+    prefix = "cuda:"
+    if not device.startswith(prefix):
+        return None
+    suffix = device[len(prefix) :]
+    if not suffix.isdigit():
+        raise ValueError(
+            f"Unrecognized CUDA device {device!r}. Expected 'cuda' or 'cuda:<index>'."
+        )
+    return int(suffix)
+
+
+def _parse_device_list(value: str) -> list[str]:
+    devices = [item.strip() for item in value.split(",") if item.strip()]
+    if not devices:
+        raise ValueError("--devices did not contain any device names.")
+    if len(devices) != len(set(devices)):
+        raise ValueError("--devices contains a repeated device.")
+    return devices
+
+
+def _validate_devices(devices: list[str]) -> None:
+    indexed = []
+    for device in devices:
+        index = _cuda_index(device)
+        if index is not None:
+            indexed.append((device, index))
+    if not indexed:
+        return
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        names = ", ".join(device for device, _ in indexed)
+        raise RuntimeError(
+            f"CUDA device(s) requested ({names}), but no GPU is visible. "
+            "Check CUDA_VISIBLE_DEVICES and nvidia-smi."
+        )
+    available = torch.cuda.device_count()
+    for device, index in indexed:
+        if index >= available:
+            raise RuntimeError(
+                f"Device {device} is outside the {available} visible GPU(s). "
+                "Check CUDA_VISIBLE_DEVICES and nvidia-smi."
+            )
+
+
+def _resolve_inference_devices(args: argparse.Namespace) -> list[str]:
+    multi = args.devices or (args.num_gpus is not None and args.num_gpus != 1)
+    if args.device and multi:
+        raise ValueError(
+            "--device selects one card. Omit it when using --num-gpus or --devices."
+        )
+    if args.devices and args.num_gpus is not None:
+        raise ValueError("Pass only one of --devices and --num-gpus.")
+    if args.devices:
+        devices = _parse_device_list(args.devices)
+    elif args.num_gpus is None or args.num_gpus == 1:
+        devices = [args.device or ("cuda" if torch.cuda.is_available() else "cpu")]
+    else:
+        if args.num_gpus == 0 or args.num_gpus < -1:
+            raise ValueError("--num-gpus must be positive, or -1 to use every visible GPU.")
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            raise RuntimeError(
+                "Multi-GPU embedding requires CUDA, but no GPU is visible. "
+                "Check CUDA_VISIBLE_DEVICES and nvidia-smi."
+            )
+        available = torch.cuda.device_count()
+        requested = available if args.num_gpus < 0 else args.num_gpus
+        if requested > available:
+            raise RuntimeError(
+                f"Requested {requested} GPUs, but only {available} are visible. "
+                "Check CUDA_VISIBLE_DEVICES and nvidia-smi."
+            )
+        devices = [f"cuda:{index}" for index in range(requested)]
+    _validate_devices(devices)
+    return devices
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    """Serialize ESMC loads on this node so host memory is not hit by every card at once."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _configure_worker_threads(num_devices: int) -> None:
+    cpu_count = os.cpu_count() or 1
+    threads = max(1, cpu_count // max(num_devices, 1))
+    torch.set_num_threads(threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def _failed_shard(device: str, count: int, message: str) -> tuple[dict[str, Any], list[str]]:
+    return (
+        {"saved": 0, "failed": count, "residues": 0, "embedding_dim": None},
+        [f"[{device}] {message}"],
+    )
+
+
+def _embed_pending(
+    pending: list[tuple[str, str]],
+    model,
+    tokenizer,
+    batch_size: int,
+    processed_dir: Path,
+    embedding_dir: Path,
+    progress_desc: str,
+    progress_position: Optional[int] = None,
+    error_prefix: str = "",
+) -> tuple[dict[str, Any], list[str]]:
+    stats = _empty_stats()
+    errors: list[str] = []
+    batches = [
+        pending[start : start + batch_size]
+        for start in range(0, len(pending), batch_size)
+    ]
+    progress_kwargs = {}
+    if progress_position is not None:
+        progress_kwargs["position"] = progress_position
+    for batch in tqdm(batches, desc=progress_desc, **progress_kwargs):
+        chain_ids = [chain_id for chain_id, _ in batch]
+        sequences = [sequence for _, sequence in batch]
+        try:
+            embeddings = embed_sequences(model, tokenizer, sequences)
+        except Exception as exc:
+            stats["failed"] += len(batch)
+            errors.append(f"{error_prefix}{', '.join(chain_ids)}: {type(exc).__name__}: {exc}")
+            continue
+        for chain_id, sequence, embedding in zip(chain_ids, sequences, embeddings):
+            try:
+                _save_chain_embedding(
+                    chain_id,
+                    sequence,
+                    embedding,
+                    processed_dir,
+                    embedding_dir,
+                )
+            except Exception as exc:
+                stats["failed"] += 1
+                errors.append(f"{error_prefix}{chain_id}: {type(exc).__name__}: {exc}")
+                continue
+            stats["saved"] += 1
+            stats["residues"] += int(embedding.shape[0])
+            stats["embedding_dim"] = int(embedding.shape[-1])
+    return stats, errors
+
+
+def _embed_shard(
+    rank: int,
+    device: str,
+    pending: list[tuple[str, str]],
+    batch_size: int,
+    model_name: str,
+    processed_dir: str,
+    embedding_dir: str,
+    num_devices: int,
+    load_lock_path: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Load one ESMC copy onto ``device`` and embed this shard."""
+    if not pending:
+        return _empty_stats(), []
+    try:
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        _configure_worker_threads(num_devices)
+        if _cuda_index(device) is not None:
+            torch.cuda.set_device(device)
+        print(
+            f"[shard {rank}] waiting to load {model_name} on {device} ({len(pending)} chains)",
+            flush=True,
+        )
+        with _exclusive_lock(Path(load_lock_path)):
+            print(f"[shard {rank}] loading {model_name} on {device}", flush=True)
+            model, tokenizer = load_esmc(model_name, device)
+        print(f"[shard {rank}] model ready on {device}", flush=True)
+    except Exception as exc:
+        return _failed_shard(device, len(pending), f"failed to start: {type(exc).__name__}: {exc}")
+    return _embed_pending(
+        pending,
+        model,
+        tokenizer,
+        batch_size,
+        Path(processed_dir),
+        Path(embedding_dir),
+        progress_desc=f"ESMC {device}",
+        progress_position=rank if sys.stderr.isatty() else None,
+        error_prefix=f"[{device}] ",
+    )
+
+
+def _embed_on_devices(
+    devices: list[str],
+    pending: list[tuple[str, str]],
+    batch_size: int,
+    model_name: str,
+    processed_dir: Path,
+    embedding_dir: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    shards = _contiguous_shards(pending, len(devices))
+    active = []
+    for rank, (device, shard) in enumerate(zip(devices, shards)):
+        if shard:
+            print(
+                f"shard {rank}: {device}, {len(shard)} chains "
+                f"({shard[0][0]} .. {shard[-1][0]})"
+            )
+            active.append((rank, device, shard))
+        else:
+            print(f"shard {rank}: {device}, 0 chains")
+    if not active:
+        return _empty_stats(), []
+
+    # Spawn so each GPU gets a fresh interpreter. Forking after CUDA init is unsafe.
+    ctx = mp.get_context("spawn")
+    lock_path = Path(tempfile.gettempdir()) / f"surpass_esmc_load_{os.getpid()}.lock"
+    lock_path.touch()
+    parts: list[dict[str, Any]] = []
+    errors: list[str] = []
+    try:
+        with ProcessPoolExecutor(max_workers=len(active), mp_context=ctx) as executor:
+            futures = [
+                executor.submit(
+                    _embed_shard,
+                    rank,
+                    device,
+                    shard,
+                    batch_size,
+                    model_name,
+                    str(processed_dir),
+                    str(embedding_dir),
+                    len(active),
+                    str(lock_path),
+                )
+                for rank, device, shard in active
+            ]
+            for (rank, device, shard), future in zip(active, futures):
+                try:
+                    stats, shard_errors = future.result()
+                except Exception as exc:
+                    stats, shard_errors = _failed_shard(
+                        device,
+                        len(shard),
+                        f"worker failed: {type(exc).__name__}: {exc}",
+                    )
+                    print(f"[shard {rank}] {shard_errors[0]}", flush=True)
+                parts.append(stats)
+                errors.extend(shard_errors)
+    finally:
+        lock_path.unlink(missing_ok=True)
+    return _merge_stats(parts), errors
+
+
+def _read_pdb_sequence(
+    task: tuple[str, str, str, bool],
+) -> tuple[str, str | None, str | None, bool]:
+    chain_id, processed_dir, embedding_dir, skip_existing = task
+    if skip_existing and (Path(embedding_dir) / f"{chain_id}.pt").is_file():
+        return chain_id, None, None, True
+    feature_path = Path(processed_dir) / f"{chain_id}.pkl"
+    if not feature_path.is_file():
+        return chain_id, None, f"{chain_id}: missing feature file {feature_path}", False
+    try:
+        with feature_path.open("rb") as handle:
+            feature_dict = pickle.load(handle)
+        sequence = _clean_sequence(feature_dict["resseq"])
+        if not sequence:
+            raise ValueError("resseq is empty")
+    except Exception as exc:
+        return chain_id, None, f"{chain_id}: {type(exc).__name__}: {exc}", False
+    return chain_id, sequence, None, False
+
+
+def _pdb_entries(
+    source_dir: Path,
+    processed_dir: Path,
+    embedding_dir: Path,
+    pairs_tsv: str,
+    skip_existing: bool,
+    workers: int,
+) -> tuple[list[tuple[str, str]], list[str], int]:
+    pairs_path = _relative_or_absolute(source_dir, pairs_tsv)
+    if not pairs_path.is_file():
+        raise FileNotFoundError(f"Cannot find PDB pair table: {pairs_path}")
+    pairs = pd.read_csv(pairs_path, sep="\t")
+    missing_columns = {"chain1", "chain2"}.difference(pairs.columns)
+    if missing_columns:
+        raise ValueError(f"{pairs_path} is missing columns: {sorted(missing_columns)}")
+    chain_ids = sorted(
+        set(pairs["chain1"].dropna().astype(str)) | set(pairs["chain2"].dropna().astype(str))
+    )
+    tasks = [
+        (chain_id, str(processed_dir), str(embedding_dir), skip_existing)
+        for chain_id in chain_ids
+    ]
+    if workers > 1 and len(tasks) > 1:
+        chunksize = max(1, len(tasks) // (workers * 4))
+        with mp.Pool(workers) as pool:
+            results = list(
+                tqdm(
+                    pool.imap(_read_pdb_sequence, tasks, chunksize=chunksize),
+                    total=len(tasks),
+                    desc="Reading PDB sequences",
+                )
+            )
+    else:
+        results = [
+            _read_pdb_sequence(task) for task in tqdm(tasks, desc="Reading PDB sequences")
+        ]
+
+    entries = []
+    errors = []
+    skipped = 0
+    for chain_id, sequence, error, was_skipped in results:
+        if was_skipped:
+            skipped += 1
+            continue
+        if error is not None:
+            errors.append(error)
+            continue
+        entries.append((chain_id, sequence))
+    return entries, errors, skipped
+
+
+def _afdb_entries(
+    source_dir: Path,
+    embedding_dir: Path,
+    fasta: str,
+    skip_existing: bool,
+) -> tuple[list[tuple[str, str]], list[str], int]:
+    fasta_path = _relative_or_absolute(source_dir, fasta)
+    if not fasta_path.is_file():
+        raise FileNotFoundError(f"Cannot find AFDB FASTA: {fasta_path}")
+    sequences = read_fasta_sequences(fasta_path)
+    print(f"AFDB sequences: {fasta_path} ({len(sequences)} records)")
+    entries = []
+    skipped = 0
+    for chain_id, sequence in sorted(sequences.items()):
+        if skip_existing and (embedding_dir / f"{chain_id}.pt").is_file():
+            skipped += 1
+            continue
+        entries.append((chain_id, sequence))
+    return entries, [], skipped
+
+
+def _save_chain_embedding(
+    chain_id: str,
+    sequence: str,
+    embedding: torch.Tensor,
+    processed_dir: Path,
+    embedding_dir: Path,
+) -> None:
+    feature_path = processed_dir / f"{chain_id}.pkl"
+    if not feature_path.is_file():
+        raise FileNotFoundError(f"missing feature file {feature_path}")
+    with feature_path.open("rb") as handle:
+        feature_dict = pickle.load(handle)
+    features = tensorize_feature_dict(feature_dict)
+    feature_len = _infer_feature_length(features)
+    if feature_len is None:
+        raise ValueError("processed features have no residue axis")
+    if feature_len != len(sequence) or feature_len != int(embedding.shape[0]):
+        raise ValueError(
+            f"feature length {feature_len}, sequence length {len(sequence)}, "
+            f"and embedding length {int(embedding.shape[0])} do not match"
+        )
+    features["plm_emb"] = embedding
+    torch.save(features, embedding_dir / f"{chain_id}.pt")
+
+
+def _relative_or_absolute(source_dir: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return source_dir / path
+
+
+def _clean_sequence(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (bytes, bytearray)):
+        text = value.decode()
+    elif isinstance(value, np.ndarray) and value.shape == ():
+        text = str(value.item())
+    else:
+        text = "".join(str(item) for item in list(value))
+    return "".join(text.split()).upper()
+
+
+def _hidden_states(output: object) -> torch.Tensor:
+    for name in ("embeddings", "last_hidden_state"):
+        value = output[name] if isinstance(output, dict) else getattr(output, name, None)
+        if isinstance(value, torch.Tensor) and value.ndim == 3:
+            return value
+    hidden_states = output.get("hidden_states") if isinstance(output, dict) else getattr(
+        output, "hidden_states", None
+    )
+    if isinstance(hidden_states, (tuple, list)) and hidden_states:
+        last = hidden_states[-1]
+        if isinstance(last, torch.Tensor) and last.ndim == 3:
+            return last
+    raise RuntimeError("ESMC forward returned no residue hidden states.")
+
+
 def _to_feature_tensor(key: str, value: Any) -> Optional[torch.Tensor]:
     if key == "chain_index":
         return _encode_chain_index(value)
-
     if isinstance(value, np.ndarray):
         tensor = torch.from_numpy(value)
     elif isinstance(value, torch.Tensor):
         tensor = value
     else:
         return None
-
     dtype = FEATURE_DTYPES.get(key)
     return tensor.to(dtype=dtype) if dtype is not None else tensor
 
@@ -131,116 +764,24 @@ def _to_feature_tensor(key: str, value: Any) -> Optional[torch.Tensor]:
 def _encode_chain_index(chain_index: Any) -> torch.Tensor:
     if isinstance(chain_index, torch.Tensor):
         return chain_index.long()
-
     values = chain_index.tolist() if isinstance(chain_index, np.ndarray) else list(chain_index)
-    mapping = {value: i for i, value in enumerate(sorted(set(values)))}
+    mapping = {value: index for index, value in enumerate(sorted(set(values)))}
     return torch.tensor([mapping[value] for value in values], dtype=torch.long)
 
 
-def _batched(items, batch_size: int):
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-
-    batch = []
-    for item in items:
-        batch.append(item)
-        if len(batch) == batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-def _infer_feature_length(features: Dict[str, torch.Tensor]) -> Optional[int]:
-    for key in ("residue_type", "residue_index", "atom14_positions", "cb_positions", "cb_mask", "atom14_mask"):
+def _infer_feature_length(features: dict[str, torch.Tensor]) -> Optional[int]:
+    for key in (
+        "residue_type",
+        "residue_index",
+        "atom14_positions",
+        "cb_positions",
+        "cb_mask",
+        "atom14_mask",
+    ):
         value = features.get(key)
         if isinstance(value, torch.Tensor) and value.ndim > 0:
             return int(value.shape[0])
     return None
-
-
-def _is_cuda_device(device: Any) -> bool:
-    """Check if the device is a CUDA device."""
-    if hasattr(device, "type"):
-        return device.type == "cuda"
-    return str(device).startswith("cuda")
-
-
-def _build_sequence_input(
-    chain_request: Dict[str, Any],
-    msa_directory: str,
-    embed_mode: str
-) -> str:
-    """
-    Build the input sequence based on embed_mode:
-    - 'single': return the one-letter amino acid sequence directly.
-    - 'msa': attempt to load .a3m from msa_directory, sample context,
-             and return 'context,sequence' if successful; otherwise fallback to single.
-    """
-    chain_seq_1 = chain_request["sequence"]
-    return chain_seq_1
-
-
-def generate_embeddings_from_request(
-    request_payload: Dict[str, Any],
-    model,
-    device,
-    msa_directory: str,
-    embed_mode: str,
-    batch_preparer: Optional[E1BatchPreparer] = None,
-) -> torch.Tensor:
-    """
-    Generate embeddings for all protein chains in the request.
-
-    Args:
-        request_payload: contains 'chain_requests' list; each item must have
-                         'chain_id' and 'sequence'. If embed_mode='msa', also
-                         require 'msa_basename'.
-        model: E1ForMaskedLM instance (already loaded and in eval mode).
-        device: torch.device.
-        msa_directory: directory containing .a3m files (used only for MSA mode).
-        embed_mode: 'single' or 'msa'.
-        batch_preparer: E1BatchPreparer instance; creates a new one if None.
-
-    Returns:
-        dict {chain_id: numpy.ndarray} of shape (L, D), where L is number of
-        residues and D is embedding dimension.
-    """
-    if batch_preparer is None:
-        batch_preparer = E1BatchPreparer()
-
-    autocast_enabled = _is_cuda_device(device)
-
-    sequence_input = _build_sequence_input(request_payload, msa_directory, embed_mode)
-    batch = batch_preparer.get_batch_kwargs([sequence_input], device=device)
-
-    autocast_ctx = (
-        torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled)
-        if hasattr(torch, "autocast")
-        else nullcontext()
-    )
-
-    with torch.inference_mode():
-        with autocast_ctx:
-            outputs = model(
-                input_ids=batch["input_ids"],
-                within_seq_position_ids=batch["within_seq_position_ids"],
-                global_position_ids=batch["global_position_ids"],
-                sequence_ids=batch["sequence_ids"],
-                past_key_values=None,
-                use_cache=False,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
-        embeddings = outputs.embeddings  # shape: (batch, seq_len, hidden_dim)
-
-        # Extract residue-level embeddings for the last sequence (target protein)
-        last_sequence_selector = batch["sequence_ids"] == batch["sequence_ids"].max(dim=1)[0][:, None]
-        residue_selector = ~(batch_preparer.get_boundary_token_mask(batch["input_ids"]))
-        last_sequence_residue_selector = last_sequence_selector & residue_selector
-        last_sequence_embeddings = embeddings[0, last_sequence_residue_selector[0]]
-
-    return last_sequence_embeddings.to(dtype=torch.float32).cpu()
 
 
 if __name__ == "__main__":
