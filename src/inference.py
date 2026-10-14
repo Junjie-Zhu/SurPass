@@ -22,7 +22,6 @@ from src.train import (
     contact_bin_count,
     log_info,
     pair_bind_scores,
-    resolve_chunk_size,
     resolve_cuda_device,
     resolve_dist_backend,
     to_device,
@@ -171,6 +170,7 @@ class InferencePairDataset(Dataset):
         label_column = resolve_label_column(metadata.columns)
         sequences = load_fasta_sequences(self.fasta_path)
 
+        self._feature_cache: dict[str, dict[str, torch.Tensor]] = {}
         self.items: list[dict[str, Any]] = []
         for _, row in metadata.iterrows():
             pair = str(row["Protein pairs"]).strip()
@@ -196,10 +196,15 @@ class InferencePairDataset(Dataset):
         return len(self.items)
 
     def _load_features(self, protein_id: str, sequence: str) -> dict[str, torch.Tensor]:
+        cached = self._feature_cache.get(protein_id)
+        if cached is not None:
+            return cached
         embedding_path = self.embedding_dir / f"{protein_id}.pt"
         if not embedding_path.exists():
             raise FileNotFoundError(f"Missing embedding file: {embedding_path}")
-        return build_residue_features(sequence, load_plm_embedding(embedding_path))
+        features = build_residue_features(sequence, load_plm_embedding(embedding_path))
+        self._feature_cache[protein_id] = features
+        return features
 
     def __getitem__(self, idx: int):
         item = self.items[idx]
@@ -355,7 +360,7 @@ def _slice_features(
     for key, value in residue_batch.items():
         if key in {"p1_length", "p2_length"} or not isinstance(value, torch.Tensor):
             continue
-        features[key] = value[index, start:end].detach().clone()
+        features[key] = value[index, start:end]
     return features
 
 
@@ -472,7 +477,6 @@ def _score_pair_windows(
     max_full_length: int | None,
     contact_bins: int,
     ppi_score_threshold: float,
-    chunk_size: int | None,
     map_dir: str | Path | None,
     pair_name: str,
     centers: torch.Tensor,
@@ -488,10 +492,11 @@ def _score_pair_windows(
     protein_score = 0.0
     pair_score = 0.0
     n_contacts = 0
+    threshold = float(ppi_score_threshold)
 
     for span_1, span_2 in windows:
         window_batch = _window_residue_batch(residue_batch, index, span_1, span_2)
-        output = model(window_batch, chunk_size=chunk_size)
+        output = model(window_batch)
         start_1, end_1 = span_1
         start_2, end_2 = span_2
         width_1 = end_1 - start_1
@@ -514,23 +519,20 @@ def _score_pair_windows(
             p1_length=window_batch["p1_length"],
             p2_length=window_batch["p2_length"],
             contact_bins=contact_bins,
-            ppi_score_threshold=ppi_score_threshold,
+            ppi_score_threshold=threshold,
         )
         pair_score = max(pair_score, float(window_pair.reshape(-1)[0].item()))
         n_contacts += int(window_contacts.reshape(-1)[0].item())
         if len(windows) == 1 and map_dir is not None:
             _write_sample_maps(map_dir, pair_name, output, window_batch, 0, centers)
-        del output
-        if len(windows) > 1 and device.type == "cuda":
-            torch.cuda.empty_cache()
 
     residue_values = []
     if bool(p1_mask.any().item()):
         residue_values.append(float(p1_prob[p1_mask].max().item()))
     if bool(p2_mask.any().item()):
         residue_values.append(float(p2_prob[p2_mask].max().item()))
-    n_pos = int((p1_prob.ge(float(ppi_score_threshold)) & p1_mask).sum().item())
-    n_pos += int((p2_prob.ge(float(ppi_score_threshold)) & p2_mask).sum().item())
+    n_pos = int((p1_prob.ge(threshold) & p1_mask).sum().item())
+    n_pos += int((p2_prob.ge(threshold) & p2_mask).sum().item())
     return {
         "p_protein": protein_score,
         "p_residue": max(residue_values) if residue_values else 0.0,
@@ -551,7 +553,6 @@ def evaluate_ppi(
     distance_bin_count: int,
     ppi_score_threshold: float,
     positive_weight: float = 1.0,
-    chunk_size: int | None = None,
     map_dir: str | Path | None = None,
     max_full_length: int | None = 1024,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
@@ -568,9 +569,26 @@ def evaluate_ppi(
         distance_bin_count,
     )
     rows: list[dict[str, Any]] = []
+    desc = (
+        "Inference"
+        if DIST_WRAPPER.world_size <= 1
+        else f"Inference [{DIST_WRAPPER.rank}/{DIST_WRAPPER.world_size}]"
+    )
+    progress = tqdm(
+        loader,
+        desc=desc,
+        total=len(loader),
+        leave=True,
+        position=DIST_WRAPPER.local_rank if DIST_WRAPPER.world_size > 1 else 0,
+    )
 
-    with torch.no_grad():
-        for residue_batch, metas in loader:
+    with progress, torch.no_grad():
+        for residue_batch, metas in progress:
+            if metas:
+                pair_label = metas[0]["pair"]
+                if len(metas) > 1:
+                    pair_label = f"{pair_label} +{len(metas) - 1}"
+                progress.set_postfix(pair=pair_label, refresh=False)
             residue_batch = to_device(residue_batch, device)
             if _batch_exceeds_budget(residue_batch, max_full_length):
                 for index, meta in enumerate(metas):
@@ -581,7 +599,6 @@ def evaluate_ppi(
                         max_full_length,
                         contact_bins,
                         ppi_score_threshold,
-                        chunk_size,
                         map_dir,
                         meta["pair"],
                         centers,
@@ -589,7 +606,7 @@ def evaluate_ppi(
                     rows.append(_prediction_row(meta, scores, ppi_score_threshold))
                 continue
 
-            output = model(residue_batch, chunk_size=chunk_size)
+            output = model(residue_batch)
             for index, meta in enumerate(metas):
                 scores = _head_scores_from_output(
                     output,
@@ -675,7 +692,6 @@ def main(args: DictConfig):
         )
 
     model_kwargs = build_model_kwargs(args, checkpoint_default=False)
-    chunk_size = resolve_chunk_size(args, default=32)
     model = ResOnly(**model_kwargs).to(device)
     checkpoint = torch.load(args.ckpt_dir, map_location=device)
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
@@ -693,7 +709,6 @@ def main(args: DictConfig):
         distance_bin_count=int(args.data.distance_bin_count),
         ppi_score_threshold=float(args.data.ppi_score_threshold),
         positive_weight=positive_weight,
-        chunk_size=chunk_size,
         map_dir=os.path.join(logging_dir, "maps"),
         max_full_length=max_full_length,
     )

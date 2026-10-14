@@ -1,8 +1,6 @@
 import torch
 from torch.nn import functional as F
 
-from src.model.components.outer_product_mean import chunk_layer
-
 # from src.utils.model_utils import (
 #     pad_at_dim,
 #     reshape_at_dim,
@@ -137,25 +135,8 @@ class PairTransition(torch.nn.Module):
             SwiGLU(),
         )
         self.linear_out = torch.nn.Linear(dim_inner, dim)
-    
-    def _transition(self, x, mask):
-        x = self.linear_out(self.swish_linear(x))
-        return x * mask[..., None]
 
-    @torch.jit.ignore
-    def _chunk(self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        chunk_size: int,
-    ) -> torch.Tensor:
-        return chunk_layer(
-            self._transition,
-            {"x": x, "mask": mask},
-            chunk_size=chunk_size,
-            no_batch_dims=len(x.shape[:-2]),
-        )
-
-    def forward(self, x, mask, chunk_size=None):
+    def forward(self, x, mask):
         """
         Args:
             x: Input sequence representation, shape [b, n, dim]
@@ -166,12 +147,8 @@ class PairTransition(torch.nn.Module):
         """
         if self.use_layer_norm:
             x = self.ln(x)
-
-        if chunk_size is not None:
-            x = self._chunk(x, mask, chunk_size)
-        else:
-            x = self._transition(x, mask)
-        return x
+        x = self.linear_out(self.swish_linear(x))
+        return x * mask[..., None]
 
 
 

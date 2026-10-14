@@ -143,9 +143,7 @@ class ResOnly(nn.Module):
     def forward(
         self,
         residue_batch: Dict[str, torch.Tensor],
-        chunk_size: Optional[int] = None,
     ) -> SurpassOutput:
-        chunk_size = _normalize_chunk_size(chunk_size)
         embedder_inputs = {
             key: value
             for key, value in residue_batch.items()
@@ -169,7 +167,6 @@ class ResOnly(nn.Module):
                 pair_repr,
                 mask,
                 pair_mask_float,
-                chunk_size,
             )
 
         pair_logits = self.pair_out_linear(self.pair_out_layernorm(pair_repr))
@@ -226,7 +223,6 @@ class ResOnly(nn.Module):
         pair_repr: torch.Tensor,
         mask: torch.Tensor,
         pair_mask_float: torch.Tensor,
-        chunk_size: Optional[int],
     ) -> torch.Tensor:
         pair_repr = pair_repr + self.outer_product_mean[layer_index](
             single_repr,
@@ -243,7 +239,6 @@ class ResOnly(nn.Module):
         pair_repr = pair_repr + self.pair_blocks[layer_index](
             pair_repr,
             pair_mask_float,
-            chunk_size=chunk_size,
         )
         return pair_repr
 
@@ -254,7 +249,6 @@ class ResOnly(nn.Module):
         pair_repr: torch.Tensor,
         mask: torch.Tensor,
         pair_mask_float: torch.Tensor,
-        chunk_size: Optional[int],
     ) -> torch.Tensor:
         use_checkpoint = (
             self.checkpoint_pair_blocks
@@ -268,7 +262,6 @@ class ResOnly(nn.Module):
                 pair_repr,
                 mask,
                 pair_mask_float,
-                chunk_size,
             )
 
         def _run(single, pair, node_mask, pair_mask):
@@ -278,7 +271,6 @@ class ResOnly(nn.Module):
                 pair,
                 node_mask,
                 pair_mask,
-                chunk_size,
             )
 
         return checkpoint(
@@ -309,12 +301,3 @@ def _masked_chain_mean(
     weight = selected.to(dtype=single_repr.dtype)
     denom = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (single_repr * weight[..., None]).sum(dim=1) / denom
-
-
-def _normalize_chunk_size(chunk_size: Optional[int]) -> Optional[int]:
-    if chunk_size is None:
-        return None
-    chunk_size = int(chunk_size)
-    if chunk_size <= 0:
-        return None
-    return chunk_size

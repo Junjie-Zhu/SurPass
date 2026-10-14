@@ -17,7 +17,6 @@ from src.train import (
     _cfg_get,
     _unpack_batch,
     build_model_kwargs,
-    resolve_chunk_size,
     resolve_cuda_device,
 )
 from src.utils.ddp_utils import seed_everything
@@ -196,7 +195,6 @@ def main(args: DictConfig):
         args.data.distance_bin_count,
     )
     last_bin = int(args.data.distance_bin_count) - 1
-    chunk_size = resolve_chunk_size(args, default=64)
     PREVIEW_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -207,7 +205,7 @@ def main(args: DictConfig):
     with torch.no_grad():
         for index, step_batch in enumerate(loader):
             residue_batch, labels = _unpack_batch(step_batch, device)
-            output = model(residue_batch, chunk_size=chunk_size)
+            output = model(residue_batch)
             pred_bins = output.pair_logits.argmax(dim=-1)
             valid_mask = output.pair_mask.to(dtype=torch.bool) & labels["label_2d_mask"].to(
                 dtype=torch.bool

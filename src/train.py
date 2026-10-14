@@ -377,14 +377,6 @@ def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
     }
 
 
-def resolve_chunk_size(cfg: DictConfig, default: int | None = 64) -> int | None:
-    value = _cfg_get(cfg, "performance.chunk_size", default=default)
-    if value is None:
-        return None
-    chunk_size = int(value)
-    return None if chunk_size <= 0 else chunk_size
-
-
 def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> dict:
     model_kwargs = dict(model_kwargs)
     distance_bin_count = int(distance_bin_count)
@@ -491,7 +483,6 @@ def train_epoch(
     inter_neg_per_pos: float = 0.0,
     dump_dir: str | None = None,
     epoch: int = 0,
-    chunk_size: int | None = None,
     ema_wrapper: EMAWrapper | None = None,
 ) -> dict[str, float]:
     model.train()
@@ -505,7 +496,7 @@ def train_epoch(
             break
         residue_batch, labels = _unpack_batch(step_batch, device)
 
-        output = model(residue_batch, chunk_size=chunk_size)
+        output = model(residue_batch)
         intra_mask, inter_mask = _region_masks(
             output.pair_mask,
             labels["label_2d_mask"],
@@ -603,7 +594,6 @@ def evaluate_epoch(
     contact_bins: int,
     max_batches: int | None = None,
     positive_weight: float = 1.0,
-    chunk_size: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     term_totals: dict[str, float] = {}
@@ -620,7 +610,7 @@ def evaluate_epoch(
             if max_batches is not None and step >= max_batches:
                 break
             residue_batch, labels = _unpack_batch(step_batch, device)
-            output = model(residue_batch, chunk_size=chunk_size)
+            output = model(residue_batch)
             intra_mask, inter_mask = _region_masks(
                 output.pair_mask,
                 labels["label_2d_mask"],
@@ -841,7 +831,6 @@ def main(args: DictConfig):
 
     model_kwargs = build_model_kwargs(args, checkpoint_default=True)
     n_contact_bins = int(model_kwargs["contact_bins"])
-    chunk_size = resolve_chunk_size(args, default=64)
     model = ResOnly(**model_kwargs).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = wrap_ddp(model, device)
@@ -891,8 +880,7 @@ def main(args: DictConfig):
     loss_weights = _build_loss_weights(args)
     log_info(
         f"Loss setup: contact_bins={n_contact_bins}, weights={loss_weights}, "
-        f"inter_neg_per_pos={float(_cfg_get(args, 'loss.inter_neg_per_pos', default=4.0))}, "
-        f"chunk_size={chunk_size}"
+        f"inter_neg_per_pos={float(_cfg_get(args, 'loss.inter_neg_per_pos', default=4.0))}"
     )
     optimizer = get_optimizer(
         model,
@@ -981,7 +969,6 @@ def main(args: DictConfig):
             inter_neg_per_pos=float(_cfg_get(args, "loss.inter_neg_per_pos", default=4.0)),
             dump_dir=logging_dir,
             epoch=crt_epoch,
-            chunk_size=chunk_size,
             ema_wrapper=ema_wrapper,
         )
 
@@ -1004,7 +991,6 @@ def main(args: DictConfig):
             device=device,
             contact_bins=n_contact_bins,
             positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
-            chunk_size=chunk_size,
         )
         if ema_wrapper is not None:
             ema_wrapper.restore()

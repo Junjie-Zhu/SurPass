@@ -122,6 +122,5 @@ hydra:
   output_subdir: null
   
 performance:
-  chunk_size: null
   checkpoint_pair_blocks: false
 

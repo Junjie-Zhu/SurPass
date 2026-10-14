@@ -44,7 +44,6 @@ model:
   num_classes: 64
 
 performance:
-  chunk_size: 32
   checkpoint_pair_blocks: false
 
 hydra:
