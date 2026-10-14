@@ -8,8 +8,6 @@ from torch.utils.data import Dataset
 
 from src.data.cropping import (
     DEFAULT_CONTACT_THRESHOLD_A,
-    DEFAULT_CROP_CONTIGUOUS_PROBABILITY,
-    DEFAULT_CROP_NEIGHBORHOOD_SIZE,
     DEFAULT_CROP_SIZE,
     crop_negative_pair,
     crop_positive_pair,
@@ -33,8 +31,6 @@ class PepoTrainDataset(Dataset):
         distance_bin_end: float = DISTANCE_BIN_END_A,
         distance_bin_count: int = DISTANCE_BIN_NUM,
         crop_size: int | None = DEFAULT_CROP_SIZE,
-        crop_neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
-        crop_contiguous_probability: float = DEFAULT_CROP_CONTIGUOUS_PROBABILITY,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
         require_labels: bool = True,
     ):
@@ -46,18 +42,12 @@ class PepoTrainDataset(Dataset):
         self.distance_bin_end = float(distance_bin_end)
         self.distance_bin_count = int(distance_bin_count)
         self.crop_size = None if crop_size is None else int(crop_size)
-        self.crop_neighborhood_size = int(crop_neighborhood_size)
-        self.crop_contiguous_probability = float(crop_contiguous_probability)
         self.contact_threshold = float(contact_threshold)
 
         if self.distance_bin_count <= 0:
             raise ValueError("distance_bin_count must be positive.")
         if self.crop_size is not None and self.crop_size <= 0:
             raise ValueError("crop_size must be positive when provided.")
-        if self.crop_neighborhood_size <= 0:
-            raise ValueError("crop_neighborhood_size must be positive.")
-        if not 0.0 <= self.crop_contiguous_probability <= 1.0:
-            raise ValueError("crop_contiguous_probability must be between 0 and 1.")
 
         self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
         required_columns = {"chain1", "chain2", "ppi_cluster_id"}
@@ -92,18 +82,10 @@ class PepoTrainDataset(Dataset):
         return p1_features, p2_features
 
     def get_positive_item(self, idx):
-        cluster_rows = self.cluster_to_rows[self.items[idx]]
-        order = list(range(len(cluster_rows)))
-        random.shuffle(order)
-        for row_index in order:
-            sample = self._positive_sample_from_row(cluster_rows.iloc[row_index])
-            if sample is not None:
-                if self.transform is not None:
-                    sample = self.transform(sample)
-                return sample
-        raise RuntimeError(
-            f"Cluster {self.items[idx]} has no structure with an inter-chain contact."
-        )
+        sample = self._positive_sample_from_row(self._sample_row(idx))
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
 
     def _positive_sample_from_row(self, row):
         p1_features, p2_features = self._load_pair_features(row)
@@ -111,26 +93,21 @@ class PepoTrainDataset(Dataset):
         pairwise_dist, pairwise_mask = self._load_pair_distance_and_mask(
             label_path, p1_features["mask"].shape[0], p2_features["mask"].shape[0]
         )
-        cropped = crop_positive_pair(
+        p1_features, p2_features, pairwise_dist, pairwise_mask, is_positive = crop_positive_pair(
             p1_features,
             p2_features,
             pairwise_dist,
             pairwise_mask,
             crop_size=self.crop_size,
-            crop_contiguous_probability=self.crop_contiguous_probability,
-            crop_neighborhood_size=self.crop_neighborhood_size,
             contact_threshold=self.contact_threshold,
         )
-        if cropped is None:
-            return None
-        p1_features, p2_features, pairwise_dist, pairwise_mask = cropped
         label_bins = distance_to_bins(
             pairwise_dist,
             bin_start=self.distance_bin_start,
             bin_end=self.distance_bin_end,
             bin_count=self.distance_bin_count,
         )
-        return (p1_features, p2_features, label_bins, pairwise_mask, True)
+        return (p1_features, p2_features, label_bins, pairwise_mask, is_positive)
 
     def get_negative_item(self, p1_idx: int, p2_idx: int):
         if self.items[p1_idx] == self.items[p2_idx]:

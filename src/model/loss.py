@@ -353,15 +353,77 @@ def noisy_or_over_partners(
 
 
 class ProteinBindLoss(nn.Module):
-    """BCE on the complex-level interaction logit."""
+    """BCE on the complex-level interaction logit.
+
+    ``pos_weight`` multiplies positive pairs. With roughly 1:1 sampling,
+    0.1 matches a 1:10 test set.
+    """
+
+    def __init__(self, pos_weight: float = 1.0):
+        super().__init__()
+        if float(pos_weight) <= 0.0:
+            raise ValueError("pos_weight must be positive.")
+        self.pos_weight = float(pos_weight)
 
     def forward(
         self,
         protein_logit: torch.Tensor,
         is_positive: torch.Tensor,
     ) -> torch.Tensor:
-        target = is_positive.reshape(-1).to(dtype=protein_logit.dtype)
-        return F.binary_cross_entropy_with_logits(protein_logit.reshape(-1), target)
+        logits = protein_logit.reshape(-1)
+        target = is_positive.reshape(-1).to(dtype=logits.dtype)
+        weight = torch.where(
+            target > 0.5,
+            logits.new_tensor(self.pos_weight),
+            logits.new_ones(()),
+        )
+        return F.binary_cross_entropy_with_logits(logits, target, weight=weight)
+
+
+class SampleTverskyLoss(nn.Module):
+    """Soft Tversky loss on one probability per protein pair.
+
+    Positive pairs are scaled by ``pos_weight`` in the true-positive and
+    false-negative terms. ``smooth`` stays near zero because a training
+    step only contains a few pairs.
+    """
+
+    def __init__(
+        self,
+        pos_weight: float = 1.0,
+        alpha: float = 0.7,
+        beta: float = 0.3,
+        smooth: float = 1e-6,
+    ):
+        super().__init__()
+        if float(pos_weight) <= 0.0:
+            raise ValueError("pos_weight must be positive.")
+        if float(smooth) < 0.0:
+            raise ValueError("smooth must be non-negative.")
+        self.pos_weight = float(pos_weight)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+
+    def forward(
+        self,
+        protein_logit: torch.Tensor,
+        is_positive: torch.Tensor,
+    ) -> torch.Tensor:
+        probability = torch.sigmoid(protein_logit.reshape(-1))
+        target = is_positive.reshape(-1).to(dtype=probability.dtype)
+        weighted_target = torch.where(
+            target > 0.5,
+            probability.new_tensor(self.pos_weight),
+            probability.new_zeros(()),
+        )
+        tp = (probability * weighted_target).sum()
+        fp = (probability * (1.0 - target)).sum()
+        fn = ((1.0 - probability) * weighted_target).sum()
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fn + self.beta * fp + self.smooth
+        )
+        return 1.0 - tversky
 
 
 class ConsistencyLoss(nn.Module):

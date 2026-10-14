@@ -149,6 +149,21 @@ def get_index_embedding(indices, edim, max_len=2056):
     return pos_embedding
 
 
+def within_chain_index(chain_index: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Sequential position 0..L-1 inside each chain, ignoring padding.
+
+    PDB residue numbers have gaps and are not what inference provides.
+    Both sides use this count of earlier valid residues on the same chain.
+    """
+    length = int(chain_index.shape[-1])
+    position = torch.arange(length, device=chain_index.device)
+    valid = mask.to(dtype=torch.bool)
+    same_chain = chain_index[:, :, None] == chain_index[:, None, :]
+    both_valid = valid[:, :, None] & valid[:, None, :]
+    earlier = position.view(1, 1, length) < position.view(1, length, 1)
+    return (same_chain & both_valid & earlier).to(dtype=torch.long).sum(dim=-1)
+
+
 def relative_position_encoding(
     token_index: torch.Tensor,
     residue_index: torch.Tensor,
@@ -230,10 +245,10 @@ class ResidueEmbedder(nn.Module):
         # residue features contain:
         # 1. plm embedding (single)
         # 2. residue type (single)
-        # 3. residue index (single)
+        # 3. within-chain sequential index (single)
         # 4. chain break per residue (single)
-        # 5. pairwise distance (pair)
-        # 6. relative position encoding (pair)
+        # 5. CALVADOS pair energy (pair; sequence, available at test time)
+        # 6. relative position encoding (pair), using the same sequential index
 
         super().__init__()
         self.dim_token = dim_token
@@ -245,10 +260,15 @@ class ResidueEmbedder(nn.Module):
         self.xt_pair_dist_dim = kwargs.get('xt_pair_dist_dim', 64)  # 0.5 A per bin
         self.plm_in_dim = kwargs.get('plm_in_dim', 1280)
         self.plm_out_dim = kwargs.get('plm_out_dim', 256)
+        self.index_emb_dim = int(kwargs.get("index_emb_dim", 128))
+        if self.index_emb_dim <= 0 or self.index_emb_dim % 2 != 0:
+            raise ValueError(
+                f"index_emb_dim must be a positive even integer, got {self.index_emb_dim}."
+            )
         
         self.plm_embedder = nn.Linear(self.plm_in_dim, self.plm_out_dim)
         
-        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + 1
+        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + 1 + self.index_emb_dim
         self.single_out = nn.Linear(single_dim, self.dim_token)
 
         pair_dim = self.xt_pair_dist_dim + 2 + 4 * (self.r_max + 1)
@@ -278,7 +298,12 @@ class ResidueEmbedder(nn.Module):
         **kwargs,
     ):
         plm_emb = self.plm_embedder(plm_emb)
-        
+        if residue_index.shape[:2] != chain_index.shape[:2]:
+            raise ValueError(
+                f"residue_index shape {tuple(residue_index.shape)} does not match "
+                f"chain_index shape {tuple(chain_index.shape)}."
+            )
+
         residue_type = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
         residue_type_emb = F.one_hot(residue_type, num_classes=NUM_RESIDUE_TYPES).to(
             dtype=plm_emb.dtype
@@ -286,12 +311,14 @@ class ResidueEmbedder(nn.Module):
 
         chain_break_emb = (chain_index[:, 1:] != chain_index[:, :-1]).float()  # [b, n-1]
         chain_break_emb = F.pad(chain_break_emb, (0, 1), mode="constant", value=0.0)[..., None]  # [b, n, 1]
-        
+
+        seq_index = within_chain_index(chain_index, mask)
+        index_emb = get_index_embedding(seq_index, self.index_emb_dim).to(dtype=plm_emb.dtype)
         token_index = torch.arange(
-            residue_index.shape[1], device=residue_index.device, dtype=residue_index.dtype
-        ).unsqueeze(0).expand_as(residue_index)
+            seq_index.shape[1], device=seq_index.device, dtype=seq_index.dtype
+        ).unsqueeze(0).expand_as(seq_index)
         rel_pos_emb = relative_position_encoding(
-            token_index, residue_index, chain_index, mask, self.r_max
+            token_index, seq_index, chain_index, mask, self.r_max
         )
 
         expected_shape = (*residue_position.shape[:2], residue_position.shape[1], self.xt_pair_dist_dim)
@@ -301,7 +328,7 @@ class ResidueEmbedder(nn.Module):
         ).squeeze(-3)
 
         single_repr = self.single_out(
-            torch.cat([plm_emb, residue_type_emb, chain_break_emb], dim=-1)
+            torch.cat([plm_emb, residue_type_emb, chain_break_emb, index_emb], dim=-1)
             * mask[..., None]
         )
         pair_mask = mask[..., None] * mask[..., None, :]

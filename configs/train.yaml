@@ -43,7 +43,6 @@ data:
   distance_bin_count: 64
   contact_threshold: 8.0
   crop_size: 128
-  crop_contiguous_prob: 0.5
 
 model:
   n_layers: 8
@@ -62,32 +61,17 @@ model:
   xt_pair_dist_min: 2.0
   xt_pair_dist_max: 22.0
   xt_pair_dist_dim: 64
-  dim_opm_inner: 128
-  dim_triangle_hidden: 128
   num_classes: 64
 
 loss:
-  intra: 0.3
-  inter: 0.7
-  inter_neg_per_pos: 10.0
-  focal:
+  bce:
     weight: 1.0
-    gamma: 1.5
-    alpha: 5.0
-  mae:
-    weight: 0.2
+    pos_weight: 0.1
   tversky:
     weight: 1.0
     alpha: 0.7
     beta: 0.3
-  residue_bind:
-    weight: 1.0
-    neg_per_pos: 0.0
-    negative_pair_weight: 0.25
-  protein:
-    weight: 1.0
-  consistency:
-    weight: 0.1
+    smooth: 1.0e-6
 
 optimizer:
   lr: 0.0005
@@ -120,7 +104,4 @@ hydra:
   run:
     dir: .
   output_subdir: null
-  
-performance:
-  checkpoint_pair_blocks: false
 

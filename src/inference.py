@@ -13,15 +13,12 @@ from tqdm import tqdm
 
 from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.collate import collate_concatenated_pairs, get_dataloader
-from src.model.loss import distance_bin_centers
 from src.model.surpass import ResOnly
 from src.train import (
     _binary_classification_metrics,
     _cfg_get,
     build_model_kwargs,
-    contact_bin_count,
     log_info,
-    pair_bind_scores,
     resolve_cuda_device,
     resolve_dist_backend,
     to_device,
@@ -30,18 +27,12 @@ from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 from src.utils.ppi_windows import plan_ppi_windows
 
 
-PPI_HEADS = ("protein", "residue", "pair")
+PPI_HEADS = ("protein",)
 PREDICTION_COLUMNS = [
     "Protein pairs",
     "Category",
     "p_protein",
     "pred_protein",
-    "p_residue",
-    "pred_residue",
-    "n_pos_residues",
-    "p_pair",
-    "pred_pair",
-    "n_inter_contacts",
     "n_forwards",
 ]
 
@@ -302,37 +293,6 @@ def write_predictions(path: str | Path, rows: list[dict[str, Any]]) -> None:
     frame.to_csv(path, sep="\t", index=False)
 
 
-def distance_map_from_logits(
-    pair_logits: torch.Tensor,
-    centers: torch.Tensor,
-) -> torch.Tensor:
-    bins = pair_logits.argmax(dim=-1)
-    centers = centers.to(device=bins.device)
-    return centers[bins.long()]
-
-
-def write_pair_maps(
-    directory: str | Path,
-    pair_name: str,
-    residue_probability: torch.Tensor,
-    distance: torch.Tensor,
-    p1_length: int,
-) -> Path:
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    safe_name = str(pair_name).replace(os.sep, "_").replace("/", "_")
-    path = directory / f"{safe_name}.pt"
-    torch.save(
-        {
-            "residue_probability": residue_probability.detach().to(device="cpu", dtype=torch.float32),
-            "distance": distance.detach().to(device="cpu", dtype=torch.float32),
-            "p1_length": int(p1_length),
-        },
-        path,
-    )
-    return path
-
-
 def write_metrics(path: str | Path, metrics_by_head: dict[str, dict[str, Any]]) -> None:
     frame = pd.DataFrame(
         [
@@ -398,12 +358,6 @@ def _prediction_row(
         "Category": bool(meta["label"]),
         "p_protein": float(scores["p_protein"]),
         "pred_protein": float(scores["p_protein"]) >= float(ppi_score_threshold),
-        "p_residue": float(scores["p_residue"]),
-        "pred_residue": int(scores["n_pos_residues"]) >= 1,
-        "n_pos_residues": int(scores["n_pos_residues"]),
-        "p_pair": float(scores["p_pair"]),
-        "pred_pair": int(scores["n_inter_contacts"]) >= 1,
-        "n_inter_contacts": int(scores["n_inter_contacts"]),
         "n_forwards": int(scores["n_forwards"]),
     }
     if "index" in meta:
@@ -411,63 +365,18 @@ def _prediction_row(
     return row
 
 
+def _protein_probability(output, index: int = 0) -> float:
+    return float(torch.sigmoid(output.protein_logit.reshape(-1))[index].item())
+
+
 def _head_scores_from_output(
     output,
-    residue_batch: dict[str, torch.Tensor],
     index: int,
-    contact_bins: int,
-    ppi_score_threshold: float,
 ) -> dict[str, float | int]:
-    p1_length = int(residue_batch["p1_length"][index].item())
-    p2_length = int(residue_batch["p2_length"][index].item())
-    length = p1_length + p2_length
-    residue_prob = torch.sigmoid(output.residue_logits[index, :length])
-    residue_mask = residue_batch["mask"][index, :length].to(dtype=torch.bool)
-    residue_prob = residue_prob.masked_fill(~residue_mask, 0.0)
-    if bool(residue_mask.any().item()):
-        p_residue = float(residue_prob[residue_mask].max().item())
-    else:
-        p_residue = 0.0
-    pair_score, n_contacts = pair_bind_scores(
-        output.pair_logits[index : index + 1],
-        output.pair_mask[index : index + 1],
-        p1_length=residue_batch["p1_length"][index : index + 1],
-        p2_length=residue_batch["p2_length"][index : index + 1],
-        contact_bins=contact_bins,
-        ppi_score_threshold=ppi_score_threshold,
-    )
     return {
-        "p_protein": float(torch.sigmoid(output.protein_logit.reshape(-1))[index].item()),
-        "p_residue": p_residue,
-        "n_pos_residues": int((residue_prob.ge(float(ppi_score_threshold)) & residue_mask).sum().item()),
-        "p_pair": float(pair_score.reshape(-1)[0].item()),
-        "n_inter_contacts": int(n_contacts.reshape(-1)[0].item()),
+        "p_protein": _protein_probability(output, index),
         "n_forwards": 1,
     }
-
-
-def _write_sample_maps(
-    map_dir: str | Path,
-    pair_name: str,
-    output,
-    residue_batch: dict[str, torch.Tensor],
-    index: int,
-    centers: torch.Tensor,
-) -> None:
-    p1_length = int(residue_batch["p1_length"][index].item())
-    p2_length = int(residue_batch["p2_length"][index].item())
-    length = p1_length + p2_length
-    residue_mask = residue_batch["mask"][index, :length].to(dtype=torch.bool)
-    pair_valid = output.pair_mask[index, :length, :length].to(dtype=torch.bool)
-    residue_probability = torch.sigmoid(output.residue_logits[index, :length])
-    distance = distance_map_from_logits(output.pair_logits[index, :length, :length], centers)
-    write_pair_maps(
-        map_dir,
-        pair_name,
-        residue_probability.masked_fill(~residue_mask, float("nan")),
-        distance.masked_fill(~pair_valid, float("nan")),
-        p1_length,
-    )
 
 
 def _score_pair_windows(
@@ -475,70 +384,17 @@ def _score_pair_windows(
     residue_batch: dict[str, torch.Tensor],
     index: int,
     max_full_length: int | None,
-    contact_bins: int,
-    ppi_score_threshold: float,
-    map_dir: str | Path | None,
-    pair_name: str,
-    centers: torch.Tensor,
 ) -> dict[str, float | int]:
     p1_length = int(residue_batch["p1_length"][index].item())
     p2_length = int(residue_batch["p2_length"][index].item())
     windows = plan_ppi_windows(p1_length, p2_length, max_full_length)
-    device = residue_batch["mask"].device
-    p1_prob = torch.zeros(p1_length, device=device)
-    p2_prob = torch.zeros(p2_length, device=device)
-    p1_mask = residue_batch["mask"][index, :p1_length].to(dtype=torch.bool)
-    p2_mask = residue_batch["mask"][index, p1_length : p1_length + p2_length].to(dtype=torch.bool)
     protein_score = 0.0
-    pair_score = 0.0
-    n_contacts = 0
-    threshold = float(ppi_score_threshold)
-
     for span_1, span_2 in windows:
         window_batch = _window_residue_batch(residue_batch, index, span_1, span_2)
         output = model(window_batch)
-        start_1, end_1 = span_1
-        start_2, end_2 = span_2
-        width_1 = end_1 - start_1
-        width_2 = end_2 - start_2
-        probability = torch.sigmoid(output.residue_logits[0])
-        window_mask = window_batch["mask"][0].to(dtype=torch.bool)
-        probability = probability.masked_fill(~window_mask, 0.0)
-        p1_prob[start_1:end_1] = torch.maximum(p1_prob[start_1:end_1], probability[:width_1])
-        p2_prob[start_2:end_2] = torch.maximum(
-            p2_prob[start_2:end_2],
-            probability[width_1 : width_1 + width_2],
-        )
-        protein_score = max(
-            protein_score,
-            float(torch.sigmoid(output.protein_logit.reshape(-1))[0].item()),
-        )
-        window_pair, window_contacts = pair_bind_scores(
-            output.pair_logits,
-            output.pair_mask,
-            p1_length=window_batch["p1_length"],
-            p2_length=window_batch["p2_length"],
-            contact_bins=contact_bins,
-            ppi_score_threshold=threshold,
-        )
-        pair_score = max(pair_score, float(window_pair.reshape(-1)[0].item()))
-        n_contacts += int(window_contacts.reshape(-1)[0].item())
-        if len(windows) == 1 and map_dir is not None:
-            _write_sample_maps(map_dir, pair_name, output, window_batch, 0, centers)
-
-    residue_values = []
-    if bool(p1_mask.any().item()):
-        residue_values.append(float(p1_prob[p1_mask].max().item()))
-    if bool(p2_mask.any().item()):
-        residue_values.append(float(p2_prob[p2_mask].max().item()))
-    n_pos = int((p1_prob.ge(threshold) & p1_mask).sum().item())
-    n_pos += int((p2_prob.ge(threshold) & p2_mask).sum().item())
+        protein_score = max(protein_score, _protein_probability(output))
     return {
         "p_protein": protein_score,
-        "p_residue": max(residue_values) if residue_values else 0.0,
-        "n_pos_residues": n_pos,
-        "p_pair": pair_score,
-        "n_inter_contacts": n_contacts,
         "n_forwards": len(windows),
     }
 
@@ -547,27 +403,11 @@ def evaluate_ppi(
     model: torch.nn.Module,
     loader,
     device: torch.device,
-    contact_threshold: float,
-    distance_bin_start: float,
-    distance_bin_end: float,
-    distance_bin_count: int,
     ppi_score_threshold: float,
     positive_weight: float = 1.0,
-    map_dir: str | Path | None = None,
     max_full_length: int | None = 1024,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
     model.eval()
-    contact_bins = contact_bin_count(
-        contact_threshold,
-        distance_bin_start,
-        distance_bin_end,
-        distance_bin_count,
-    )
-    centers = distance_bin_centers(
-        distance_bin_start,
-        distance_bin_end,
-        distance_bin_count,
-    )
     rows: list[dict[str, Any]] = []
     desc = (
         "Inference"
@@ -597,34 +437,14 @@ def evaluate_ppi(
                         residue_batch,
                         index,
                         max_full_length,
-                        contact_bins,
-                        ppi_score_threshold,
-                        map_dir,
-                        meta["pair"],
-                        centers,
                     )
                     rows.append(_prediction_row(meta, scores, ppi_score_threshold))
                 continue
 
             output = model(residue_batch)
             for index, meta in enumerate(metas):
-                scores = _head_scores_from_output(
-                    output,
-                    residue_batch,
-                    index,
-                    contact_bins,
-                    ppi_score_threshold,
-                )
+                scores = _head_scores_from_output(output, index)
                 rows.append(_prediction_row(meta, scores, ppi_score_threshold))
-                if map_dir is not None:
-                    _write_sample_maps(
-                        map_dir,
-                        meta["pair"],
-                        output,
-                        residue_batch,
-                        index,
-                        centers,
-                    )
 
     return rows, metrics_for_heads(rows, positive_weight=positive_weight)
 
@@ -703,13 +523,8 @@ def main(args: DictConfig):
         model=model,
         loader=loader,
         device=device,
-        contact_threshold=float(args.data.contact_threshold),
-        distance_bin_start=float(args.data.distance_bin_start),
-        distance_bin_end=float(args.data.distance_bin_end),
-        distance_bin_count=int(args.data.distance_bin_count),
         ppi_score_threshold=float(args.data.ppi_score_threshold),
         positive_weight=positive_weight,
-        map_dir=os.path.join(logging_dir, "maps"),
         max_full_length=max_full_length,
     )
     rows = gather_rank_prediction_rows(rows)
@@ -738,7 +553,6 @@ def main(args: DictConfig):
         )
         print(f"Wrote {predictions_path}")
         print(f"Wrote {metrics_path}")
-        print(f"Wrote residue probabilities and distance maps to {os.path.join(logging_dir, 'maps')}")
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

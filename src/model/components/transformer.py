@@ -374,11 +374,17 @@ class TransitionADALN(torch.nn.Module):
 
 
 class ResidueTransformer(torch.nn.Module):
+    """Pair-biased attention and a plain transition, both pre-normalized.
+
+    The pair tensor is an attention bias only. It is not conditioned on and
+    is not updated here. Output projections start at zero so the residual
+    stack is the identity at initialization.
+    """
+
     def __init__(
-        self, 
+        self,
         dim_token,
         dim_pair,
-        dim_cond,
         nheads,
         residual_mha,
         residual_transition,
@@ -388,57 +394,53 @@ class ResidueTransformer(torch.nn.Module):
         expansion_factor=2,
     ):
         super().__init__()
-        self.use_attn_pair_bias = use_attn_pair_bias
+        if not use_attn_pair_bias:
+            raise ValueError(
+                "Residue updates are biased by the initial pair representation. "
+                "Set use_attn_pair_bias=true."
+            )
         self.residual_mha = residual_mha
         self.residual_transition = residual_transition
+        dim_head = int(dim_token // nheads)
+        self.mha = PairBiasAttention(
+            node_dim=dim_token,
+            dim_head=dim_head,
+            heads=nheads,
+            bias=True,
+            dim_out=dim_token,
+            qkln=use_qkln,
+            pair_dim=dim_pair,
+            dropout=dropout,
+        )
+        self.transition = Transition(
+            dim=dim_token,
+            expansion_factor=expansion_factor,
+            layer_norm=True,
+        )
+        nn.init.zeros_(self.mha.to_out_node.weight)
+        if self.mha.to_out_node.bias is not None:
+            nn.init.zeros_(self.mha.to_out_node.bias)
+        nn.init.zeros_(self.transition.linear_out.weight)
+        if self.transition.linear_out.bias is not None:
+            nn.init.zeros_(self.transition.linear_out.bias)
 
-        if self.use_attn_pair_bias:
-            self.mha = MultiHeadBiasedAttentionADALN_MM(
-                dim_token=dim_token,
-                dim_pair=dim_pair,
-                nheads=nheads,
-                dim_cond=dim_cond,
-                use_qkln=use_qkln,
-                dropout=dropout,
-            )
-        else:
-            self.mha = MultiHeadAttentionADALN(
-                dim_token=dim_token,
-                nheads=nheads,
-                dim_cond=dim_cond,
-                dropout=dropout,
-            )
-
-        self.transition = TransitionADALN(
-            dim=dim_token, dim_cond=dim_cond, expansion_factor=expansion_factor)
-        
-    def _apply_mha(self, x, pair_rep, cond, mask):
-        if self.use_attn_pair_bias:
-            x_attn = self.mha(x, pair_rep, cond, mask)
-        else:
-            x_attn = self.mha(x, cond, mask)
-        if self.residual_mha:
-            x_attn = x_attn + x
-        return x_attn * mask[..., None]
-    
-    def _apply_transition(self, x, cond, mask):
-        x_tr = self.transition(x, cond, mask)
-        if self.residual_transition:
-            x_tr = x_tr + x
-        return x_tr * mask[..., None]
-    
-    def forward(self, x, pair_rep, cond, mask):
+    def forward(self, x, pair_rep, mask):
         """
         Args:
             x: Input sequence representation, shape [b, n, dim_token]
-            cond: Conditioning variables, shape [b, n, dim_cond]
-            pair_rep: Pair represnetation, shape [b, n, n, dim_pair]
+            pair_rep: Static pair bias, shape [b, n, n, dim_pair]
             mask: Binary mask, shape [b, n]
         """
         x = x * mask[..., None]
-        x = self._apply_mha(x, pair_rep, cond, mask)
-        x = self._apply_transition(x, cond, mask)
-        return x * mask[..., None]
+        pair_mask = mask.to(dtype=torch.bool)[:, :, None] & mask.to(dtype=torch.bool)[:, None, :]
+        x_attn = self.mha(node_feats=x, pair_feats=pair_rep, mask=pair_mask)
+        if self.residual_mha:
+            x_attn = x_attn + x
+        x = x_attn * mask[..., None]
+        x_transition = self.transition(x, mask)
+        if self.residual_transition:
+            x_transition = x_transition + x
+        return x_transition * mask[..., None]
 
 
 class AtomEncoder(torch.nn.Module):

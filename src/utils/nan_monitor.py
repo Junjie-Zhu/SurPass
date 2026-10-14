@@ -17,12 +17,8 @@ INPUT_KEYS = (
     "chain_index",
 )
 LABEL_KEYS = ("label_2d_bins", "label_2d_mask", "is_positive")
-WATCH_ATTRS = ("residue_embedder", "pair_out_layernorm", "pair_out_linear")
-WATCH_LISTS = (
-    "residue_blocks",
-    "outer_product_mean",
-    "pair_blocks",
-)
+WATCH_ATTRS = ("residue_embedder", "protein_head")
+WATCH_LISTS = ("residue_blocks",)
 
 
 class NonFiniteTrainingError(RuntimeError):

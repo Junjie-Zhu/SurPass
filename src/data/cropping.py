@@ -2,12 +2,10 @@ import random
 
 import torch
 
-from src.data.labels import inter_chain_contact_mask
+from src.data.labels import has_inter_chain_contact
 
 DEFAULT_CROP_SIZE = 256
-DEFAULT_CROP_NEIGHBORHOOD_SIZE = 10
 DEFAULT_CONTACT_THRESHOLD_A = 8.0
-DEFAULT_CROP_CONTIGUOUS_PROBABILITY = 0.3
 
 
 def select_contiguous_crop_indices(
@@ -23,116 +21,6 @@ def select_contiguous_crop_indices(
         start = random.randint(0, max_start)
     start = max(0, min(int(start), max_start))
     return torch.arange(start, start + crop_size, dtype=torch.long)
-
-
-def select_centered_contiguous_crop_indices(
-    length: int,
-    crop_size: int,
-    center: int,
-) -> torch.Tensor:
-    if length <= crop_size:
-        return torch.arange(length, dtype=torch.long)
-    start = int(center) - int(crop_size) // 2
-    return select_contiguous_crop_indices(length, crop_size, start=start)
-
-
-def _fill_crop_indices(selected: set[int], length: int, crop_size: int) -> set[int]:
-    filled = set(selected)
-    left = min(filled)
-    right = max(filled)
-    while len(filled) < crop_size and (left > 0 or right + 1 < length):
-        if left > 0:
-            left -= 1
-            filled.add(left)
-            if len(filled) >= crop_size:
-                break
-        if right + 1 < length and len(filled) < crop_size:
-            right += 1
-            filled.add(right)
-    if len(filled) < crop_size:
-        for idx in range(length):
-            if idx not in filled:
-                filled.add(idx)
-                if len(filled) >= crop_size:
-                    break
-    return filled
-
-
-def _gather_neighbor_indices(
-    seeds: list[int],
-    length: int,
-    crop_size: int,
-    neighborhood_size: int,
-) -> torch.Tensor:
-    if length <= crop_size:
-        return torch.arange(length, dtype=torch.long)
-
-    selected: set[int] = set()
-    window_size = max(1, int(neighborhood_size))
-    for seed in seeds:
-        seed = int(seed)
-        if seed not in selected:
-            if len(selected) >= crop_size:
-                break
-            selected.add(seed)
-        start = max(0, min(seed - window_size // 2, length - window_size))
-        end = min(length, start + window_size)
-        window = list(range(start, end))
-        new_indices = [idx for idx in window if idx not in selected]
-        if len(selected) + len(new_indices) > crop_size:
-            break
-        selected.update(new_indices)
-        if len(selected) >= crop_size:
-            break
-
-    if not selected:
-        return select_contiguous_crop_indices(length, crop_size)
-
-    target = min(int(length), int(crop_size))
-    if len(selected) < target:
-        selected = _fill_crop_indices(selected, length, target)
-    return torch.tensor(sorted(selected), dtype=torch.long)
-
-
-def select_interface_crop_indices(
-    contacts: torch.Tensor,
-    n1: int,
-    n2: int,
-    crop_size: int,
-    neighborhood_size: int = DEFAULT_CROP_NEIGHBORHOOD_SIZE,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if n1 <= crop_size and n2 <= crop_size:
-        return torch.arange(n1, dtype=torch.long), torch.arange(n2, dtype=torch.long)
-
-    order = list(range(int(contacts.shape[0])))
-    random.shuffle(order)
-
-    p1_selected = _gather_neighbor_indices(
-        [int(contacts[i, 0]) for i in order],
-        length=n1,
-        crop_size=crop_size,
-        neighborhood_size=neighborhood_size,
-    )
-    p2_selected = _gather_neighbor_indices(
-        [int(contacts[i, 1]) for i in order],
-        length=n2,
-        crop_size=crop_size,
-        neighborhood_size=neighborhood_size,
-    )
-    return p1_selected, p2_selected
-
-
-def select_contact_centered_crop_indices(
-    contacts: torch.Tensor,
-    n1: int,
-    n2: int,
-    crop_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    choice = contacts[random.randrange(int(contacts.shape[0]))]
-    return (
-        select_centered_contiguous_crop_indices(n1, crop_size, int(choice[0])),
-        select_centered_contiguous_crop_indices(n2, crop_size, int(choice[1])),
-    )
 
 
 def slice_complex_features(features: dict, indices: torch.Tensor) -> dict:
@@ -170,50 +58,30 @@ def crop_positive_pair(
     pairwise_mask: torch.Tensor,
     *,
     crop_size: int | None,
-    crop_contiguous_probability: float,
-    crop_neighborhood_size: int,
     contact_threshold: float,
-) -> tuple[dict, dict, torch.Tensor, torch.Tensor] | None:
+) -> tuple[dict, dict, torch.Tensor, torch.Tensor, bool]:
+    """Contiguous crop of both chains. A window with no contact is negative."""
     p1_length = int(p1_features["mask"].shape[0])
-    contact_mask = inter_chain_contact_mask(
+    if crop_size is not None:
+        p1_idx = select_contiguous_crop_indices(p1_length, crop_size)
+        p2_idx = select_contiguous_crop_indices(int(p2_features["mask"].shape[0]), crop_size)
+        p1_features, p2_features, pairwise_dist, pairwise_mask = _slice_pair_maps(
+            p1_features,
+            p2_features,
+            pairwise_dist,
+            pairwise_mask,
+            p1_idx,
+            p2_idx,
+            p1_length,
+        )
+        p1_length = int(p1_features["mask"].shape[0])
+    is_positive = has_inter_chain_contact(
         pairwise_dist,
         pairwise_mask,
         p1_length,
         contact_threshold,
     )
-    contacts = torch.nonzero(contact_mask, as_tuple=False)
-    if int(contacts.shape[0]) == 0:
-        return None
-    if crop_size is None:
-        return p1_features, p2_features, pairwise_dist, pairwise_mask
-
-    n1, n2 = int(contact_mask.shape[0]), int(contact_mask.shape[1])
-    probability = float(crop_contiguous_probability)
-    use_contiguous = probability >= 1.0 or (probability > 0.0 and random.random() < probability)
-    if use_contiguous:
-        p1_idx, p2_idx = select_contact_centered_crop_indices(
-            contacts,
-            n1,
-            n2,
-            crop_size,
-        )
-    else:
-        p1_idx, p2_idx = select_interface_crop_indices(
-            contacts,
-            n1,
-            n2,
-            crop_size,
-            neighborhood_size=crop_neighborhood_size,
-        )
-    return _slice_pair_maps(
-        p1_features,
-        p2_features,
-        pairwise_dist,
-        pairwise_mask,
-        p1_idx,
-        p2_idx,
-        p1_length,
-    )
+    return p1_features, p2_features, pairwise_dist, pairwise_mask, is_positive
 
 
 def crop_negative_pair(
