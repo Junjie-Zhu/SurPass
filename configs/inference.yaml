@@ -5,10 +5,10 @@ deterministic: false
 ckpt_dir: null
 
 data:
-  root_dir: /lustre/home/acct-clschf/clschf/jjzhu/datasets/ppi_dataset/pdb_metadata
+  root_dir: /groups/sbinlab/clschf/datasets/PDB_PPI
   test_set_tsv: ${data.root_dir}/test_set.tsv
   fasta_path: ${data.root_dir}/test_set.fasta
-  embedding_dir: ${data.root_dir}/embeddings
+  embedding_dir: ${data.root_dir}/test_embeddings
   batch_size: 1
   num_workers: 0
   pin_memory: true
@@ -20,7 +20,7 @@ data:
   ppi_score_threshold: 0.5
 
 metrics:
-  positive_weight: 1.0
+  positive_weight: 0.01
 
 model:
   n_layers: 8
@@ -33,8 +33,8 @@ model:
   use_qkln: true
   dropout: 0.0
   expansion_factor: 2
-  plm_in_dim: 1280
-  plm_out_dim: 256
+  plm_in_dim: 2560
+  plm_out_dim: 512
   r_max: 32
   xt_pair_dist_min: 2.0
   xt_pair_dist_max: 22.0

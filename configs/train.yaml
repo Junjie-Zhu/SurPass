@@ -68,7 +68,7 @@ loss:
     weight: 1.0
     pos_weight: 0.1
   tversky:
-    weight: 1.0
+    weight: 0.1
     alpha: 0.7
     beta: 0.3
     smooth: 1.0e-6
@@ -83,8 +83,8 @@ optimizer:
   warmup_steps: 500
   decay_every_n_steps: 15000
   decay_factor: 0.95
-  grad_accum_steps: 4
-  max_grad_norm: 1.0
+  grad_accum_steps: 1
+  max_grad_norm: 0.0
 
 metrics:
   positive_weight: 1.0

@@ -24,16 +24,13 @@ from src.train import (
     to_device,
 )
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
-from src.utils.ppi_windows import plan_ppi_windows
 
 
-PPI_HEADS = ("protein",)
 PREDICTION_COLUMNS = [
     "Protein pairs",
     "Category",
     "p_protein",
     "pred_protein",
-    "n_forwards",
 ]
 
 
@@ -151,10 +148,16 @@ class InferencePairDataset(Dataset):
         test_set_tsv: str | Path,
         fasta_path: str | Path,
         embedding_dir: str | Path,
+        max_full_length: int | None = None,
     ):
         self.test_set_tsv = Path(test_set_tsv)
         self.fasta_path = Path(fasta_path)
         self.embedding_dir = Path(embedding_dir)
+        self.max_full_length = None if max_full_length is None else int(max_full_length)
+        if self.max_full_length is not None and self.max_full_length <= 0:
+            raise ValueError(
+                f"max_full_length must be positive, got {self.max_full_length}."
+            )
         metadata = pd.read_csv(self.test_set_tsv, sep="\t")
         if "Protein pairs" not in metadata.columns:
             raise ValueError("Test set TSV is missing the 'Protein pairs' column.")
@@ -163,6 +166,7 @@ class InferencePairDataset(Dataset):
 
         self._feature_cache: dict[str, dict[str, torch.Tensor]] = {}
         self.items: list[dict[str, Any]] = []
+        self.dropped_pairs: list[str] = []
         for _, row in metadata.iterrows():
             pair = str(row["Protein pairs"]).strip()
             protein_1, protein_2 = parse_protein_pair(pair)
@@ -172,6 +176,10 @@ class InferencePairDataset(Dataset):
                 raise KeyError(f"Missing FASTA sequence for {protein_2}")
             sequence_1 = sequences[protein_1]
             sequence_2 = sequences[protein_2]
+            full_length = len(sequence_1) + len(sequence_2)
+            if self.max_full_length is not None and full_length > self.max_full_length:
+                self.dropped_pairs.append(pair)
+                continue
             self.items.append(
                 {
                     "pair": pair,
@@ -253,18 +261,12 @@ def metrics_from_prediction_rows(
     }
 
 
-def metrics_for_heads(
-    rows: list[dict[str, Any]],
-    positive_weight: float = 1.0,
-) -> dict[str, dict[str, float]]:
-    return {
-        head: metrics_from_prediction_rows(
-            rows,
-            f"p_{head}",
-            positive_weight=positive_weight,
-        )
-        for head in PPI_HEADS
-    }
+def protein_metric_weights(configured_weight: float) -> list[float]:
+    weights = [1.0]
+    configured_weight = float(configured_weight)
+    if configured_weight != 1.0:
+        weights.append(configured_weight)
+    return weights
 
 
 def gather_rank_prediction_rows(local_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -293,72 +295,37 @@ def write_predictions(path: str | Path, rows: list[dict[str, Any]]) -> None:
     frame.to_csv(path, sep="\t", index=False)
 
 
-def write_metrics(path: str | Path, metrics_by_head: dict[str, dict[str, Any]]) -> None:
+def write_metrics(
+    path: str | Path,
+    metrics_by_weight: dict[float, dict[str, Any]],
+) -> None:
     frame = pd.DataFrame(
         [
             {
-                "head": head,
-                "AUROC": metrics_by_head[head]["auroc"],
-                "AUPRC": metrics_by_head[head]["auprc"],
-                "N": metrics_by_head[head]["n"],
-                "N_pos": metrics_by_head[head]["n_pos"],
-                "N_neg": metrics_by_head[head]["n_neg"],
+                "head": "protein",
+                "positive_weight": weight,
+                "AUROC": metrics["auroc"],
+                "AUPRC": metrics["auprc"],
+                "N": metrics["n"],
+                "N_pos": metrics["n_pos"],
+                "N_neg": metrics["n_neg"],
             }
-            for head in PPI_HEADS
+            for weight, metrics in metrics_by_weight.items()
         ]
     )
     frame.to_csv(path, index=False)
 
 
-def _slice_features(
-    residue_batch: dict[str, torch.Tensor],
-    index: int,
-    start: int,
-    end: int,
-) -> dict[str, torch.Tensor]:
-    features: dict[str, torch.Tensor] = {}
-    for key, value in residue_batch.items():
-        if key in {"p1_length", "p2_length"} or not isinstance(value, torch.Tensor):
-            continue
-        features[key] = value[index, start:end]
-    return features
-
-
-def _window_residue_batch(
-    residue_batch: dict[str, torch.Tensor],
-    index: int,
-    span_1: tuple[int, int],
-    span_2: tuple[int, int],
-) -> dict[str, torch.Tensor]:
-    n1 = int(residue_batch["p1_length"][index].item())
-    start_1, end_1 = span_1
-    start_2, end_2 = span_2
-    protein = _slice_features(residue_batch, index, start_1, end_1)
-    peptide = _slice_features(residue_batch, index, n1 + start_2, n1 + end_2)
-    return collate_concatenated_pairs([protein], [peptide])
-
-
-def _batch_exceeds_budget(
-    residue_batch: dict[str, torch.Tensor],
-    max_full_length: int | None,
-) -> bool:
-    if max_full_length is None:
-        return False
-    lengths = residue_batch["p1_length"] + residue_batch["p2_length"]
-    return bool((lengths > int(max_full_length)).any().item())
-
-
 def _prediction_row(
     meta: dict[str, Any],
-    scores: dict[str, float | int],
+    probability: float,
     ppi_score_threshold: float,
 ) -> dict[str, Any]:
     row = {
         "Protein pairs": meta["pair"],
         "Category": bool(meta["label"]),
-        "p_protein": float(scores["p_protein"]),
-        "pred_protein": float(scores["p_protein"]) >= float(ppi_score_threshold),
-        "n_forwards": int(scores["n_forwards"]),
+        "p_protein": float(probability),
+        "pred_protein": float(probability) >= float(ppi_score_threshold),
     }
     if "index" in meta:
         row["_index"] = meta["index"]
@@ -369,44 +336,12 @@ def _protein_probability(output, index: int = 0) -> float:
     return float(torch.sigmoid(output.protein_logit.reshape(-1))[index].item())
 
 
-def _head_scores_from_output(
-    output,
-    index: int,
-) -> dict[str, float | int]:
-    return {
-        "p_protein": _protein_probability(output, index),
-        "n_forwards": 1,
-    }
-
-
-def _score_pair_windows(
-    model: torch.nn.Module,
-    residue_batch: dict[str, torch.Tensor],
-    index: int,
-    max_full_length: int | None,
-) -> dict[str, float | int]:
-    p1_length = int(residue_batch["p1_length"][index].item())
-    p2_length = int(residue_batch["p2_length"][index].item())
-    windows = plan_ppi_windows(p1_length, p2_length, max_full_length)
-    protein_score = 0.0
-    for span_1, span_2 in windows:
-        window_batch = _window_residue_batch(residue_batch, index, span_1, span_2)
-        output = model(window_batch)
-        protein_score = max(protein_score, _protein_probability(output))
-    return {
-        "p_protein": protein_score,
-        "n_forwards": len(windows),
-    }
-
-
 def evaluate_ppi(
     model: torch.nn.Module,
     loader,
     device: torch.device,
     ppi_score_threshold: float,
-    positive_weight: float = 1.0,
-    max_full_length: int | None = 1024,
-) -> tuple[list[dict[str, Any]], dict[str, dict[str, float]]]:
+) -> list[dict[str, Any]]:
     model.eval()
     rows: list[dict[str, Any]] = []
     desc = (
@@ -430,23 +365,12 @@ def evaluate_ppi(
                     pair_label = f"{pair_label} +{len(metas) - 1}"
                 progress.set_postfix(pair=pair_label, refresh=False)
             residue_batch = to_device(residue_batch, device)
-            if _batch_exceeds_budget(residue_batch, max_full_length):
-                for index, meta in enumerate(metas):
-                    scores = _score_pair_windows(
-                        model,
-                        residue_batch,
-                        index,
-                        max_full_length,
-                    )
-                    rows.append(_prediction_row(meta, scores, ppi_score_threshold))
-                continue
-
             output = model(residue_batch)
             for index, meta in enumerate(metas):
-                scores = _head_scores_from_output(output, index)
-                rows.append(_prediction_row(meta, scores, ppi_score_threshold))
+                probability = _protein_probability(output, index)
+                rows.append(_prediction_row(meta, probability, ppi_score_threshold))
 
-    return rows, metrics_for_heads(rows, positive_weight=positive_weight)
+    return rows
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="inference")
@@ -487,6 +411,7 @@ def main(args: DictConfig):
         test_set_tsv=args.data.test_set_tsv,
         fasta_path=args.data.fasta_path,
         embedding_dir=embedding_dir,
+        max_full_length=max_full_length,
     )
     shard = shard_dataset(dataset)
     loader = get_dataloader(
@@ -497,14 +422,17 @@ def main(args: DictConfig):
         num_workers=int(args.data.num_workers),
         pin_memory=bool(args.data.pin_memory),
     )
+    dropped = len(dataset.dropped_pairs)
     log_info(
         f"Loaded {len(dataset)} test pairs"
         + (
-            f" (complexes longer than {max_full_length} are tiled)"
+            f"; dropped {dropped} longer than {max_full_length}"
             if max_full_length is not None
             else ""
         )
     )
+    if dropped:
+        log_info("Dropped pairs: " + ", ".join(dataset.dropped_pairs))
     if DIST_WRAPPER.world_size > 1:
         print(
             f"[rank {DIST_WRAPPER.rank}/{DIST_WRAPPER.world_size}] "
@@ -518,38 +446,43 @@ def main(args: DictConfig):
     model.load_state_dict(state_dict)
     del checkpoint
 
-    positive_weight = float(_cfg_get(args, "metrics.positive_weight", default=1.0))
-    rows, _ = evaluate_ppi(
+    configured_weight = float(_cfg_get(args, "metrics.positive_weight", default=1.0))
+    rows = evaluate_ppi(
         model=model,
         loader=loader,
         device=device,
         ppi_score_threshold=float(args.data.ppi_score_threshold),
-        positive_weight=positive_weight,
-        max_full_length=max_full_length,
     )
     rows = gather_rank_prediction_rows(rows)
 
     if DIST_WRAPPER.rank == 0:
-        metrics = metrics_for_heads(rows, positive_weight=positive_weight)
+        weights = protein_metric_weights(configured_weight)
+        metrics_by_weight = {
+            weight: metrics_from_prediction_rows(
+                rows,
+                "p_protein",
+                positive_weight=weight,
+            )
+            for weight in weights
+        }
         predictions_path = os.path.join(logging_dir, "predictions.tsv")
         metrics_path = os.path.join(logging_dir, "metrics.csv")
         write_predictions(predictions_path, rows)
-        write_metrics(metrics_path, metrics)
-        for head in PPI_HEADS:
-            head_metrics = metrics[head]
+        write_metrics(metrics_path, metrics_by_weight)
+        for weight, head_metrics in metrics_by_weight.items():
             print(
-                f"[test-metrics] head={head} "
+                f"[test-metrics] head=protein "
+                f"positive_weight={weight:g} "
                 f"auroc={head_metrics['auroc']:.4f} "
                 f"auprc={head_metrics['auprc']:.4f}"
             )
-        shared = metrics["protein"]
-        n_tiled = sum(int(row["n_forwards"]) > 1 for row in rows)
+        unweighted = metrics_by_weight[1.0]
         print(
             f"[test-metrics] "
-            f"n={shared['n']} "
-            f"n_pos={shared['n_pos']} "
-            f"n_neg={shared['n_neg']} "
-            f"n_tiled={n_tiled}"
+            f"n={unweighted['n']} "
+            f"n_pos={unweighted['n_pos']} "
+            f"n_neg={unweighted['n_neg']} "
+            f"n_dropped={dropped}"
         )
         print(f"Wrote {predictions_path}")
         print(f"Wrote {metrics_path}")
