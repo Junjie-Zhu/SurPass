@@ -15,7 +15,8 @@ avoids the overflow float16 would introduce on large embedding values.
 ``--update-existing`` rewrites plain archives in ``embedded/`` without calling
 ESMC. A file that is already gzip-compressed is treated as processed and is
 skipped before it is loaded. Each remaining archive is loaded, ``plm_emb`` is
-cast to bfloat16, and the compressed file replaces the original.
+cast to bfloat16, and the compressed file replaces the original. An archive
+that cannot be read is deleted.
 
 ``--num-gpus`` or ``--devices`` splits the pending chains into contiguous shards
 and embeds one shard per GPU, each in its own process.
@@ -803,20 +804,28 @@ def _save_chain_embedding(
 
 
 def _update_one(path_str: str) -> tuple[str, str | None]:
-    """Cast one plain embedding to bfloat16 and gzip it. Leave the original on failure."""
+    """Cast one plain embedding to bfloat16 and gzip it.
+
+    A file that cannot be read is deleted. A readable file that fails during
+    the rewrite is left in place.
+    """
     path = Path(path_str)
     try:
         features = torch.load(path, weights_only=False)
-        if "plm_emb" not in features:
+        if not isinstance(features, dict) or "plm_emb" not in features:
             raise ValueError("missing plm_emb")
         embedding = features["plm_emb"]
         if not isinstance(embedding, torch.Tensor):
             embedding = torch.as_tensor(embedding)
         features["plm_emb"] = _storage_embedding(embedding)
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        return "deleted", f"{path.name}: {type(exc).__name__}: {exc}"
+    try:
         _write_embedded_file(features, path)
-        return "updated", None
     except Exception as exc:
         return "failed", f"{path.name}: {type(exc).__name__}: {exc}"
+    return "updated", None
 
 
 def _note_updated_file() -> None:
@@ -827,17 +836,25 @@ def _note_updated_file() -> None:
         progress.value += 1
 
 
-def _update_shard(path_strs: list[str]) -> tuple[int, list[str]]:
+def _record_update(status: str, error: str | None, updated: int, deleted: list[str], errors: list[str]) -> int:
+    if status == "updated":
+        return updated + 1
+    if status == "deleted" and error is not None:
+        deleted.append(error)
+    elif error is not None:
+        errors.append(error)
+    return updated
+
+
+def _update_shard(path_strs: list[str]) -> tuple[int, list[str], list[str]]:
     updated = 0
+    deleted: list[str] = []
     errors: list[str] = []
     for path_str in path_strs:
         status, error = _update_one(path_str)
-        if status == "updated":
-            updated += 1
-        elif error is not None:
-            errors.append(error)
+        updated = _record_update(status, error, updated, deleted, errors)
         _note_updated_file()
-    return updated, errors
+    return updated, deleted, errors
 
 
 def _run_shards(path_strs: list[str], workers: int) -> list[list[str]]:
@@ -881,15 +898,13 @@ def _update_existing_embeddings(embedding_dir: Path, workers: int) -> None:
     if len(update_shards) == 1:
         with tqdm(total=len(tasks), desc="Updating embeddings", unit="file") as progress:
             updated = 0
+            deleted = []
             errors = []
             for path_str in tasks:
                 status, error = _update_one(path_str)
-                if status == "updated":
-                    updated += 1
-                elif error is not None:
-                    errors.append(error)
+                updated = _record_update(status, error, updated, deleted, errors)
                 progress.update(1)
-        results = [(updated, errors)]
+        results = [(updated, deleted, errors)]
     else:
         file_progress = mp.Value("Q", 0)
         with mp.Pool(
@@ -921,21 +936,28 @@ def _update_existing_embeddings(embedding_dir: Path, workers: int) -> None:
                         progress.update(remaining)
 
     updated = 0
+    deleted: list[str] = []
     errors: list[str] = []
-    for shard_updated, shard_errors in results:
+    for shard_updated, shard_deleted, shard_errors in results:
         updated += shard_updated
+        deleted.extend(shard_deleted)
         errors.extend(shard_errors)
     print("\nEmbedding update summary")
     print(f"updated: {updated}")
     print(f"already gzip, skipped: {skipped}")
+    print(f"deleted broken: {len(deleted)}")
     print(f"failed: {len(errors)}")
     print(f"output directory: {embedding_dir}")
+    if deleted:
+        print("deleted broken files:")
+        for error in deleted[:10]:
+            print(f"  - {error}")
     if errors:
         print("example errors:")
         for error in errors[:10]:
             print(f"  - {error}")
         raise RuntimeError(
-            f"{len(errors)} embedded files could not be updated. Originals were left in place."
+            f"{len(errors)} embedded files could not be rewritten. Those originals were left in place."
         )
 
 

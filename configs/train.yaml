@@ -45,22 +45,22 @@ data:
   crop_size: 128
 
 model:
-  n_layers: 8
-  dim_token: 768
-  dim_pair: 512
+  n_layers: 9
+  dim_token: 768 
+  dim_pair: 512 
   n_heads: 12
   residual_mha: true
   residual_transition: true
   use_attn_pair_bias: true
   use_qkln: true
-  dropout: 0.0
+  dropout: 0.0 
   expansion_factor: 2
   plm_in_dim: 2560
-  plm_out_dim: 512
+  plm_out_dim: 512 
   r_max: 32
-  pair_update_interval: 2
+  pair_update_interval: 3
   pair_n_heads: 8
-  dim_opm_inner: 128
+  dim_opm_inner: 128 
 
 loss:
   bce:
