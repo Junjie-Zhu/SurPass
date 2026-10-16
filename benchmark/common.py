@@ -24,7 +24,6 @@ from src.inference import (  # noqa: E402
     resolve_label_column,
     write_metrics,
 )
-from src.utils.ppi_windows import plan_ppi_windows  # noqa: E402
 
 DEFAULT_DATA_ROOT = "/groups/sbinlab/clschf/datasets/PDB_PPI"
 BENCHMARK_COLUMNS = [
@@ -65,32 +64,14 @@ def load_test_pairs(test_set_tsv: str | Path, fasta_path: str | Path) -> list[di
 
 def score_test_pairs(
     items: list[dict[str, Any]],
-    budget: int | None,
     score_sequences: Callable[[str, str], float],
     threshold: float,
     desc: str,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Score every pair. Pairs longer than ``budget`` are tiled and reduced by max."""
+) -> list[dict[str, Any]]:
+    """Score every pair on its full sequences."""
     rows: list[dict[str, Any]] = []
-    n_windowed = 0
-    max_length = 0
     for item in tqdm(items, desc=desc):
-        sequence_1 = item["sequence_1"]
-        sequence_2 = item["sequence_2"]
-        length = len(sequence_1) + len(sequence_2)
-        max_length = max(max_length, length)
-        windows = plan_ppi_windows(len(sequence_1), len(sequence_2), budget)
-        if len(windows) > 1:
-            n_windowed += 1
-        probability = max(
-            float(
-                score_sequences(
-                    sequence_1[start_1:end_1],
-                    sequence_2[start_2:end_2],
-                )
-            )
-            for (start_1, end_1), (start_2, end_2) in windows
-        )
+        probability = float(score_sequences(item["sequence_1"], item["sequence_2"]))
         rows.append(
             {
                 "Protein pairs": item["pair"],
@@ -99,11 +80,7 @@ def score_test_pairs(
                 "pred_interaction": probability >= float(threshold),
             }
         )
-    return rows, {
-        "n_windowed": n_windowed,
-        "max_length": max_length,
-        "n_dropped": 0,
-    }
+    return rows
 
 
 def prepare_logging_dir(prefix: str, logging_dir: str | Path = "logs") -> Path:

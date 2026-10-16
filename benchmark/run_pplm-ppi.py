@@ -1,7 +1,6 @@
 """Score the SurPass test set with PPLM-PPI.
 
-Full attention maps are kept, so one forward stays within a 1024-token budget.
-Longer pairs are tiled and the interaction score is the maximum over windows.
+Each pair is scored on its full sequences in one forward.
 """
 
 from __future__ import annotations
@@ -26,12 +25,6 @@ from common import (  # noqa: E402
     write_benchmark_results,
 )
 
-# Two chains each contribute a boundary token pair, so residue length + 4
-# is the attention-map length. 1024 keeps that map near 2.8 GB in float32.
-PPLM_TOKEN_BUDGET = 1024
-PPLM_SPECIAL_TOKENS = 4
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PPLM-PPI on the SurPass PPI test set")
     parser.add_argument(
@@ -51,12 +44,6 @@ def parse_args() -> argparse.Namespace:
         "--backbone",
         default=str(BENCHMARK_DIR / "weights" / "pplm_t33_650M.pt"),
         help="PPLM t33 backbone checkpoint.",
-    )
-    parser.add_argument(
-        "--max-length",
-        type=int,
-        default=PPLM_TOKEN_BUDGET,
-        help="Token budget, including 4 special tokens. Residue windows use this minus 4.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--positive-weight", type=float, default=0.01)
@@ -177,12 +164,6 @@ def ensemble_probability(features, model, model_weights) -> float:
 
 def main() -> None:
     args = parse_args()
-    residue_budget = int(args.max_length) - PPLM_SPECIAL_TOKENS
-    if residue_budget < 2:
-        raise SystemExit(
-            f"--max-length must leave at least 2 residues after {PPLM_SPECIAL_TOKENS} "
-            f"special tokens, got {args.max_length}."
-        )
     test_set = require_file(args.test_set_tsv, "test set TSV")
     fasta = require_file(args.fasta, "FASTA")
     weights_path = require_file(args.weights, "PPLM-PPI weights")
@@ -214,9 +195,8 @@ def main() -> None:
         )
         return ensemble_probability(features, head, model_weights)
 
-    rows, stats = score_test_pairs(
+    rows = score_test_pairs(
         items,
-        budget=residue_budget,
         score_sequences=score_sequences,
         threshold=float(args.threshold),
         desc="PPLM",
@@ -227,12 +207,7 @@ def main() -> None:
         rows,
         positive_weight=float(args.positive_weight),
     )
-    print(
-        f"[test-metrics] n={len(rows)} "
-        f"n_dropped={stats['n_dropped']} "
-        f"n_windowed={stats['n_windowed']} "
-        f"max_length={stats['max_length']}"
-    )
+    print(f"[test-metrics] n={len(rows)}")
     print(f"Wrote {predictions_path}")
     print(f"Wrote {metrics_path}")
 

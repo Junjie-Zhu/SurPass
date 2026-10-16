@@ -1,8 +1,6 @@
 """Score the SurPass test set with MINT.
 
-Pairs longer than the ESM context are tiled. The reported probability is the
-maximum over those windows, so a long complex is not truncated to its first
-residues or dropped from the metrics.
+Each pair is scored on its full sequences in one forward.
 """
 
 from __future__ import annotations
@@ -27,10 +25,6 @@ from common import (  # noqa: E402
     write_benchmark_results,
 )
 
-# ESM-2 context is 1024 tokens. 1022 leaves room for the boundary tokens MINT adds.
-MINT_CONTEXT = 1022
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MINT on the SurPass PPI test set")
     parser.add_argument(
@@ -52,12 +46,6 @@ def parse_args() -> argparse.Namespace:
         default="bernett_mlp.pth",
         help="Bernett MLP checkpoint.",
     )
-    parser.add_argument(
-        "--max-length",
-        type=int,
-        default=MINT_CONTEXT,
-        help="Concatenated residue budget for one MINT forward.",
-    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--positive-weight", type=float, default=0.01)
     parser.add_argument("--logging-dir", default="logs")
@@ -70,7 +58,6 @@ def load_mint(
     checkpoint_path: Path,
     mlp_path: Path,
     device: torch.device,
-    max_length: int,
 ):
     try:
         from mint.helpers.extract import CollateFn, MINTWrapper, load_config
@@ -90,13 +77,11 @@ def load_mint(
     model.load_state_dict(torch.load(mlp_path, map_location=device))
     model.eval()
     model.to(device)
-    return wrapper, model, CollateFn(int(max_length))
+    return wrapper, model, CollateFn()
 
 
 def main() -> None:
     args = parse_args()
-    if int(args.max_length) < 2:
-        raise SystemExit(f"--max-length must be at least 2, got {args.max_length}.")
     test_set = require_file(args.test_set_tsv, "test set TSV")
     fasta = require_file(args.fasta, "FASTA")
     config_path = require_file(args.config, "MINT config")
@@ -109,7 +94,6 @@ def main() -> None:
         checkpoint_path,
         mlp_path,
         device,
-        int(args.max_length),
     )
     items = load_test_pairs(test_set, fasta)
 
@@ -122,9 +106,8 @@ def main() -> None:
             probability = torch.sigmoid(model(embeddings))
         return float(probability.reshape(-1)[0].detach().float().cpu())
 
-    rows, stats = score_test_pairs(
+    rows = score_test_pairs(
         items,
-        budget=int(args.max_length),
         score_sequences=score_sequences,
         threshold=float(args.threshold),
         desc="MINT",
@@ -135,12 +118,7 @@ def main() -> None:
         rows,
         positive_weight=float(args.positive_weight),
     )
-    print(
-        f"[test-metrics] n={len(rows)} "
-        f"n_dropped={stats['n_dropped']} "
-        f"n_windowed={stats['n_windowed']} "
-        f"max_length={stats['max_length']}"
-    )
+    print(f"[test-metrics] n={len(rows)}")
     print(f"Wrote {predictions_path}")
     print(f"Wrote {metrics_path}")
 
