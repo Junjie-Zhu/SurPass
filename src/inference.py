@@ -15,6 +15,7 @@ from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.collate import collate_concatenated_pairs, get_dataloader
 from src.data.labels import contact_bin_count, inter_chain_pair_mask
 from src.model.surpass import ResOnly
+from src.utils.ppi_windows import plan_ppi_windows
 from src.train import (
     _binary_classification_metrics,
     _cfg_get,
@@ -36,6 +37,15 @@ PREDICTION_COLUMNS = [
     "pred_pair",
     "n_inter_contacts",
 ]
+
+_RESIDUE_FEATURE_KEYS = (
+    "plm_emb",
+    "residue_type",
+    "residue_index",
+    "chain_index",
+    "mask",
+    "residue_position",
+)
 
 
 def parse_protein_pair(pair: str) -> tuple[str, str]:
@@ -152,16 +162,10 @@ class InferencePairDataset(Dataset):
         test_set_tsv: str | Path,
         fasta_path: str | Path,
         embedding_dir: str | Path,
-        max_full_length: int | None = None,
     ):
         self.test_set_tsv = Path(test_set_tsv)
         self.fasta_path = Path(fasta_path)
         self.embedding_dir = Path(embedding_dir)
-        self.max_full_length = None if max_full_length is None else int(max_full_length)
-        if self.max_full_length is not None and self.max_full_length <= 0:
-            raise ValueError(
-                f"max_full_length must be positive, got {self.max_full_length}."
-            )
         metadata = pd.read_csv(self.test_set_tsv, sep="\t")
         if "Protein pairs" not in metadata.columns:
             raise ValueError("Test set TSV is missing the 'Protein pairs' column.")
@@ -170,7 +174,6 @@ class InferencePairDataset(Dataset):
 
         self._feature_cache: dict[str, dict[str, torch.Tensor]] = {}
         self.items: list[dict[str, Any]] = []
-        self.dropped_pairs: list[str] = []
         for _, row in metadata.iterrows():
             pair = str(row["Protein pairs"]).strip()
             protein_1, protein_2 = parse_protein_pair(pair)
@@ -180,10 +183,6 @@ class InferencePairDataset(Dataset):
                 raise KeyError(f"Missing FASTA sequence for {protein_2}")
             sequence_1 = sequences[protein_1]
             sequence_2 = sequences[protein_2]
-            full_length = len(sequence_1) + len(sequence_2)
-            if self.max_full_length is not None and full_length > self.max_full_length:
-                self.dropped_pairs.append(pair)
-                continue
             self.items.append(
                 {
                     "pair": pair,
@@ -343,7 +342,86 @@ def _prediction_row(
 
 
 def _protein_probability(output, index: int = 0) -> float:
-    return float(torch.sigmoid(output.protein_logit.reshape(-1))[index].item())
+    logit = output.protein_logit.detach().float().reshape(-1)[index]
+    return float(torch.sigmoid(logit).item())
+
+
+def resolve_inference_dtype(name: str | None) -> torch.dtype | None:
+    """Autocast dtype for the inference forward. ``None`` keeps float32."""
+    if name is None:
+        return None
+    key = str(name).strip().lower()
+    if key in {"float32", "fp32", "float"}:
+        return None
+    if key in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if key in {"float16", "fp16", "half"}:
+        return torch.float16
+    raise ValueError(
+        f"Unsupported inference_dtype {name!r}. Use bfloat16, float16, or float32."
+    )
+
+
+def aggregate_window_scores(
+    protein_probabilities: list[float],
+    pair_probabilities: list[float],
+    contact_counts: list[int],
+) -> tuple[float, float, int]:
+    """Max probabilities and summed contacts across tiled windows."""
+    if not protein_probabilities or not pair_probabilities or not contact_counts:
+        raise ValueError("window scores require at least one window.")
+    return (
+        max(float(value) for value in protein_probabilities),
+        max(float(value) for value in pair_probabilities),
+        int(sum(int(value) for value in contact_counts)),
+    )
+
+
+def slice_residue_features(
+    residue_batch: dict[str, torch.Tensor],
+    index: int,
+    start: int,
+    end: int,
+) -> dict[str, torch.Tensor]:
+    features = {
+        key: residue_batch[key][index, start:end]
+        for key in _RESIDUE_FEATURE_KEYS
+    }
+    features["chain_index"] = torch.zeros(
+        end - start,
+        dtype=torch.long,
+        device=features["mask"].device,
+    )
+    return features
+
+
+def window_residue_batch(
+    residue_batch: dict[str, torch.Tensor],
+    index: int,
+    p1_length: int,
+    span_1: tuple[int, int],
+    span_2: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    start_1, end_1 = span_1
+    start_2, end_2 = span_2
+    protein = slice_residue_features(residue_batch, index, start_1, end_1)
+    peptide = slice_residue_features(
+        residue_batch,
+        index,
+        int(p1_length) + start_2,
+        int(p1_length) + end_2,
+    )
+    return collate_concatenated_pairs([protein], [peptide])
+
+
+def _model_forward(model, residue_batch, device: torch.device, autocast_dtype):
+    enabled = autocast_dtype is not None and device.type == "cuda"
+    with torch.autocast(
+        device_type="cuda",
+        dtype=autocast_dtype or torch.bfloat16,
+        enabled=enabled,
+    ):
+        return model(residue_batch)
 
 
 def pair_contact_summary(
@@ -381,9 +459,13 @@ def evaluate_ppi(
     device: torch.device,
     ppi_score_threshold: float,
     contact_bins: int,
-) -> list[dict[str, Any]]:
+    max_full_length: int | None,
+    autocast_dtype: torch.dtype | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     model.eval()
     rows: list[dict[str, Any]] = []
+    n_windowed = 0
+    max_length = 0
     desc = (
         "Inference"
         if DIST_WRAPPER.world_size <= 1
@@ -404,28 +486,81 @@ def evaluate_ppi(
                 if len(metas) > 1:
                     pair_label = f"{pair_label} +{len(metas) - 1}"
                 progress.set_postfix(pair=pair_label, refresh=False)
-            residue_batch = to_device(residue_batch, device)
-            output = model(residue_batch)
-            pair_probability, n_inter_contacts = pair_contact_summary(
-                output.pair_logits,
-                residue_batch["mask"],
-                residue_batch["p1_length"],
-                residue_batch["p2_length"],
-                contact_bins,
-                ppi_score_threshold,
-            )
             for index, meta in enumerate(metas):
+                p1_length = int(residue_batch["p1_length"][index])
+                p2_length = int(residue_batch["p2_length"][index])
+                full_length = p1_length + p2_length
+                max_length = max(max_length, full_length)
+                windows = plan_ppi_windows(p1_length, p2_length, max_full_length)
+                if len(windows) > 1:
+                    n_windowed += 1
+                if len(windows) == 1 and len(metas) == 1:
+                    prepared = [residue_batch]
+                else:
+                    prepared = [
+                        window_residue_batch(
+                            residue_batch,
+                            index,
+                            p1_length,
+                            span_1,
+                            span_2,
+                        )
+                        for span_1, span_2 in windows
+                    ]
+                protein_probabilities: list[float] = []
+                pair_probabilities: list[float] = []
+                contact_counts: list[int] = []
+                for window_batch in prepared:
+                    window_batch = to_device(window_batch, device)
+                    output = _model_forward(
+                        model,
+                        window_batch,
+                        device,
+                        autocast_dtype,
+                    )
+                    pair_probability, n_inter_contacts = pair_contact_summary(
+                        output.pair_logits,
+                        window_batch["mask"],
+                        window_batch["p1_length"],
+                        window_batch["p2_length"],
+                        contact_bins,
+                        ppi_score_threshold,
+                    )
+                    protein_probabilities.append(_protein_probability(output, 0))
+                    pair_probabilities.append(float(pair_probability[0].item()))
+                    contact_counts.append(int(n_inter_contacts[0].item()))
+                    del output, window_batch
+                protein_probability, pair_probability_value, n_contacts = (
+                    aggregate_window_scores(
+                        protein_probabilities,
+                        pair_probabilities,
+                        contact_counts,
+                    )
+                )
                 rows.append(
                     _prediction_row(
                         meta,
-                        _protein_probability(output, index),
-                        float(pair_probability[index].item()),
-                        int(n_inter_contacts[index].item()),
+                        protein_probability,
+                        pair_probability_value,
+                        n_contacts,
                         ppi_score_threshold,
                     )
                 )
 
-    return rows
+    return rows, {
+        "n_windowed": n_windowed,
+        "max_length": max_length,
+        "n_dropped": 0,
+    }
+
+
+def gather_inference_stats(stats: dict[str, int]) -> dict[str, int]:
+    gathered = DIST_WRAPPER.all_gather_object(stats)
+    return {
+        "n_windowed": sum(int(item["n_windowed"]) for item in gathered),
+        "max_length": max((int(item["max_length"]) for item in gathered), default=0),
+        "n_dropped": 0,
+    }
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="inference")
@@ -459,14 +594,20 @@ def main(args: DictConfig):
     if embedding_dir is None:
         embedding_dir = str(Path(args.data.root_dir) / "embeddings")
 
-    max_full_length = _cfg_get(args, "data.max_full_length", default=1024)
+    max_full_length = _cfg_get(args, "data.max_full_length", default=2048)
     if max_full_length is not None:
         max_full_length = int(max_full_length)
+        if max_full_length <= 0:
+            raise ValueError(
+                f"max_full_length must be positive, got {max_full_length}."
+            )
+    autocast_dtype = resolve_inference_dtype(
+        _cfg_get(args, "data.inference_dtype", default="float32")
+    )
     dataset = InferencePairDataset(
         test_set_tsv=args.data.test_set_tsv,
         fasta_path=args.data.fasta_path,
         embedding_dir=embedding_dir,
-        max_full_length=max_full_length,
     )
     shard = shard_dataset(dataset)
     loader = get_dataloader(
@@ -477,17 +618,12 @@ def main(args: DictConfig):
         num_workers=int(args.data.num_workers),
         pin_memory=bool(args.data.pin_memory),
     )
-    dropped = len(dataset.dropped_pairs)
+    budget_label = "unbounded" if max_full_length is None else str(max_full_length)
+    dtype_label = "float32" if autocast_dtype is None else str(autocast_dtype).replace("torch.", "")
     log_info(
-        f"Loaded {len(dataset)} test pairs"
-        + (
-            f"; dropped {dropped} longer than {max_full_length}"
-            if max_full_length is not None
-            else ""
-        )
+        f"Loaded {len(dataset)} test pairs; "
+        f"single-forward budget {budget_label}; dtype {dtype_label}"
     )
-    if dropped:
-        log_info("Dropped pairs: " + ", ".join(dataset.dropped_pairs))
     if DIST_WRAPPER.world_size > 1:
         print(
             f"[rank {DIST_WRAPPER.rank}/{DIST_WRAPPER.world_size}] "
@@ -508,14 +644,17 @@ def main(args: DictConfig):
         float(args.data.distance_bin_end),
         int(args.data.distance_bin_count),
     )
-    rows = evaluate_ppi(
+    rows, stats = evaluate_ppi(
         model=model,
         loader=loader,
         device=device,
         ppi_score_threshold=float(args.data.ppi_score_threshold),
         contact_bins=contact_bins,
+        max_full_length=max_full_length,
+        autocast_dtype=autocast_dtype,
     )
     rows = gather_rank_prediction_rows(rows)
+    stats = gather_inference_stats(stats)
 
     if DIST_WRAPPER.rank == 0:
         weights = protein_metric_weights(configured_weight)
@@ -548,7 +687,9 @@ def main(args: DictConfig):
             f"n={unweighted['n']} "
             f"n_pos={unweighted['n_pos']} "
             f"n_neg={unweighted['n_neg']} "
-            f"n_dropped={dropped}"
+            f"n_dropped={stats['n_dropped']} "
+            f"n_windowed={stats['n_windowed']} "
+            f"max_length={stats['max_length']}"
         )
         print(f"Wrote {predictions_path}")
         print(f"Wrote {metrics_path}")

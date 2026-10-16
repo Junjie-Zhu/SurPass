@@ -190,16 +190,29 @@ def relative_position_encoding(
     chain_index: torch.Tensor,
     mask: torch.Tensor,
     r_max: int,
+    row_start: int = 0,
+    row_end: int | None = None,
 ):
-    pair_mask = mask.to(dtype=torch.bool)
-    pair_mask = pair_mask[..., None] & pair_mask[..., None, :]
+    """Relative position features for query rows ``[row_start, row_end)``.
 
-    same_chain_mask = (chain_index[:, :, None] == chain_index[:, None, :]).long()
+    The key axis stays the full sequence, so concatenating row chunks reproduces
+    the full ``[B, L, L, C]`` encoding without building it in one allocation.
+    """
+    if row_end is None:
+        row_end = int(token_index.shape[1])
+    query_token = token_index[:, row_start:row_end]
+    query_residue = residue_index[:, row_start:row_end]
+    query_chain = chain_index[:, row_start:row_end]
+    query_mask = mask[:, row_start:row_end].to(dtype=torch.bool)
+    key_mask = mask.to(dtype=torch.bool)
+    pair_mask = query_mask[..., None] & key_mask[..., None, :]
+
+    same_chain_mask = (query_chain[:, :, None] == chain_index[:, None, :]).long()
     rel_pos_chain = F.one_hot(same_chain_mask.clamp(0, 1), 2)
 
     rel_pos_classes = 2 * (int(r_max) + 1)
     d_residue = torch.clip(
-        input=residue_index[:, :, None] - residue_index[:, None, :] + r_max,
+        input=query_residue[:, :, None] - residue_index[:, None, :] + r_max,
         min=0, max=2 * r_max,
     ) * same_chain_mask + (1 - same_chain_mask) * (2 * r_max + 1)
     rel_pos_residue = F.one_hot(
@@ -208,7 +221,7 @@ def relative_position_encoding(
 
     # add a global position encoding
     d_token = torch.clip(
-        input=token_index[:, :, None] - token_index[:, None, :] + r_max,
+        input=query_token[:, :, None] - token_index[:, None, :] + r_max,
         min=0, max=2 * r_max,
     )
     rel_pos_token = F.one_hot(
@@ -216,7 +229,7 @@ def relative_position_encoding(
     )
 
     rel_pos = torch.cat([rel_pos_token, rel_pos_residue, rel_pos_chain], dim=-1).float()
-    return rel_pos * pair_mask[..., None].to(dtype=rel_pos.dtype)  # [b, n, n, 2 + 4 * (r_max + 1)]
+    return rel_pos * pair_mask[..., None].to(dtype=rel_pos.dtype)  # [b, rows, n, 2 + 4 * (r_max + 1)]
 
 
 def bin_pairwise_distances(x, min_dist, max_dist, dim):
@@ -260,6 +273,7 @@ class ResidueEmbedder(nn.Module):
         self,
         dim_token: int,
         dim_pair: int,
+        pair_row_chunk_size: int = 32,
         **kwargs,
     ):
         # residue features contain:
@@ -274,6 +288,11 @@ class ResidueEmbedder(nn.Module):
         super().__init__()
         self.dim_token = dim_token
         self.dim_pair = dim_pair
+        if int(pair_row_chunk_size) < 1:
+            raise ValueError(
+                f"pair_row_chunk_size must be positive, got {pair_row_chunk_size}."
+            )
+        self.pair_row_chunk_size = int(pair_row_chunk_size)
 
         self.r_max = kwargs.get('r_max', 32)
         self.distance_bin_start = float(kwargs.get("distance_bin_start", 2.0))
@@ -308,9 +327,16 @@ class ResidueEmbedder(nn.Module):
             persistent=False,
         )
 
-    def pair_energies(self, residue_type: torch.Tensor) -> torch.Tensor:
+    def pair_energies(
+        self,
+        residue_type: torch.Tensor,
+        row_start: int = 0,
+        row_end: int | None = None,
+    ) -> torch.Tensor:
         aa = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
-        return self.pair_bin_energies[aa[:, :, None], aa[:, None, :]]
+        if row_end is None:
+            row_end = int(aa.shape[1])
+        return self.pair_bin_energies[aa[:, row_start:row_end, None], aa[:, None, :]]
 
     def forward(
         self,
@@ -342,25 +368,60 @@ class ResidueEmbedder(nn.Module):
         token_index = torch.arange(
             seq_index.shape[1], device=seq_index.device, dtype=seq_index.dtype
         ).unsqueeze(0).expand_as(seq_index)
-        rel_pos_emb = relative_position_encoding(
-            token_index, seq_index, chain_index, mask, self.r_max
-        )
-
-        pairwise_dist_emb = self.pair_energies(residue_type).to(
-            device=residue_position.device,
-            dtype=residue_position.dtype,
-        ).flatten(start_dim=-2)
 
         single_repr = self.single_out(
             torch.cat([plm_emb, residue_type_emb, chain_break_emb, index_emb], dim=-1)
             * mask[..., None]
         )
-        pair_mask = mask[..., None] * mask[..., None, :]
-        pair_repr = self.pair_out(
-            torch.cat([pairwise_dist_emb, rel_pos_emb], dim=-1)
-            * pair_mask[..., None]
+        pair_repr = self._pair_repr_rows(
+            residue_type,
+            token_index,
+            seq_index,
+            chain_index,
+            mask,
+            dtype=residue_position.dtype,
         )
         return single_repr, pair_repr, mask
+
+    def _pair_repr_rows(
+        self,
+        residue_type: torch.Tensor,
+        token_index: torch.Tensor,
+        seq_index: torch.Tensor,
+        chain_index: torch.Tensor,
+        mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        length = int(mask.shape[1])
+        chunk = self.pair_row_chunk_size
+
+        def rows(start: int, end: int) -> torch.Tensor:
+            rel_pos_emb = relative_position_encoding(
+                token_index,
+                seq_index,
+                chain_index,
+                mask,
+                self.r_max,
+                row_start=start,
+                row_end=end,
+            )
+            pairwise_dist_emb = self.pair_energies(
+                residue_type,
+                row_start=start,
+                row_end=end,
+            ).to(device=rel_pos_emb.device, dtype=dtype).flatten(start_dim=-2)
+            row_mask = mask[:, start:end, None] * mask[:, None, :]
+            return self.pair_out(
+                torch.cat([pairwise_dist_emb, rel_pos_emb], dim=-1)
+                * row_mask[..., None]
+            )
+
+        if chunk >= length:
+            return rows(0, length)
+        return torch.cat(
+            [rows(start, min(start + chunk, length)) for start in range(0, length, chunk)],
+            dim=1,
+        )
 
 
 class AtomEmbedder(nn.Module):
