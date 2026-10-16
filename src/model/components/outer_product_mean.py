@@ -31,12 +31,7 @@ class EfficientOuterProductMean(nn.Module):
         self.linear_no_bias = nn.Linear(c_m, c_hidden, bias=False)
         self.linear_out = nn.Linear(c_hidden ** 2, c_z)
 
-    def forward(
-        self,
-        token_repr: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        row_chunk_size: int | None = None,
-    ) -> torch.Tensor:
+    def forward(self, token_repr: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         token_repr = self.layernorm(token_repr)
         token_repr = self.linear_no_bias(token_repr)
         if mask is not None:
@@ -45,19 +40,10 @@ class EfficientOuterProductMean(nn.Module):
         pair_dim, inner = self.linear_out.weight.shape[0], token_repr.shape[-1]
         weight = self.linear_out.weight.view(pair_dim, inner, inner)
         projected = torch.einsum("pcd,bjd->bjpc", weight, token_repr)
-        rows = int(token_repr.shape[-2])
-        chunk = rows if row_chunk_size is None else int(row_chunk_size)
-
-        def outer_rows(start: int, end: int) -> torch.Tensor:
-            outer = torch.einsum("bic,bjpc->bijp", token_repr[:, start:end], projected)
-            if self.linear_out.bias is not None:
-                outer = outer + self.linear_out.bias
-            return outer
-
-        if chunk >= rows:
-            return outer_rows(0, rows)
-        parts = [outer_rows(start, min(start + chunk, rows)) for start in range(0, rows, chunk)]
-        return torch.cat(parts, dim=1)
+        outer_product = torch.einsum("bic,bjpc->bijp", token_repr, projected)
+        if self.linear_out.bias is not None:
+            outer_product = outer_product + self.linear_out.bias
+        return outer_product
 
 
 class OuterProductMean(nn.Module):

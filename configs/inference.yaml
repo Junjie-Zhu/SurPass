@@ -12,8 +12,7 @@ data:
   batch_size: 1
   num_workers: 0
   pin_memory: true
-  max_full_length: 2048
-  inference_dtype: float32
+  max_full_length: 1024
   distance_bin_start: 2.0
   distance_bin_end: 22.0
   distance_bin_count: 64
@@ -39,8 +38,7 @@ model:
   r_max: 32
   pair_update_interval: 3
   pair_n_heads: 8
-  dim_opm_inner: 128
-  pair_row_chunk_size: 32 
+  dim_opm_inner: 128 
 
 hydra:
   run:
