@@ -1,5 +1,4 @@
 import math
-import os
 from functools import lru_cache
 
 import numpy as np
@@ -7,108 +6,129 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.common.residue_constants import restypes, restypes_with_x
-from src.model.components.calvados_functions import (
-    _default_residue_pickle_path,
+from src.common.calvados.calvados_functions import (
     compute_ashbaugh_hatch,
     compute_yukawa,
     load_calvados_model,
 )
+from src.common.mpipi.mpipi_functions import coulomb, load_mpipi_arrays, wang_frenkel
+from src.common.residue_constants import restypes, restypes_with_x
 from src.model.loss import distance_bin_centers
 
 NUM_RESIDUE_TYPES = len(restypes_with_x)
+N_ENERGY_CHANNELS = 4
 k_BOLTZMANN = 0.0083144721  # kJ/mol/K
 CALVADOS_TEMP = 298.15
 _MIN_CALVADOS_DISTANCE_NM = 1e-6
-def _calvados_residue_pickle_path() -> str:
-    local_path = os.path.join(os.path.dirname(__file__), "calvados_residues.pickle")
-    if os.path.isfile(local_path):
-        return local_path
-    return _default_residue_pickle_path()
 
 
-def normalize_calvados_energy(energy_kt):
-    """asinh(E/kT) keeps attractive wells nearly linear and compresses the LJ wall."""
+def normalize_pair_energy(energy_kt):
+    """asinh(E/kT) keeps attractive wells nearly linear and compresses the repulsive wall."""
     return np.arcsinh(np.asarray(energy_kt, dtype=np.float64))
 
 
-def _build_calvados_bin_energy_table(
-    min_dist: float,
-    max_dist: float,
-    dim: int,
-    temp: float,
-    model=None,
-) -> torch.Tensor:
-    """CALVADOS asinh(E/kT) at each pairwise-distance bin center, shape [n_aa, n_aa, dim]."""
-    if model is None:
-        model = load_calvados_model(
-            version="CALVADOS2",
-            salt=0.150,
-            pH=7.4,
-            temp=temp,
-            residue_pickle_path=_calvados_residue_pickle_path(),
-        )
-    centers_a = distance_bin_centers(min_dist, max_dist, dim).detach().cpu().numpy()
+def _calvados_energy_channels(centers_a: np.ndarray, temp: float) -> tuple[np.ndarray, np.ndarray]:
+    """Yukawa and Ashbaugh-Hatch, each asinh(E/kT), shape [20, 20, bins]."""
+    model = load_calvados_model(
+        version="CALVADOS2",
+        salt=0.150,
+        pH=7.4,
+        temp=temp,
+    )
     r_nm = np.maximum(np.asarray(centers_a, dtype=np.float64) * 0.1, _MIN_CALVADOS_DISTANCE_NM)
-
     aa_names = list(restypes)
     sigma = model.sigmamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
     lam = model.lambdamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
     yukawa_q = model.yukawa_eps.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
 
     r_b = r_nm[None, None, :]
-    ah = compute_ashbaugh_hatch(
+    yukawa = compute_yukawa(
+        r_b,
+        yukawa_q[:, :, None],
+        model.yukawa_kappa,
+        yukawa_r_cut=model.yukawa_r_cut,
+    )
+    ashbaugh = compute_ashbaugh_hatch(
         r_b,
         sigma[:, :, None],
         lam[:, :, None],
         cutoff=model.cutoff,
         lj_eps=model.lj_eps,
     )
-    yu = compute_yukawa(
+    yukawa = np.where(r_b > model.yukawa_r_cut, 0.0, yukawa)
+    ashbaugh = np.where(r_b > model.cutoff, 0.0, ashbaugh)
+    kt = k_BOLTZMANN * float(temp)
+    return normalize_pair_energy(yukawa / kt), normalize_pair_energy(ashbaugh / kt)
+
+
+def _mpipi_energy_channels(centers_a: np.ndarray, temp: float) -> tuple[np.ndarray, np.ndarray]:
+    """Coulomb and Wang-Frenkel, each asinh(E/kT), shape [20, 20, bins]."""
+    params = load_mpipi_arrays(list(restypes))
+    r_b = np.asarray(centers_a, dtype=np.float64)[None, None, :]
+    electrostatic = coulomb(
+        params["charge"][:, None, None],
+        params["charge"][None, :, None],
         r_b,
-        yukawa_q[:, :, None],
-        model.yukawa_kappa,
-        yukawa_r_cut=model.yukawa_r_cut,
     )
-    ah = np.where(r_b > model.cutoff, 0.0, ah)
-    yu = np.where(r_b > model.yukawa_r_cut, 0.0, yu)
-    energy_kt = (ah + yu) / (k_BOLTZMANN * float(temp))
-    energy_norm = normalize_calvados_energy(energy_kt)
+    lennard_jones = wang_frenkel(
+        r_b,
+        params["sigma"][:, :, None],
+        params["epsilon"][:, :, None],
+        params["mu"][:, :, None],
+        params["nu"][:, :, None],
+    )
+    kt = k_BOLTZMANN * float(temp)
+    return (
+        normalize_pair_energy(electrostatic / kt),
+        normalize_pair_energy(lennard_jones / kt),
+    )
 
-    table = np.zeros((NUM_RESIDUE_TYPES, NUM_RESIDUE_TYPES, int(dim)), dtype=np.float32)
-    n_canonical = len(aa_names)
-    table[:n_canonical, :n_canonical] = np.asarray(energy_norm, dtype=np.float32)
-    return torch.from_numpy(table)
 
-
-@lru_cache(maxsize=8)
-def _cached_calvados_bin_energy_table(
+def _build_pair_bin_energy_table(
     min_dist: float,
     max_dist: float,
     dim: int,
     temp: float,
 ) -> torch.Tensor:
-    return _build_calvados_bin_energy_table(min_dist, max_dist, dim, temp)
+    """Four asinh(E/kT) channels at each shared distance-bin center.
+
+    Channel order is Calvados Yukawa, Calvados Ashbaugh-Hatch, Mpipi Coulomb,
+    Mpipi Wang-Frenkel. Shape [n_aa, n_aa, 4, bins]. Unknown residues stay zero.
+    """
+    centers_a = distance_bin_centers(min_dist, max_dist, dim).detach().cpu().numpy()
+    channels = (
+        *_calvados_energy_channels(centers_a, temp),
+        *_mpipi_energy_channels(centers_a, temp),
+    )
+    table = np.zeros(
+        (NUM_RESIDUE_TYPES, NUM_RESIDUE_TYPES, N_ENERGY_CHANNELS, int(dim)),
+        dtype=np.float32,
+    )
+    n_canonical = len(restypes)
+    for index, channel in enumerate(channels):
+        table[:n_canonical, :n_canonical, index] = np.asarray(channel, dtype=np.float32)
+    return torch.from_numpy(table)
 
 
-def build_calvados_bin_energy_table(
+@lru_cache(maxsize=8)
+def _cached_pair_bin_energy_table(
+    min_dist: float,
+    max_dist: float,
+    dim: int,
+    temp: float,
+) -> torch.Tensor:
+    return _build_pair_bin_energy_table(min_dist, max_dist, dim, temp)
+
+
+def build_pair_bin_energy_table(
     min_dist: float,
     max_dist: float,
     dim: int,
     *,
-    model=None,
     temp: float = CALVADOS_TEMP,
 ) -> torch.Tensor:
-    """Return a cloned 20x20x64 CALVADOS lookup; physics is computed once per key."""
-    if model is not None:
-        return _build_calvados_bin_energy_table(
-            float(min_dist),
-            float(max_dist),
-            int(dim),
-            float(temp),
-            model=model,
-        )
-    return _cached_calvados_bin_energy_table(
+    """Return a cloned residue-pair energy lookup. Physics is computed once per key."""
+    return _cached_pair_bin_energy_table(
         float(min_dist),
         float(max_dist),
         int(dim),
@@ -247,7 +267,8 @@ class ResidueEmbedder(nn.Module):
         # 2. residue type (single)
         # 3. within-chain sequential index (single)
         # 4. chain break per residue (single)
-        # 5. CALVADOS pair energy (pair; sequence, available at test time)
+        # 5. four binned pair energies (pair; sequence, available at test time):
+        #    Calvados Yukawa, Calvados Ashbaugh-Hatch, Mpipi Coulomb, Mpipi Wang-Frenkel
         # 6. relative position encoding (pair), using the same sequential index
 
         super().__init__()
@@ -255,9 +276,13 @@ class ResidueEmbedder(nn.Module):
         self.dim_pair = dim_pair
 
         self.r_max = kwargs.get('r_max', 32)
-        self.xt_pair_dist_min = kwargs.get('xt_pair_dist_min', 1)
-        self.xt_pair_dist_max = kwargs.get('xt_pair_dist_max', 33)
-        self.xt_pair_dist_dim = kwargs.get('xt_pair_dist_dim', 64)  # 0.5 A per bin
+        self.distance_bin_start = float(kwargs.get("distance_bin_start", 2.0))
+        self.distance_bin_end = float(kwargs.get("distance_bin_end", 22.0))
+        self.distance_bin_count = int(kwargs.get("distance_bin_count", 64))
+        if self.distance_bin_count < 2:
+            raise ValueError(
+                f"distance_bin_count must be at least 2, got {self.distance_bin_count}."
+            )
         self.plm_in_dim = kwargs.get('plm_in_dim', 1280)
         self.plm_out_dim = kwargs.get('plm_out_dim', 256)
         self.index_emb_dim = int(kwargs.get("index_emb_dim", 128))
@@ -271,21 +296,21 @@ class ResidueEmbedder(nn.Module):
         single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + 1 + self.index_emb_dim
         self.single_out = nn.Linear(single_dim, self.dim_token)
 
-        pair_dim = self.xt_pair_dist_dim + 2 + 4 * (self.r_max + 1)
+        pair_dim = N_ENERGY_CHANNELS * self.distance_bin_count + 2 + 4 * (self.r_max + 1)
         self.pair_out = nn.Linear(pair_dim, self.dim_pair)
         self.register_buffer(
-            "calvados_bin_energies",
-            build_calvados_bin_energy_table(
-                self.xt_pair_dist_min,
-                self.xt_pair_dist_max,
-                self.xt_pair_dist_dim,
+            "pair_bin_energies",
+            build_pair_bin_energy_table(
+                self.distance_bin_start,
+                self.distance_bin_end,
+                self.distance_bin_count,
             ),
             persistent=False,
         )
 
-    def calvados_pair_energies(self, residue_type: torch.Tensor) -> torch.Tensor:
+    def pair_energies(self, residue_type: torch.Tensor) -> torch.Tensor:
         aa = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
-        return self.calvados_bin_energies[aa[:, :, None], aa[:, None, :]]
+        return self.pair_bin_energies[aa[:, :, None], aa[:, None, :]]
 
     def forward(
         self,
@@ -321,11 +346,10 @@ class ResidueEmbedder(nn.Module):
             token_index, seq_index, chain_index, mask, self.r_max
         )
 
-        expected_shape = (*residue_position.shape[:2], residue_position.shape[1], self.xt_pair_dist_dim)
-        pairwise_dist_emb = self.calvados_pair_energies(residue_type).to(
+        pairwise_dist_emb = self.pair_energies(residue_type).to(
             device=residue_position.device,
             dtype=residue_position.dtype,
-        ).squeeze(-3)
+        ).flatten(start_dim=-2)
 
         single_repr = self.single_out(
             torch.cat([plm_emb, residue_type_emb, chain_break_emb, index_emb], dim=-1)

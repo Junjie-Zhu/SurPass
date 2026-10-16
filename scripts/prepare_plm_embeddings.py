@@ -7,12 +7,18 @@ during domain preparation, so those pickles are opened only for coordinates.
 Saved files live in ``<source>/embedded/<chain_id>.pt`` and keep the structure
 tensors used by training, plus ``plm_emb`` of shape ``[length, hidden]``.
 
+PDB files are plain ``torch.save`` archives with float32 embeddings. AFDB
+files are gzip-compressed and store ``plm_emb`` as float16. Training reloads
+that embedding as float32.
+
 ``--num-gpus`` or ``--devices`` splits the pending chains into contiguous shards
 and embeds one shard per GPU, each in its own process.
 """
 
 import argparse
 import fcntl
+import gzip
+import io
 import multiprocessing as mp
 import os
 import pickle
@@ -42,6 +48,9 @@ FEATURE_DTYPES = {
     "residue_type": torch.long,
     "residue_index": torch.long,
 }
+# Level 1 is enough: the payload is mostly float16 embeddings, which barely
+# shrink further, and higher levels stall the embedding workers.
+AFDB_GZIP_LEVEL = 1
 
 
 def read_fasta_sequences(fasta_path: Path) -> dict[str, str]:
@@ -245,8 +254,11 @@ def main(argv: Iterable[str] | None = None) -> None:
         )
     entries_count = len(pending) + skipped + len(missing)
 
+    compress = args.source == "afdb"
     print(f"source: {args.source}")
     print(f"source directory: {source_dir}")
+    if compress:
+        print("save format: gzip-compressed .pt, plm_emb float16")
     print(f"chains: {entries_count}")
     print(f"pending: {len(pending)}")
     print(f"skipped existing: {skipped}")
@@ -268,6 +280,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             processed_dir,
             embedding_dir,
             progress_desc="Extracting ESMC embeddings",
+            compress=compress,
         )
         errors.extend(embed_errors)
     else:
@@ -282,6 +295,7 @@ def main(argv: Iterable[str] | None = None) -> None:
             args.model_name,
             processed_dir,
             embedding_dir,
+            compress=compress,
         )
         errors.extend(embed_errors)
 
@@ -455,6 +469,7 @@ def _embed_pending(
     progress_desc: str,
     progress_position: Optional[int] = None,
     error_prefix: str = "",
+    compress: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     stats = _empty_stats()
     errors: list[str] = []
@@ -482,6 +497,7 @@ def _embed_pending(
                     embedding,
                     processed_dir,
                     embedding_dir,
+                    compress=compress,
                 )
             except Exception as exc:
                 stats["failed"] += 1
@@ -503,6 +519,7 @@ def _embed_shard(
     embedding_dir: str,
     num_devices: int,
     load_lock_path: str,
+    compress: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     """Load one ESMC copy onto ``device`` and embed this shard."""
     if not pending:
@@ -532,6 +549,7 @@ def _embed_shard(
         progress_desc=f"ESMC {device}",
         progress_position=rank if sys.stderr.isatty() else None,
         error_prefix=f"[{device}] ",
+        compress=compress,
     )
 
 
@@ -542,6 +560,7 @@ def _embed_on_devices(
     model_name: str,
     processed_dir: Path,
     embedding_dir: Path,
+    compress: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     shards = _contiguous_shards(pending, len(devices))
     active = []
@@ -577,6 +596,7 @@ def _embed_on_devices(
                     str(embedding_dir),
                     len(active),
                     str(lock_path),
+                    compress,
                 )
                 for rank, device, shard in active
             ]
@@ -695,6 +715,7 @@ def _save_chain_embedding(
     embedding: torch.Tensor,
     processed_dir: Path,
     embedding_dir: Path,
+    compress: bool = False,
 ) -> None:
     feature_path = processed_dir / f"{chain_id}.pkl"
     if not feature_path.is_file():
@@ -710,8 +731,32 @@ def _save_chain_embedding(
             f"feature length {feature_len}, sequence length {len(sequence)}, "
             f"and embedding length {int(embedding.shape[0])} do not match"
         )
+    if compress:
+        embedding = embedding.to(dtype=torch.float16).contiguous()
     features["plm_emb"] = embedding
-    torch.save(features, embedding_dir / f"{chain_id}.pt")
+    _write_embedded_file(features, embedding_dir / f"{chain_id}.pt", compress=compress)
+
+
+def _write_embedded_file(
+    features: dict[str, torch.Tensor],
+    path: Path,
+    compress: bool,
+) -> None:
+    """Write one chain file, replacing it only after the payload is complete."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        if compress:
+            buffer = io.BytesIO()
+            torch.save(features, buffer)
+            tmp_path.write_bytes(gzip.compress(buffer.getvalue(), compresslevel=AFDB_GZIP_LEVEL))
+        else:
+            torch.save(features, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _relative_or_absolute(source_dir: Path, value: str) -> Path:

@@ -19,7 +19,7 @@ except Exception:
 
 from src.data.balancing import DistributedWeightedSampler, build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
-from src.model.loss import ProteinBindLoss, SampleTverskyLoss
+from src.model.loss import DistogramCELoss, ProteinBindLoss, SampleTverskyLoss
 from src.model.ema import EMAWrapper
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
@@ -64,21 +64,6 @@ def to_device(obj, device):
     return obj
 
 
-def contact_bin_count(
-    contact_threshold: float,
-    distance_bin_start: float,
-    distance_bin_end: float,
-    distance_bin_count: int,
-) -> int:
-    bin_limits = torch.linspace(
-        float(distance_bin_start),
-        float(distance_bin_end),
-        int(distance_bin_count) - 1,
-    )
-    count = int(torch.bucketize(torch.tensor(float(contact_threshold)), bin_limits).item())
-    return max(1, min(count, int(distance_bin_count)))
-
-
 def _binary_classification_metrics(
     scores: torch.Tensor,
     target: torch.Tensor,
@@ -107,6 +92,9 @@ def _compute_protein_loss(
     loss_weights: Dict[str, float],
     protein_logit: torch.Tensor,
     is_positive: torch.Tensor,
+    pair_logits: torch.Tensor | None = None,
+    target_bins: torch.Tensor | None = None,
+    pair_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     raw_loss = protein_logit.new_zeros(())
     terms: dict[str, torch.Tensor] = {}
@@ -117,6 +105,17 @@ def _compute_protein_loss(
         value = loss_fn[name](protein_logit, is_positive)
         terms[name] = value.detach()
         raw_loss = raw_loss + term_weight * value
+    pair_weight = float(loss_weights.get("pair_ce", 0.0))
+    if (
+        pair_weight > 0.0
+        and "pair_ce" in loss_fn
+        and pair_logits is not None
+        and target_bins is not None
+        and pair_mask is not None
+    ):
+        value = loss_fn["pair_ce"](pair_logits, target_bins, pair_mask)
+        terms["pair_ce"] = value.detach()
+        raw_loss = raw_loss + pair_weight * value
     terms["total"] = raw_loss.detach()
     return raw_loss, terms
 
@@ -148,6 +147,7 @@ _TRAIN_LOG_KEYS = (
     "total",
     "bce",
     "tversky",
+    "pair_ce",
 )
 _TEST_LOG_KEYS = (
     "total",
@@ -165,6 +165,7 @@ def _progress_postfix(terms: dict[str, float]) -> dict[str, str]:
         ("loss", "total"),
         ("bce", "bce"),
         ("tv", "tversky"),
+        ("pair", "pair_ce"),
     )
     return {
         label: f"{terms[key]:.3f}"
@@ -222,22 +223,16 @@ def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
     return {
         "bce": float(_cfg_get(cfg, "loss.bce.weight", default=1.0)),
         "tversky": float(_cfg_get(cfg, "loss.tversky.weight", default=1.0)),
+        "pair_ce": float(_cfg_get(cfg, "loss.pair_ce.weight", default=1.0)),
     }
 
 
-def _validate_model_bin_counts(model_kwargs: dict, distance_bin_count: int) -> dict:
-    model_kwargs = dict(model_kwargs)
-    distance_bin_count = int(distance_bin_count)
-    model_kwargs.setdefault("num_classes", distance_bin_count)
-    model_kwargs.setdefault("xt_pair_dist_dim", distance_bin_count)
-    num_classes = int(model_kwargs["num_classes"])
-    xt_pair_dist_dim = int(model_kwargs["xt_pair_dist_dim"])
-    if len({num_classes, xt_pair_dist_dim, distance_bin_count}) != 1:
-        raise ValueError(
-            "num_classes, xt_pair_dist_dim, and data.distance_bin_count must be equal, "
-            f"got {num_classes}, {xt_pair_dist_dim}, {distance_bin_count}."
-        )
-    return model_kwargs
+_MODEL_BIN_KEYS = (
+    "xt_pair_dist_min",
+    "xt_pair_dist_max",
+    "xt_pair_dist_dim",
+    "num_classes",
+)
 
 
 def build_model_kwargs(cfg: DictConfig, *, checkpoint_default: bool = True) -> dict:
@@ -245,14 +240,12 @@ def build_model_kwargs(cfg: DictConfig, *, checkpoint_default: bool = True) -> d
     if isinstance(model_kwargs, DictConfig):
         model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
     model_kwargs = dict(model_kwargs or {})
-    model_kwargs = _validate_model_bin_counts(model_kwargs, cfg.data.distance_bin_count)
+    for key in _MODEL_BIN_KEYS:
+        model_kwargs.pop(key, None)
     model_kwargs.pop("n_pair_heads", None)
-    model_kwargs["contact_bins"] = contact_bin_count(
-        cfg.data.contact_threshold,
-        cfg.data.distance_bin_start,
-        cfg.data.distance_bin_end,
-        cfg.data.distance_bin_count,
-    )
+    model_kwargs["distance_bin_start"] = float(cfg.data.distance_bin_start)
+    model_kwargs["distance_bin_end"] = float(cfg.data.distance_bin_end)
+    model_kwargs["distance_bin_count"] = int(cfg.data.distance_bin_count)
     model_kwargs["checkpoint_pair_blocks"] = bool(
         _cfg_get(cfg, "performance.checkpoint_pair_blocks", default=checkpoint_default)
     )
@@ -346,6 +339,9 @@ def train_epoch(
             loss_weights,
             output.protein_logit,
             labels["is_positive"],
+            pair_logits=output.pair_logits,
+            target_bins=labels["label_2d_bins"],
+            pair_mask=labels["label_2d_mask"],
         )
 
         loss = raw_loss / grad_accum_steps
@@ -434,6 +430,9 @@ def evaluate_epoch(
                 loss_weights,
                 output.protein_logit,
                 labels["is_positive"],
+                pair_logits=output.pair_logits,
+                target_bins=labels["label_2d_bins"],
+                pair_mask=labels["label_2d_mask"],
             )
 
             protein_score_rows.append(torch.sigmoid(output.protein_logit.reshape(-1)).detach().cpu())
@@ -632,6 +631,7 @@ def main(args: DictConfig):
             beta=float(_cfg_get(args, "loss.tversky.beta", default=0.3)),
             smooth=float(_cfg_get(args, "loss.tversky.smooth", default=1e-6)),
         ).to(device),
+        "pair_ce": DistogramCELoss().to(device),
     }
     loss_weights = _build_loss_weights(args)
     log_info(f"Loss setup: pos_weight={pos_weight}, weights={loss_weights}")

@@ -1,3 +1,5 @@
+import gzip
+import io
 import pickle
 import random
 from pathlib import Path
@@ -19,6 +21,17 @@ from src.data.labels import (
     build_negative_pair_labels,
     distance_to_bins,
 )
+
+
+def _load_embedded_file(path: Path) -> dict:
+    """Load a plain torch archive, or an AFDB gzip-compressed one."""
+    with path.open("rb") as handle:
+        gzipped = handle.read(2) == b"\x1f\x8b"
+    if not gzipped:
+        return torch.load(path, weights_only=False)
+    with gzip.open(path, "rb") as handle:
+        payload = handle.read()
+    return torch.load(io.BytesIO(payload), weights_only=False, mmap=False)
 
 
 class PepoTrainDataset(Dataset):
@@ -168,7 +181,7 @@ class PepoTrainDataset(Dataset):
         path = self.root_dir / "embedded" / f"{chain_name}.pt"
         if not path.exists():
             raise FileNotFoundError(f"Missing chain feature file: {path}")
-        return torch.load(path, weights_only=False)
+        return _load_embedded_file(path)
 
     def _load_pair_distance_and_mask(
         self,

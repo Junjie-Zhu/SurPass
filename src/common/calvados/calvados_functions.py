@@ -21,6 +21,7 @@ def _default_residue_pickle_path() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
     candidates = [
+        os.path.join(here, "calvados_residues.pickle"),
         os.path.join(here, "Calvados_data", "calvados_residues.pickle"),
         os.path.join(root, "Calvados_data", "calvados_residues.pickle"),
     ]

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from src.model.components.embedder import ResidueEmbedder
+from src.model.components.pair_block import PairBlock
 from src.model.components.transformer import ResidueTransformer
 
 _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
@@ -13,6 +14,7 @@ _RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
 @dataclass
 class SurpassOutput:
     protein_logit: torch.Tensor
+    pair_logits: torch.Tensor
 
 
 class ResOnly(nn.Module):
@@ -28,6 +30,9 @@ class ResOnly(nn.Module):
         use_qkln=True,
         dropout=0.0,
         expansion_factor=2,
+        pair_update_interval=2,
+        pair_n_heads=8,
+        dim_opm_inner=32,
         **kwargs,
     ):
         super().__init__()
@@ -35,14 +40,27 @@ class ResOnly(nn.Module):
             raise ValueError(
                 f"n_heads ({n_heads}) must divide dim_token ({dim_token})."
             )
+        if int(dim_pair) % int(pair_n_heads) != 0:
+            raise ValueError(
+                f"pair_n_heads ({pair_n_heads}) must divide dim_pair ({dim_pair})."
+            )
+        if int(pair_update_interval) < 1:
+            raise ValueError(
+                f"pair_update_interval must be positive, got {pair_update_interval}."
+            )
         self.dim_token = dim_token
         self.dim_pair = dim_pair
+        self.pair_update_interval = int(pair_update_interval)
+        self.checkpoint_pair_blocks = bool(checkpoint_pair_blocks)
+        self.distance_bin_count = int(kwargs.get("distance_bin_count", 64))
         for unused_key in (
             "contact_bins",
-            "checkpoint_pair_blocks",
             "num_classes",
-            "dim_opm_inner",
             "dim_triangle_hidden",
+            "n_pair_heads",
+            "xt_pair_dist_min",
+            "xt_pair_dist_max",
+            "xt_pair_dist_dim",
         ):
             kwargs.pop(unused_key, None)
 
@@ -53,6 +71,22 @@ class ResOnly(nn.Module):
         )
 
         self.n_layers = n_layers
+        self.pair_blocks = nn.ModuleList([
+            PairBlock(
+                dim_token=dim_token,
+                dim_pair=dim_pair,
+                n_heads=int(pair_n_heads),
+                dim_opm_inner=int(dim_opm_inner),
+                dropout=dropout,
+                expansion_factor=expansion_factor,
+            )
+            for layer_index in range(n_layers)
+            if layer_index % self.pair_update_interval == 0
+        ])
+        self.pair_head = nn.Sequential(
+            nn.LayerNorm(dim_pair),
+            nn.Linear(dim_pair, self.distance_bin_count),
+        )
         self.residue_blocks = nn.ModuleList([
             ResidueTransformer(
                 dim_token=dim_token,
@@ -86,8 +120,17 @@ class ResOnly(nn.Module):
         single_repr, pair_repr, mask = self.residue_embedder(**embedder_inputs)
         mask = mask.to(dtype=torch.bool)
 
-        for block in self.residue_blocks:
+        pair_block_index = 0
+        for layer_index, block in enumerate(self.residue_blocks):
             single_repr = block(single_repr, pair_repr, mask)
+            if layer_index % self.pair_update_interval == 0:
+                pair_repr = self._apply_pair_block(
+                    self.pair_blocks[pair_block_index],
+                    single_repr,
+                    pair_repr,
+                    mask,
+                )
+                pair_block_index += 1
 
         protein_logit = self._protein_logit(
             single_repr,
@@ -95,7 +138,25 @@ class ResOnly(nn.Module):
             residue_batch["p1_length"],
             residue_batch["p2_length"],
         )
-        return SurpassOutput(protein_logit=protein_logit)
+        pair_logits = self.pair_head(pair_repr)
+        return SurpassOutput(protein_logit=protein_logit, pair_logits=pair_logits)
+
+    def _apply_pair_block(
+        self,
+        block: PairBlock,
+        single_repr: torch.Tensor,
+        pair_repr: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # if self.checkpoint_pair_blocks and self.training:
+        #     return checkpoint(
+        #         block,
+        #         single_repr,
+        #         pair_repr,
+        #         mask,
+        #         use_reentrant=False,
+        #     )
+        return block(single_repr, pair_repr, mask)
 
     def _protein_logit(
         self,
