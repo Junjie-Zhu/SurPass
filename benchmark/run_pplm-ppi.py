@@ -1,135 +1,241 @@
-import os
-import sys
-import torch
+"""Score the SurPass test set with PPLM-PPI.
+
+Full attention maps are kept, so one forward stays within a 1024-token budget.
+Longer pairs are tiled and the interaction score is the maximum over windows.
+"""
+
+from __future__ import annotations
+
 import argparse
-from pplm_ppi import PPLM_PPI
+import sys
+from pathlib import Path
 
-def main():
-    parser = argparse.ArgumentParser(description="Protein-Protein Interaction Prediction",
-                                     epilog="v0.0.1")
+import torch
 
-    parser.add_argument("seqA_path",
-                        action="store",
-                        help="Location of sequence A")
+BENCHMARK_DIR = Path(__file__).resolve().parent
+if str(BENCHMARK_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARK_DIR))
 
-    parser.add_argument("seqB_path",
-                        action="store",
-                        help="Location of sequence B")
+from common import (  # noqa: E402
+    DEFAULT_DATA_ROOT,
+    load_test_pairs,
+    prepare_logging_dir,
+    require_file,
+    resolve_device,
+    score_test_pairs,
+    write_benchmark_results,
+)
 
-    parser.add_argument("--gpu_id",
-                        "-gpu",
-                        type=int,
-                        default=0,
-                        help="gpu device specified",
-                        )
-
-    args = parser.parse_args()
-
-    ### Define model ###
-    assigned_device = "cuda:" + str(args.gpu_id)
-    device = assigned_device if torch.cuda.is_available() else "cpu"
-
-    model_weights = torch.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights/ppi_models.pkl"), map_location=device)
-
-    model = PPLM_PPI()
-    model.to(device)
-
-    ### Read sequences ###
-    seqA = read_sequence(args.seqA_path)
-    seqB = read_sequence(args.seqB_path)
-
-    ### Get pplm features ###
-    mean_inter_attn, mean_attn_AA, mean_attn_BB, mean_embed_A, mean_embed_B, max_inter_attn, max_attn_AA, max_attn_BB, max_embed_A, max_embed_B = get_pplm_features(seqA, seqB, device)
-
-    ### Prediction ###
-    with torch.no_grad():
-        predictions_list = []
-        for model_weight in model_weights['mean']:
-            model.load_state_dict(model_weight)
-            predictions = model(mean_inter_attn, mean_attn_AA, mean_attn_BB, mean_embed_A, mean_embed_B)
-            predictions_ = model(mean_inter_attn, mean_attn_BB, mean_attn_AA, mean_embed_B, mean_embed_A)
-            predictions = (predictions + predictions_) / 2
-            predictions_list.append(predictions)
-
-        for model_weight in model_weights['max']:
-            model.load_state_dict(model_weight)
-            predictions = model(max_inter_attn, max_attn_AA, max_attn_BB, max_embed_A, max_embed_B)
-            predictions_ = model(max_inter_attn, max_attn_BB, max_attn_AA, max_embed_B, max_embed_A)
-            predictions = (predictions + predictions_) / 2
-            predictions_list.append(predictions)
-
-        predictions = torch.stack(predictions_list)
-        predictions = torch.mean(predictions, dim=0).squeeze().cpu().numpy()
-
-        print("Predicted interaction score:", predictions)
+# Two chains each contribute a boundary token pair, so residue length + 4
+# is the attention-map length. 1024 keeps that map near 2.8 GB in float32.
+PPLM_TOKEN_BUDGET = 1024
+PPLM_SPECIAL_TOKENS = 4
 
 
-def read_sequence(seq_path):
-    seq = ""
-    for line in open(seq_path, "r").readlines():
-        if not line.startswith(">"):
-            seq += line.strip()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="PPLM-PPI on the SurPass PPI test set")
+    parser.add_argument(
+        "--test-set-tsv",
+        default=str(Path(DEFAULT_DATA_ROOT) / "test_set.tsv"),
+    )
+    parser.add_argument(
+        "--fasta",
+        default=str(Path(DEFAULT_DATA_ROOT) / "test_set.fasta"),
+    )
+    parser.add_argument(
+        "--weights",
+        default=str(BENCHMARK_DIR / "weights" / "ppi_models.pkl"),
+        help="Ensemble of PPLM-PPI heads.",
+    )
+    parser.add_argument(
+        "--backbone",
+        default=str(BENCHMARK_DIR / "weights" / "pplm_t33_650M.pt"),
+        help="PPLM t33 backbone checkpoint.",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=PPLM_TOKEN_BUDGET,
+        help="Token budget, including 4 special tokens. Residue windows use this minus 4.",
+    )
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--positive-weight", type=float, default=0.01)
+    parser.add_argument("--logging-dir", default="logs")
+    parser.add_argument("--gpu-id", type=int, default=0)
+    return parser.parse_args()
 
-    return seq
 
-def get_pplm_features(seqA, seqB, device):
-    mian_path = os.path.dirname(__file__)
-    sys.path.append(os.path.abspath(mian_path))
+def load_pplm(backbone_path: Path, device: torch.device):
+    try:
+        from pplm import Alphabet, PPLM
+    except ImportError as exc:
+        raise SystemExit(
+            "PPLM is not installed. Install the pplm package before running this script."
+        ) from exc
 
-    from pplm import PPLM, Alphabet
-    model_location = os.path.join(mian_path, 'weights/', 'pplm_t33_650M.pt')
-
-    ##### Loading PPLM Model #####
     alphabet = Alphabet.from_architecture()
     batch_converter = alphabet.get_batch_converter()
-    model_data = torch.load(model_location, map_location="cpu")
+    model_data = torch.load(backbone_path, map_location="cpu")
     model_param = model_data["param"]
-    model_state = model_data["model"]
-
     model = PPLM(
-        num_layers=model_param['encoder_layers'],
-        embed_dim=model_param['encoder_embed_dim'],
-        attention_heads=model_param['encoder_attention_heads'],
+        num_layers=model_param["encoder_layers"],
+        embed_dim=model_param["encoder_embed_dim"],
+        attention_heads=model_param["encoder_attention_heads"],
         token_dropout=False,
-        alphabet=alphabet
+        alphabet=alphabet,
     )
     model.to(device)
-    model.load_state_dict(model_state, strict=False)
+    model.load_state_dict(model_data["model"], strict=False)
+    model.eval()
+    return model, batch_converter, int(model_param["encoder_layers"]), int(
+        model_param["encoder_attention_heads"]
+    )
 
+
+def pplm_features(seq_a: str, seq_b: str, device: torch.device, model, batch_converter, n_layers: int, n_heads: int):
     with torch.no_grad():
-        seqA_labels, seqA_strs, seqA_tokens = batch_converter([('seqA', seqA)])
-        seqB_labels, seqB_strs, seqB_tokens = batch_converter([('seqB', seqB)])
-        tokens = torch.cat([seqA_tokens, seqB_tokens], dim=-1).to(device)
+        _, _, tokens_a = batch_converter([("seqA", seq_a)])
+        _, _, tokens_b = batch_converter([("seqB", seq_b)])
+        tokens = torch.cat([tokens_a, tokens_b], dim=-1).to(device)
+        length_a = len(seq_a)
+        length_b = len(seq_b)
+        token_length = length_a + 2 + length_b + 2
+        inter_chain_mask = torch.ones((token_length, token_length), device=device)
+        inter_chain_mask[: length_a + 2, : length_a + 2] = 0
+        inter_chain_mask[length_a + 2 :, length_a + 2 :] = 0
 
-        inter_chain_mask = torch.ones((len(seqA) + 2 + len(seqB) + 2, len(seqA) + 2 + len(seqB) + 2), device=device)
-        inter_chain_mask[:len(seqA) + 2, :len(seqA) + 2] = 0
-        inter_chain_mask[len(seqA) + 2:, len(seqA) + 2:] = 0
+        out = model(
+            tokens,
+            inter_chain_mask,
+            repr_layers=[n_layers],
+            need_head_weights=True,
+            return_contacts=False,
+        )
+        embed_a = out["representations"][n_layers][0, 1 : (length_a + 1), :]
+        embed_b = out["representations"][n_layers][0, -(length_b + 1) : -1, :]
+        attentions = out["attentions"].squeeze()
+        attn_aa = attentions[:, :, 1 : (length_a + 1), 1 : (length_a + 1)].reshape(
+            n_layers * n_heads, length_a, length_a
+        )
+        attn_ab = attentions[:, :, 1 : (length_a + 1), -(length_b + 1) : -1].reshape(
+            n_layers * n_heads, length_a, length_b
+        )
+        attn_ba = attentions[:, :, -(length_b + 1) : -1, 1 : (length_a + 1)].reshape(
+            n_layers * n_heads, length_b, length_a
+        )
+        attn_bb = attentions[:, :, -(length_b + 1) : -1, -(length_b + 1) : -1].reshape(
+            n_layers * n_heads, length_b, length_b
+        )
+        inter_attn = (attn_ab + attn_ba.transpose(1, 2)) / 2
+        features = (
+            inter_attn.mean(dim=(1, 2)),
+            attn_aa.mean(dim=(1, 2)),
+            attn_bb.mean(dim=(1, 2)),
+            embed_a.mean(dim=0),
+            embed_b.mean(dim=0),
+            torch.amax(inter_attn, dim=(1, 2)),
+            torch.amax(attn_aa, dim=(1, 2)),
+            torch.amax(attn_bb, dim=(1, 2)),
+            torch.amax(embed_a, dim=0),
+            torch.amax(embed_b, dim=0),
+        )
+        del out, attentions
+        return features
 
-        ##### running PPLM #####
-        out = model(tokens, inter_chain_mask, repr_layers=[33], need_head_weights=True, return_contacts=False)
 
-        embed_A = out['representations'][33][0, 1:(len(seqA) + 1), :]
-        embed_B = out['representations'][33][0, -(len(seqB) + 1):-1, :]
+def ensemble_probability(features, model, model_weights) -> float:
+    mean_features = features[:5]
+    max_features = features[5:]
+    predictions = []
+    with torch.no_grad():
+        for state in model_weights["mean"]:
+            model.load_state_dict(state)
+            forward = model(*mean_features)
+            swapped = model(
+                mean_features[0],
+                mean_features[2],
+                mean_features[1],
+                mean_features[4],
+                mean_features[3],
+            )
+            predictions.append((forward + swapped) / 2)
+        for state in model_weights["max"]:
+            model.load_state_dict(state)
+            forward = model(*max_features)
+            swapped = model(
+                max_features[0],
+                max_features[2],
+                max_features[1],
+                max_features[4],
+                max_features[3],
+            )
+            predictions.append((forward + swapped) / 2)
+        stacked = torch.stack(predictions)
+        score = torch.mean(stacked, dim=0).reshape(-1)[0]
+    return float(score.detach().float().cpu())
 
-        attn_AA = out['attentions'].squeeze()[:, :, 1:(len(seqA) + 1), 1:(len(seqA) + 1)].reshape(33 * 20, len(seqA), len(seqA))
-        attn_AB = out['attentions'].squeeze()[:, :, 1:(len(seqA) + 1), -(len(seqB) + 1):-1].reshape(33 * 20, len(seqA), len(seqB))
-        attn_BA = out['attentions'].squeeze()[:, :, -(len(seqB) + 1):-1, 1:(len(seqA) + 1)].reshape(33 * 20, len(seqB), len(seqA))
-        attn_BB = out['attentions'].squeeze()[:, :, -(len(seqB) + 1):-1, -(len(seqB) + 1):-1].reshape(33 * 20, len(seqB), len(seqB))
-        inter_attn = (attn_AB + attn_BA.transpose(1, 2)) / 2
 
-        mean_inter_attn = inter_attn.mean(dim=[1, 2])
-        mean_attn_AA = attn_AA.mean(dim=[1, 2])
-        mean_attn_BB = attn_BB.mean(dim=[1, 2])
-        mean_embed_A = embed_A.mean(dim=[0])
-        mean_embed_B = embed_B.mean(dim=[0])
-        max_inter_attn = torch.amax(inter_attn, dim=(1, 2))
-        max_attn_AA = torch.amax(attn_AA, dim=(1, 2))
-        max_attn_BB = torch.amax(attn_BB, dim=(1, 2))
-        max_embed_A = torch.amax(embed_A, dim=0)
-        max_embed_B = torch.amax(embed_B, dim=0)
+def main() -> None:
+    args = parse_args()
+    residue_budget = int(args.max_length) - PPLM_SPECIAL_TOKENS
+    if residue_budget < 2:
+        raise SystemExit(
+            f"--max-length must leave at least 2 residues after {PPLM_SPECIAL_TOKENS} "
+            f"special tokens, got {args.max_length}."
+        )
+    test_set = require_file(args.test_set_tsv, "test set TSV")
+    fasta = require_file(args.fasta, "FASTA")
+    weights_path = require_file(args.weights, "PPLM-PPI weights")
+    backbone_path = require_file(args.backbone, "PPLM backbone")
 
-        return mean_inter_attn, mean_attn_AA, mean_attn_BB, mean_embed_A, mean_embed_B, max_inter_attn, max_attn_AA, max_attn_BB, max_embed_A, max_embed_B
+    try:
+        from pplm_ppi import PPLM_PPI
+    except ImportError as exc:
+        raise SystemExit(
+            "pplm_ppi is not installed. Install it before running this script."
+        ) from exc
+
+    device = resolve_device(args.gpu_id)
+    backbone, batch_converter, n_layers, n_heads = load_pplm(backbone_path, device)
+    model_weights = torch.load(weights_path, map_location=device)
+    head = PPLM_PPI().to(device)
+    head.eval()
+    items = load_test_pairs(test_set, fasta)
+
+    def score_sequences(sequence_1: str, sequence_2: str) -> float:
+        features = pplm_features(
+            sequence_1,
+            sequence_2,
+            device,
+            backbone,
+            batch_converter,
+            n_layers,
+            n_heads,
+        )
+        return ensemble_probability(features, head, model_weights)
+
+    rows, stats = score_test_pairs(
+        items,
+        budget=residue_budget,
+        score_sequences=score_sequences,
+        threshold=float(args.threshold),
+        desc="PPLM",
+    )
+    logging_dir = prepare_logging_dir("PPLM", args.logging_dir)
+    predictions_path, metrics_path = write_benchmark_results(
+        logging_dir,
+        rows,
+        positive_weight=float(args.positive_weight),
+    )
+    print(
+        f"[test-metrics] n={len(rows)} "
+        f"n_dropped={stats['n_dropped']} "
+        f"n_windowed={stats['n_windowed']} "
+        f"max_length={stats['max_length']}"
+    )
+    print(f"Wrote {predictions_path}")
+    print(f"Wrote {metrics_path}")
+
 
 if __name__ == "__main__":
     main()
-    
