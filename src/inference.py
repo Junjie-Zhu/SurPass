@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.collate import collate_concatenated_pairs, get_dataloader
+from src.data.labels import contact_bin_count, inter_chain_pair_mask
 from src.model.surpass import ResOnly
 from src.train import (
     _binary_classification_metrics,
@@ -31,6 +32,9 @@ PREDICTION_COLUMNS = [
     "Category",
     "p_protein",
     "pred_protein",
+    "p_pair",
+    "pred_pair",
+    "n_inter_contacts",
 ]
 
 
@@ -297,12 +301,12 @@ def write_predictions(path: str | Path, rows: list[dict[str, Any]]) -> None:
 
 def write_metrics(
     path: str | Path,
-    metrics_by_weight: dict[float, dict[str, Any]],
+    metrics_by_head: dict[str, dict[float, dict[str, Any]]],
 ) -> None:
     frame = pd.DataFrame(
         [
             {
-                "head": "protein",
+                "head": head,
                 "positive_weight": weight,
                 "AUROC": metrics["auroc"],
                 "AUPRC": metrics["auprc"],
@@ -310,6 +314,7 @@ def write_metrics(
                 "N_pos": metrics["n_pos"],
                 "N_neg": metrics["n_neg"],
             }
+            for head, metrics_by_weight in metrics_by_head.items()
             for weight, metrics in metrics_by_weight.items()
         ]
     )
@@ -318,14 +323,19 @@ def write_metrics(
 
 def _prediction_row(
     meta: dict[str, Any],
-    probability: float,
+    protein_probability: float,
+    pair_probability: float,
+    n_inter_contacts: int,
     ppi_score_threshold: float,
 ) -> dict[str, Any]:
     row = {
         "Protein pairs": meta["pair"],
         "Category": bool(meta["label"]),
-        "p_protein": float(probability),
-        "pred_protein": float(probability) >= float(ppi_score_threshold),
+        "p_protein": float(protein_probability),
+        "pred_protein": float(protein_probability) >= float(ppi_score_threshold),
+        "p_pair": float(pair_probability),
+        "pred_pair": int(n_inter_contacts) >= 1,
+        "n_inter_contacts": int(n_inter_contacts),
     }
     if "index" in meta:
         row["_index"] = meta["index"]
@@ -336,11 +346,41 @@ def _protein_probability(output, index: int = 0) -> float:
     return float(torch.sigmoid(output.protein_logit.reshape(-1))[index].item())
 
 
+def pair_contact_summary(
+    pair_logits: torch.Tensor,
+    residue_mask: torch.Tensor,
+    p1_length: torch.Tensor,
+    p2_length: torch.Tensor,
+    contact_bins: int,
+    score_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Max inter-chain contact probability and the number of such contacts.
+
+    A contact is a directed inter-chain pair whose predicted distance falls in
+    the bins closer than the contact threshold with probability at least
+    ``score_threshold``. ``p_pair`` is the maximum of those probabilities.
+    """
+    contact_probability = torch.softmax(pair_logits.float(), dim=-1)[..., : int(contact_bins)].sum(dim=-1)
+    valid = residue_mask.to(dtype=torch.bool)
+    inter_mask = inter_chain_pair_mask(
+        p1_length,
+        p2_length,
+        device=contact_probability.device,
+        total_length=int(contact_probability.shape[-1]),
+    )
+    pair_valid = inter_mask & valid[:, :, None] & valid[:, None, :]
+    contact_probability = contact_probability.masked_fill(~pair_valid, 0.0)
+    pair_probability = contact_probability.amax(dim=(-2, -1))
+    n_inter_contacts = (contact_probability >= float(score_threshold)).sum(dim=(-2, -1))
+    return pair_probability, n_inter_contacts
+
+
 def evaluate_ppi(
     model: torch.nn.Module,
     loader,
     device: torch.device,
     ppi_score_threshold: float,
+    contact_bins: int,
 ) -> list[dict[str, Any]]:
     model.eval()
     rows: list[dict[str, Any]] = []
@@ -366,9 +406,24 @@ def evaluate_ppi(
                 progress.set_postfix(pair=pair_label, refresh=False)
             residue_batch = to_device(residue_batch, device)
             output = model(residue_batch)
+            pair_probability, n_inter_contacts = pair_contact_summary(
+                output.pair_logits,
+                residue_batch["mask"],
+                residue_batch["p1_length"],
+                residue_batch["p2_length"],
+                contact_bins,
+                ppi_score_threshold,
+            )
             for index, meta in enumerate(metas):
-                probability = _protein_probability(output, index)
-                rows.append(_prediction_row(meta, probability, ppi_score_threshold))
+                rows.append(
+                    _prediction_row(
+                        meta,
+                        _protein_probability(output, index),
+                        float(pair_probability[index].item()),
+                        int(n_inter_contacts[index].item()),
+                        ppi_score_threshold,
+                    )
+                )
 
     return rows
 
@@ -447,36 +502,47 @@ def main(args: DictConfig):
     del checkpoint
 
     configured_weight = float(_cfg_get(args, "metrics.positive_weight", default=1.0))
+    contact_bins = contact_bin_count(
+        float(args.data.contact_threshold),
+        float(args.data.distance_bin_start),
+        float(args.data.distance_bin_end),
+        int(args.data.distance_bin_count),
+    )
     rows = evaluate_ppi(
         model=model,
         loader=loader,
         device=device,
         ppi_score_threshold=float(args.data.ppi_score_threshold),
+        contact_bins=contact_bins,
     )
     rows = gather_rank_prediction_rows(rows)
 
     if DIST_WRAPPER.rank == 0:
         weights = protein_metric_weights(configured_weight)
-        metrics_by_weight = {
-            weight: metrics_from_prediction_rows(
-                rows,
-                "p_protein",
-                positive_weight=weight,
-            )
-            for weight in weights
+        metrics_by_head = {
+            head: {
+                weight: metrics_from_prediction_rows(
+                    rows,
+                    score_key,
+                    positive_weight=weight,
+                )
+                for weight in weights
+            }
+            for head, score_key in (("pair", "p_pair"), ("protein", "p_protein"))
         }
         predictions_path = os.path.join(logging_dir, "predictions.tsv")
         metrics_path = os.path.join(logging_dir, "metrics.csv")
         write_predictions(predictions_path, rows)
-        write_metrics(metrics_path, metrics_by_weight)
-        for weight, head_metrics in metrics_by_weight.items():
-            print(
-                f"[test-metrics] head=protein "
-                f"positive_weight={weight:g} "
-                f"auroc={head_metrics['auroc']:.4f} "
-                f"auprc={head_metrics['auprc']:.4f}"
-            )
-        unweighted = metrics_by_weight[1.0]
+        write_metrics(metrics_path, metrics_by_head)
+        for head, metrics_by_weight in metrics_by_head.items():
+            for weight, head_metrics in metrics_by_weight.items():
+                print(
+                    f"[test-metrics] head={head} "
+                    f"positive_weight={weight:g} "
+                    f"auroc={head_metrics['auroc']:.4f} "
+                    f"auprc={head_metrics['auprc']:.4f}"
+                )
+        unweighted = metrics_by_head["pair"][1.0]
         print(
             f"[test-metrics] "
             f"n={unweighted['n']} "

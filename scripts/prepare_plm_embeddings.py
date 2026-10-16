@@ -7,9 +7,15 @@ during domain preparation, so those pickles are opened only for coordinates.
 Saved files live in ``<source>/embedded/<chain_id>.pt`` and keep the structure
 tensors used by training, plus ``plm_emb`` of shape ``[length, hidden]``.
 
-PDB files are plain ``torch.save`` archives with float32 embeddings. AFDB
-files are gzip-compressed and store ``plm_emb`` as float16. Training reloads
-that embedding as float32.
+Both PDB and AFDB store ``plm_emb`` as bfloat16 inside a gzip-compressed
+archive. Training reloads that tensor as float32, so the model, loss, and
+optimizer stay in float32. bfloat16 keeps the float32 exponent range, which
+avoids the overflow float16 would introduce on large embedding values.
+
+``--update-existing`` rewrites plain archives in ``embedded/`` without calling
+ESMC. A file that is already gzip-compressed is treated as processed and is
+skipped before it is loaded. Each remaining archive is loaded, ``plm_emb`` is
+cast to bfloat16, and the compressed file replaces the original.
 
 ``--num-gpus`` or ``--devices`` splits the pending chains into contiguous shards
 and embeds one shard per GPU, each in its own process.
@@ -24,7 +30,8 @@ import os
 import pickle
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -48,9 +55,11 @@ FEATURE_DTYPES = {
     "residue_type": torch.long,
     "residue_index": torch.long,
 }
-# Level 1 is enough: the payload is mostly float16 embeddings, which barely
+# bfloat16 matches float32's range. Training casts it back to float32.
+EMBEDDING_DTYPE = torch.bfloat16
+# Level 1 is enough: the payload is mostly bfloat16 embeddings, which barely
 # shrink further, and higher levels stall the embedding workers.
-AFDB_GZIP_LEVEL = 1
+GZIP_LEVEL = 1
 
 
 def read_fasta_sequences(fasta_path: Path) -> dict[str, str]:
@@ -151,6 +160,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  # the first 4 GPUs, or an explicit subset\n"
             "  python prepare_plm_embeddings.py --source afdb --num-gpus 4 --batch-size 2\n"
             "  python prepare_plm_embeddings.py --source afdb --devices cuda:0,cuda:1,cuda:3\n"
+            "\n"
+            "  # cast existing embeddings to bfloat16 and gzip them, without ESMC\n"
+            "  python prepare_plm_embeddings.py --source afdb --update-existing\n"
         ),
     )
     parser.add_argument(
@@ -221,6 +233,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip chains whose embedded .pt file already exists.",
     )
+    parser.add_argument(
+        "--update-existing",
+        action="store_true",
+        help=(
+            "Rewrite plain embedded .pt files in place: cast plm_emb to bfloat16 "
+            "and gzip-compress. Files that are already gzip-compressed are "
+            "skipped without being loaded. Does not recompute embeddings."
+        ),
+    )
     return parser
 
 
@@ -235,6 +256,13 @@ def main(argv: Iterable[str] | None = None) -> None:
     processed_dir = source_dir / "processed"
     embedding_dir = source_dir / "embedded"
     embedding_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"source: {args.source}")
+    print(f"source directory: {source_dir}")
+    print("save format: gzip-compressed .pt, plm_emb bfloat16")
+    if args.update_existing:
+        _update_existing_embeddings(embedding_dir, workers=args.workers)
+        return
 
     if args.source == "pdb":
         pending, missing, skipped = _pdb_entries(
@@ -254,11 +282,6 @@ def main(argv: Iterable[str] | None = None) -> None:
         )
     entries_count = len(pending) + skipped + len(missing)
 
-    compress = args.source == "afdb"
-    print(f"source: {args.source}")
-    print(f"source directory: {source_dir}")
-    if compress:
-        print("save format: gzip-compressed .pt, plm_emb float16")
     print(f"chains: {entries_count}")
     print(f"pending: {len(pending)}")
     print(f"skipped existing: {skipped}")
@@ -280,7 +303,6 @@ def main(argv: Iterable[str] | None = None) -> None:
             processed_dir,
             embedding_dir,
             progress_desc="Extracting ESMC embeddings",
-            compress=compress,
         )
         errors.extend(embed_errors)
     else:
@@ -295,7 +317,6 @@ def main(argv: Iterable[str] | None = None) -> None:
             args.model_name,
             processed_dir,
             embedding_dir,
-            compress=compress,
         )
         errors.extend(embed_errors)
 
@@ -469,7 +490,6 @@ def _embed_pending(
     progress_desc: str,
     progress_position: Optional[int] = None,
     error_prefix: str = "",
-    compress: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     stats = _empty_stats()
     errors: list[str] = []
@@ -497,7 +517,6 @@ def _embed_pending(
                     embedding,
                     processed_dir,
                     embedding_dir,
-                    compress=compress,
                 )
             except Exception as exc:
                 stats["failed"] += 1
@@ -519,7 +538,6 @@ def _embed_shard(
     embedding_dir: str,
     num_devices: int,
     load_lock_path: str,
-    compress: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     """Load one ESMC copy onto ``device`` and embed this shard."""
     if not pending:
@@ -549,7 +567,6 @@ def _embed_shard(
         progress_desc=f"ESMC {device}",
         progress_position=rank if sys.stderr.isatty() else None,
         error_prefix=f"[{device}] ",
-        compress=compress,
     )
 
 
@@ -560,7 +577,6 @@ def _embed_on_devices(
     model_name: str,
     processed_dir: Path,
     embedding_dir: Path,
-    compress: bool,
 ) -> tuple[dict[str, Any], list[str]]:
     shards = _contiguous_shards(pending, len(devices))
     active = []
@@ -596,7 +612,6 @@ def _embed_on_devices(
                     str(embedding_dir),
                     len(active),
                     str(lock_path),
-                    compress,
                 )
                 for rank, device, shard in active
             ]
@@ -709,13 +724,65 @@ def _afdb_entries(
     return entries, [], skipped
 
 
+_UPDATE_PROGRESS: Any = None
+
+
+def _init_cpu_worker(progress: Any) -> None:
+    """One torch thread per process. The parent already imported torch with a full CPU pool."""
+    global _UPDATE_PROGRESS
+    _UPDATE_PROGRESS = progress
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+def _gzip_header_shard(path_strs: list[str], progress: Any = None) -> bytes:
+    """Return one byte per path: 1 when the file is already gzip-compressed."""
+    flags = bytearray(len(path_strs))
+    for index, path_str in enumerate(path_strs):
+        with open(path_str, "rb") as handle:
+            flags[index] = handle.read(2) == b"\x1f\x8b"
+        if progress is not None:
+            progress.update(1)
+    return bytes(flags)
+
+
+def _storage_embedding(embedding: torch.Tensor) -> torch.Tensor:
+    """ESMC prediction stored as bfloat16. Training casts this back to float32."""
+    tensor = embedding if isinstance(embedding, torch.Tensor) else torch.as_tensor(embedding)
+    if tensor.ndim != 2:
+        raise ValueError(f"plm_emb must have shape [length, hidden], got {tuple(tensor.shape)}")
+    return tensor.detach().to(dtype=EMBEDDING_DTYPE, device="cpu").contiguous()
+
+
+def _write_embedded_file(features: dict[str, Any], path: Path) -> None:
+    """Gzip one chain file and replace ``path`` only after the write finishes."""
+    buffer = io.BytesIO()
+    torch.save(features, buffer)
+    compressed = gzip.compress(buffer.getvalue(), compresslevel=GZIP_LEVEL)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(compressed)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _save_chain_embedding(
     chain_id: str,
     sequence: str,
     embedding: torch.Tensor,
     processed_dir: Path,
     embedding_dir: Path,
-    compress: bool = False,
 ) -> None:
     feature_path = processed_dir / f"{chain_id}.pkl"
     if not feature_path.is_file():
@@ -731,32 +798,145 @@ def _save_chain_embedding(
             f"feature length {feature_len}, sequence length {len(sequence)}, "
             f"and embedding length {int(embedding.shape[0])} do not match"
         )
-    if compress:
-        embedding = embedding.to(dtype=torch.float16).contiguous()
-    features["plm_emb"] = embedding
-    _write_embedded_file(features, embedding_dir / f"{chain_id}.pt", compress=compress)
+    features["plm_emb"] = _storage_embedding(embedding)
+    _write_embedded_file(features, embedding_dir / f"{chain_id}.pt")
 
 
-def _write_embedded_file(
-    features: dict[str, torch.Tensor],
-    path: Path,
-    compress: bool,
-) -> None:
-    """Write one chain file, replacing it only after the payload is complete."""
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    os.close(fd)
-    tmp_path = Path(tmp_name)
+def _update_one(path_str: str) -> tuple[str, str | None]:
+    """Cast one plain embedding to bfloat16 and gzip it. Leave the original on failure."""
+    path = Path(path_str)
     try:
-        if compress:
-            buffer = io.BytesIO()
-            torch.save(features, buffer)
-            tmp_path.write_bytes(gzip.compress(buffer.getvalue(), compresslevel=AFDB_GZIP_LEVEL))
+        features = torch.load(path, weights_only=False)
+        if "plm_emb" not in features:
+            raise ValueError("missing plm_emb")
+        embedding = features["plm_emb"]
+        if not isinstance(embedding, torch.Tensor):
+            embedding = torch.as_tensor(embedding)
+        features["plm_emb"] = _storage_embedding(embedding)
+        _write_embedded_file(features, path)
+        return "updated", None
+    except Exception as exc:
+        return "failed", f"{path.name}: {type(exc).__name__}: {exc}"
+
+
+def _note_updated_file() -> None:
+    progress = _UPDATE_PROGRESS
+    if progress is None:
+        return
+    with progress.get_lock():
+        progress.value += 1
+
+
+def _update_shard(path_strs: list[str]) -> tuple[int, list[str]]:
+    updated = 0
+    errors: list[str] = []
+    for path_str in path_strs:
+        status, error = _update_one(path_str)
+        if status == "updated":
+            updated += 1
+        elif error is not None:
+            errors.append(error)
+        _note_updated_file()
+    return updated, errors
+
+
+def _run_shards(path_strs: list[str], workers: int) -> list[list[str]]:
+    shard_count = 1 if workers <= 1 or len(path_strs) <= 1 else min(len(path_strs), workers * 4)
+    return _contiguous_shards(path_strs, shard_count)
+
+
+def _update_existing_embeddings(embedding_dir: Path, workers: int) -> None:
+    paths = sorted(embedding_dir.glob("*.pt"))
+    print(f"embedded files: {len(paths)}")
+    if not paths:
+        print("nothing to update")
+        return
+    path_strs = [str(path) for path in paths]
+    scan_shards = _run_shards(path_strs, workers)
+    with tqdm(
+        total=len(path_strs),
+        desc="Checking for gzip-compressed embeddings",
+        unit="file",
+    ) as progress:
+        if len(scan_shards) == 1:
+            flag_parts = [_gzip_header_shard(scan_shards[0], progress)]
         else:
-            torch.save(features, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+            with ThreadPoolExecutor(max_workers=min(workers, len(scan_shards))) as executor:
+                flag_parts = list(
+                    executor.map(lambda shard: _gzip_header_shard(shard, progress), scan_shards)
+                )
+    tasks = []
+    skipped = 0
+    for path_str, flag in zip(path_strs, b"".join(flag_parts)):
+        if flag:
+            skipped += 1
+            continue
+        tasks.append(path_str)
+    print(f"already gzip, skipped: {skipped}")
+    print(f"plain archives to update: {len(tasks)}")
+    if not tasks:
+        print("nothing to update")
+        return
+    update_shards = _run_shards(tasks, workers)
+    if len(update_shards) == 1:
+        with tqdm(total=len(tasks), desc="Updating embeddings", unit="file") as progress:
+            updated = 0
+            errors = []
+            for path_str in tasks:
+                status, error = _update_one(path_str)
+                if status == "updated":
+                    updated += 1
+                elif error is not None:
+                    errors.append(error)
+                progress.update(1)
+        results = [(updated, errors)]
+    else:
+        file_progress = mp.Value("Q", 0)
+        with mp.Pool(
+            min(workers, len(update_shards)),
+            initializer=_init_cpu_worker,
+            initargs=(file_progress,),
+        ) as pool:
+            with tqdm(total=len(tasks), desc="Updating embeddings", unit="file") as progress:
+                stop = threading.Event()
+
+                def _pump_progress() -> None:
+                    shown = 0
+                    while not stop.wait(0.2):
+                        current = file_progress.value
+                        delta = current - shown
+                        if delta:
+                            progress.update(delta)
+                            shown = current
+
+                pump = threading.Thread(target=_pump_progress, daemon=True)
+                pump.start()
+                try:
+                    results = list(pool.imap_unordered(_update_shard, update_shards))
+                finally:
+                    stop.set()
+                    pump.join()
+                    remaining = file_progress.value - progress.n
+                    if remaining > 0:
+                        progress.update(remaining)
+
+    updated = 0
+    errors: list[str] = []
+    for shard_updated, shard_errors in results:
+        updated += shard_updated
+        errors.extend(shard_errors)
+    print("\nEmbedding update summary")
+    print(f"updated: {updated}")
+    print(f"already gzip, skipped: {skipped}")
+    print(f"failed: {len(errors)}")
+    print(f"output directory: {embedding_dir}")
+    if errors:
+        print("example errors:")
+        for error in errors[:10]:
+            print(f"  - {error}")
+        raise RuntimeError(
+            f"{len(errors)} embedded files could not be updated. Originals were left in place."
+        )
 
 
 def _relative_or_absolute(source_dir: Path, value: str) -> Path:

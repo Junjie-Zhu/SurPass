@@ -23,6 +23,22 @@ def distance_to_bins(
     return torch.bucketize(distance.to(dtype=torch.float32), bin_limits).to(dtype=torch.long)
 
 
+def contact_bin_count(
+    contact_threshold: float,
+    bin_start: float = DISTANCE_BIN_START_A,
+    bin_end: float = DISTANCE_BIN_END_A,
+    bin_count: int = DISTANCE_BIN_NUM,
+) -> int:
+    """Number of leading distance bins strictly closer than ``contact_threshold``."""
+    bin_limits = torch.linspace(
+        float(bin_start),
+        float(bin_end),
+        int(bin_count) - 1,
+    )
+    count = int(torch.bucketize(torch.tensor(float(contact_threshold)), bin_limits).item())
+    return max(1, min(count, int(bin_count)))
+
+
 def inter_chain_pair_mask(
     p1_length: int | torch.Tensor,
     p2_length: int | torch.Tensor,

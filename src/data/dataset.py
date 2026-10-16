@@ -24,13 +24,11 @@ from src.data.labels import (
 
 
 def _load_embedded_file(path: Path) -> dict:
-    """Load a plain torch archive, or an AFDB gzip-compressed one."""
+    """Load a plain torch archive, or a gzip-compressed PDB/AFDB one, in one read."""
     with path.open("rb") as handle:
-        gzipped = handle.read(2) == b"\x1f\x8b"
-    if not gzipped:
-        return torch.load(path, weights_only=False)
-    with gzip.open(path, "rb") as handle:
         payload = handle.read()
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
     return torch.load(io.BytesIO(payload), weights_only=False, mmap=False)
 
 
