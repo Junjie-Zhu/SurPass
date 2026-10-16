@@ -51,12 +51,7 @@ class ResOnly(nn.Module):
         self.dim_token = dim_token
         self.dim_pair = dim_pair
         self.pair_update_interval = int(pair_update_interval)
-        self.checkpoint_pair_blocks = bool(kwargs.pop("checkpoint_pair_blocks", False))
-        self.pair_row_chunk_size = int(kwargs.pop("pair_row_chunk_size", 32))
-        if self.pair_row_chunk_size < 1:
-            raise ValueError(
-                f"pair_row_chunk_size must be positive, got {self.pair_row_chunk_size}."
-            )
+        self.checkpoint_pair_blocks = bool(checkpoint_pair_blocks)
         self.distance_bin_count = int(kwargs.get("distance_bin_count", 64))
         for unused_key in (
             "contact_bins",
@@ -72,7 +67,6 @@ class ResOnly(nn.Module):
         self.residue_embedder = ResidueEmbedder(
             dim_token=dim_token,
             dim_pair=dim_pair,
-            pair_row_chunk_size=self.pair_row_chunk_size,
             **kwargs,
         )
 
@@ -85,7 +79,6 @@ class ResOnly(nn.Module):
                 dim_opm_inner=int(dim_opm_inner),
                 dropout=dropout,
                 expansion_factor=expansion_factor,
-                row_chunk_size=self.pair_row_chunk_size,
             )
             for layer_index in range(n_layers)
             if layer_index % self.pair_update_interval == 0
