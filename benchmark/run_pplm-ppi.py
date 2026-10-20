@@ -11,9 +11,9 @@ from pathlib import Path
 
 import torch
 
-BENCHMARK_DIR = Path(__file__).resolve().parent
-if str(BENCHMARK_DIR) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_DIR))
+BENCHMARK_DIR = "/groups/sbinlab/clschf/PPLM"
+if BENCHMARK_DIR not in sys.path:
+    sys.path.insert(0, BENCHMARK_DIR)
 
 from common import (  # noqa: E402
     DEFAULT_DATA_ROOT,
@@ -37,12 +37,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weights",
-        default=str(BENCHMARK_DIR / "weights" / "ppi_models.pkl"),
+        default=str(Path(BENCHMARK_DIR) / "weights" / "ppi_models.pkl"),
         help="Ensemble of PPLM-PPI heads.",
     )
     parser.add_argument(
         "--backbone",
-        default=str(BENCHMARK_DIR / "weights" / "pplm_t33_650M.pt"),
+        default=str(Path(BENCHMARK_DIR) / "weights" / "pplm_t33_650M.pt"),
         help="PPLM t33 backbone checkpoint.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)

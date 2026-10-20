@@ -2,9 +2,9 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="src",
-    version="0.0.1",
-    description="Generative conformational ensemble prediction for monomers, multidomain proteins, and protein complexes.",
+    name="surpass-ppi",
+    version="0.1.0",
+    description="Sequence-only inter-protein contact and interaction prediction.",
     author="junjie zhu",
     author_email="shiroyuki@sjtu.edu.cn",
     url="https://github.com/junjie-zhu/SurPass",

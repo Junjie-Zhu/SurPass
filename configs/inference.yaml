@@ -12,10 +12,10 @@ data:
   batch_size: 1
   num_workers: 0
   pin_memory: true
-  max_full_length: 1024
+  maximum_length: 2048
   distance_bin_start: 2.0
   distance_bin_end: 22.0
-  distance_bin_count: 64
+  distance_bin_count: 16
   contact_threshold: 8.0
   ppi_score_threshold: 0.5
 
@@ -23,22 +23,23 @@ metrics:
   positive_weight: 0.01
 
 model:
-  n_layers: 9
-  dim_token: 768 
-  dim_pair: 512 
-  n_heads: 12
-  residual_mha: true
-  residual_transition: true
-  use_attn_pair_bias: true
-  use_qkln: true
-  dropout: 0.0 
+  n_layers: 2
+  cross_n_layers: 2
+  pair_n_layers: 2
+  dim_token: 384
+  dim_pair: 96
+  n_heads: 8
+  dropout: 0.0
   expansion_factor: 2
   plm_in_dim: 2560
-  plm_out_dim: 512 
-  r_max: 32
-  pair_update_interval: 3
-  pair_n_heads: 8
-  dim_opm_inner: 128 
+  plm_out_dim: 384
+  index_emb_dim: 64
+  topk_fraction: 0.01
+  maximum_topk: 64
+  allow_missing_physics: false
+
+runtime:
+  precision: bfloat16
 
 hydra:
   run:

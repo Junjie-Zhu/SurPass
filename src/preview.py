@@ -8,12 +8,9 @@ from torch.utils.data import Subset
 from src.data.balancing import build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
 from src.model.surpass import ResOnly
-from src.train import (
-    _cfg_get,
-    _unpack_batch,
-    build_model_kwargs,
-    resolve_cuda_device,
-)
+from src.runtime.checkpoint import load_checkpoint
+from src.runtime.config import build_model_kwargs, cfg_get
+from src.runtime.device import autocast_context, resolve_cuda_device, to_device
 from src.utils.ddp_utils import seed_everything
 
 PREVIEW_SAMPLE_COUNT = 5
@@ -29,22 +26,22 @@ def resolve_device() -> torch.device:
 
 
 def build_preview_loader(args: DictConfig):
-    sources = _cfg_get(args, "data.datasets", default=None)
+    sources = cfg_get(args, "data.datasets", default=None)
     if sources is None:
         raise ValueError("data.datasets must list at least one cluster source.")
     sources = OmegaConf.to_container(sources, resolve=True)
     train_dataset, _, _, _ = build_multi_source_split(
         sources,
         root_dir=args.data.root_dir,
-        test_fraction=args.data.test_fraction,
-        seed=args.seed,
-        negative_ratio=int(_cfg_get(args, "data.negative_ratio", default=1)),
         dataset_kwargs={
             "distance_bin_start": args.data.distance_bin_start,
             "distance_bin_end": args.data.distance_bin_end,
             "distance_bin_count": args.data.distance_bin_count,
-            "crop_size": None,
+            "crop_size": args.data.crop_size,
             "contact_threshold": args.data.contact_threshold,
+            "interface_crop_probability": float(
+                cfg_get(args, "data.interface_crop_probability", 0.8)
+            ),
         },
     )
     sample_count = min(PREVIEW_SAMPLE_COUNT, len(train_dataset))
@@ -68,10 +65,8 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
             "ckpt_dir is required. Example: "
             "python -m src.preview ckpt_dir=logs/<run>/checkpoints/epoch_N.pth"
         )
-    model_kwargs = build_model_kwargs(args, checkpoint_default=False)
-    model = ResOnly(**model_kwargs).to(device)
-    checkpoint = torch.load(args.ckpt_dir, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = ResOnly(**build_model_kwargs(args)).to(device)
+    load_checkpoint(args.ckpt_dir, model, map_location=device)
     model.eval()
     return model
 
@@ -85,17 +80,23 @@ def main(args: DictConfig):
 
     print(
         f"Previewing {sample_count} of {train_size} train samples "
-        f"(full-length, batch_size=1) from ckpt={args.ckpt_dir} on {device}"
+        f"(training crops, batch_size=1) from ckpt={args.ckpt_dir} on {device}"
     )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for index, step_batch in enumerate(loader):
-            residue_batch, labels = _unpack_batch(step_batch, device)
-            output = model(residue_batch)
+            residue_batch, labels = step_batch
+            residue_batch = to_device(residue_batch, device)
+            labels = to_device(labels, device)
+            with autocast_context(
+                device,
+                str(cfg_get(args, "runtime.precision", "bfloat16")),
+            ):
+                output = model(residue_batch)
             probability = float(torch.sigmoid(output.protein_logit.reshape(-1))[0].item())
-            label = bool(labels["is_positive"].reshape(-1)[0].item())
+            label = bool(labels["crop_is_positive"].reshape(-1)[0].item())
             print(
-                f"[sample {index:02d}] p_protein={probability:.4f} label={label}"
+                f"[sample {index:02d}] p_pair={probability:.4f} label={label}"
             )
 
 

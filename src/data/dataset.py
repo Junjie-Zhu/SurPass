@@ -3,6 +3,7 @@ import io
 import pickle
 import random
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import pandas as pd
 import torch
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset
 from src.data.cropping import (
     DEFAULT_CONTACT_THRESHOLD_A,
     DEFAULT_CROP_SIZE,
+    DEFAULT_INTERFACE_CROP_PROBABILITY,
     crop_negative_pair,
     crop_positive_pair,
 )
@@ -18,9 +20,18 @@ from src.data.labels import (
     DISTANCE_BIN_END_A,
     DISTANCE_BIN_NUM,
     DISTANCE_BIN_START_A,
-    build_negative_pair_labels,
     distance_to_bins,
 )
+
+
+class PairSample(NamedTuple):
+    p1_features: dict
+    p2_features: dict
+    label_inter_bins: torch.Tensor
+    label_inter_mask: torch.Tensor
+    crop_is_positive: bool
+    source_is_positive: bool
+    metadata: dict[str, Any]
 
 
 def _load_embedded_file(path: Path) -> dict:
@@ -43,6 +54,7 @@ class PepoTrainDataset(Dataset):
         distance_bin_count: int = DISTANCE_BIN_NUM,
         crop_size: int | None = DEFAULT_CROP_SIZE,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
+        interface_crop_probability: float = DEFAULT_INTERFACE_CROP_PROBABILITY,
         require_labels: bool = True,
     ):
         self.root_dir = Path(root_dir)
@@ -54,13 +66,28 @@ class PepoTrainDataset(Dataset):
         self.distance_bin_count = int(distance_bin_count)
         self.crop_size = None if crop_size is None else int(crop_size)
         self.contact_threshold = float(contact_threshold)
+        self.interface_crop_probability = float(interface_crop_probability)
 
         if self.distance_bin_count <= 0:
             raise ValueError("distance_bin_count must be positive.")
-        if self.crop_size is not None and self.crop_size <= 0:
-            raise ValueError("crop_size must be positive when provided.")
+        if self.crop_size is not None and self.crop_size < 2:
+            raise ValueError("crop_size must be at least 2 when provided.")
+        if not 0.0 <= self.interface_crop_probability <= 1.0:
+            raise ValueError("interface_crop_probability must be between 0 and 1.")
 
         self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
+        if "ppi_cluster_id" not in self.metadata.columns:
+            if "pair_id" not in self.metadata.columns:
+                raise ValueError(
+                    "Pair manifest must contain ppi_cluster_id or pair_id."
+                )
+            self.metadata["ppi_cluster_id"] = self.metadata["pair_id"].astype(str)
+        else:
+            missing_cluster = self.metadata["ppi_cluster_id"].isna()
+            if missing_cluster.any() and "pair_id" in self.metadata.columns:
+                self.metadata.loc[missing_cluster, "ppi_cluster_id"] = (
+                    self.metadata.loc[missing_cluster, "pair_id"].astype(str)
+                )
         required_columns = {"chain1", "chain2", "ppi_cluster_id"}
         if self.require_labels:
             required_columns.add("label_path")
@@ -80,7 +107,22 @@ class PepoTrainDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
-        return self.get_positive_item(idx)
+        row = self._sample_row(idx)
+        if "source_is_positive" not in self.metadata.columns:
+            sample = self._positive_sample_from_row(row)
+            return self.transform(sample) if self.transform is not None else sample
+        if self._as_bool(row["source_is_positive"]):
+            sample = self._positive_sample_from_row(row)
+            return self.transform(sample) if self.transform is not None else sample
+        p1_features, p2_features = self._load_pair_features(row)
+        return self._finalize_negative_sample(
+            p1_features,
+            p2_features,
+            negative_kind=str(self._row_value(row, "negative_kind", "curated")),
+            confidence=float(
+                self._row_value(row, "sample_confidence", 1.0)
+            ),
+        )
 
     def _sample_row(self, idx):
         cluster_id = self.items[idx]
@@ -92,65 +134,108 @@ class PepoTrainDataset(Dataset):
         p2_features = self._process_complex(self._load_chain_features(row["chain2"]))
         return p1_features, p2_features
 
-    def get_positive_item(self, idx):
-        sample = self._positive_sample_from_row(self._sample_row(idx))
-        if self.transform is not None:
-            sample = self.transform(sample)
-        return sample
-
     def _positive_sample_from_row(self, row):
         p1_features, p2_features = self._load_pair_features(row)
         label_path = self.root_dir / "labels" / Path(row["label_path"]).name
         pairwise_dist, pairwise_mask = self._load_pair_distance_and_mask(
             label_path, p1_features["mask"].shape[0], p2_features["mask"].shape[0]
         )
-        p1_features, p2_features, pairwise_dist, pairwise_mask, is_positive = crop_positive_pair(
+        (
+            p1_features,
+            p2_features,
+            pairwise_dist,
+            pairwise_mask,
+            crop_is_positive,
+            crop_metadata,
+        ) = crop_positive_pair(
             p1_features,
             p2_features,
             pairwise_dist,
             pairwise_mask,
             crop_size=self.crop_size,
             contact_threshold=self.contact_threshold,
+            interface_crop_probability=self.interface_crop_probability,
         )
-        label_bins = distance_to_bins(
-            pairwise_dist,
+        p1_length = int(p1_features["mask"].shape[0])
+        label_inter_dist = pairwise_dist[:p1_length, p1_length:]
+        label_inter_mask = pairwise_mask[:p1_length, p1_length:].to(dtype=torch.bool)
+        label_inter_bins = distance_to_bins(
+            label_inter_dist,
             bin_start=self.distance_bin_start,
             bin_end=self.distance_bin_end,
             bin_count=self.distance_bin_count,
         )
-        return (p1_features, p2_features, label_bins, pairwise_mask, is_positive)
+        crop_metadata.update(
+            {
+                "source_kind": "positive",
+                "sample_confidence": 1.0,
+            }
+        )
+        return PairSample(
+            p1_features,
+            p2_features,
+            label_inter_bins,
+            label_inter_mask,
+            crop_is_positive,
+            True,
+            crop_metadata,
+        )
 
-    def get_negative_item(self, p1_idx: int, p2_idx: int):
-        if self.items[p1_idx] == self.items[p2_idx]:
-            raise ValueError("Negative samples must use chains from different PPI clusters.")
+    @staticmethod
+    def _row_value(row, key: str, default):
+        value = row.get(key, default)
+        return default if pd.isna(value) else value
 
-        p1_row = self._sample_row(p1_idx)
-        p2_row = self._sample_row(p2_idx)
-        p1_features = self._process_complex(self._load_chain_features(p1_row["chain1"]))
-        p2_features = self._process_complex(self._load_chain_features(p2_row["chain2"]))
-        return self._finalize_negative_sample(p1_features, p2_features)
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not pd.isna(value):
+            return bool(value)
+        lowered = str(value).strip().lower()
+        if lowered in {"true", "1", "yes", "positive", "pos"}:
+            return True
+        if lowered in {"false", "0", "no", "negative", "neg"}:
+            return False
+        raise ValueError(f"Unsupported source_is_positive value: {value!r}")
 
-    def get_static_negative_item(self, idx):
-        row = self._sample_row(idx)
-        p1_features, p2_features = self._load_pair_features(row)
-        return self._finalize_negative_sample(p1_features, p2_features)
-
-    def _finalize_negative_sample(self, p1_features: dict, p2_features: dict):
-        p1_features, p2_features = crop_negative_pair(
+    def _finalize_negative_sample(
+        self,
+        p1_features: dict,
+        p2_features: dict,
+        *,
+        negative_kind: str,
+        confidence: float,
+    ):
+        p1_features, p2_features, crop_metadata = crop_negative_pair(
             p1_features,
             p2_features,
             crop_size=self.crop_size,
         )
-        label_bins, label_mask = build_negative_pair_labels(
-            p1_features["residue_position"],
-            p1_features["mask"],
-            p2_features["residue_position"],
-            p2_features["mask"],
-            bin_start=self.distance_bin_start,
-            bin_end=self.distance_bin_end,
-            bin_count=self.distance_bin_count,
+        p1_mask = p1_features["mask"].to(dtype=torch.bool)
+        p2_mask = p2_features["mask"].to(dtype=torch.bool)
+        label_inter_bins = torch.full(
+            (int(p1_mask.shape[0]), int(p2_mask.shape[0])),
+            self.distance_bin_count - 1,
+            dtype=torch.long,
+            device=p1_mask.device,
         )
-        sample = (p1_features, p2_features, label_bins, label_mask, False)
+        label_inter_mask = p1_mask[:, None] & p2_mask[None, :]
+        crop_metadata.update(
+            {
+                "source_kind": str(negative_kind),
+                "sample_confidence": float(confidence),
+            }
+        )
+        sample = PairSample(
+            p1_features,
+            p2_features,
+            label_inter_bins,
+            label_inter_mask,
+            False,
+            False,
+            crop_metadata,
+        )
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
@@ -209,15 +294,6 @@ class PepoTrainDataset(Dataset):
             key: value.copy() if hasattr(value, "copy") else value
             for key, value in residue_features.items()
         }
-        residue_features["atom14_positions"] = self._to_tensor(
-            residue_features["atom14_positions"], dtype=torch.float32
-        )
-        residue_features["atom14_mask"] = self._to_tensor(
-            residue_features["atom14_mask"], dtype=torch.bool
-        )
-        residue_features["cb_positions"] = self._to_tensor(
-            residue_features["cb_positions"], dtype=torch.float32
-        )
         residue_features["cb_mask"] = self._to_tensor(
             residue_features["cb_mask"], dtype=torch.bool
         )
@@ -238,9 +314,6 @@ class PepoTrainDataset(Dataset):
             "plm_emb": residue_features["plm_emb"],
             "residue_type": residue_features["residue_type"],
             "residue_index": residue_features["residue_index"],
-            "residue_position": residue_features["cb_positions"],
             "chain_index": residue_features["chain_index"],
             "mask": residue_features["cb_mask"],
-            "atom14_positions": residue_features["atom14_positions"],
-            "atom14_mask": residue_features["atom14_mask"],
         }

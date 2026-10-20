@@ -633,15 +633,47 @@ def _embed_on_devices(
     return _merge_stats(parts), errors
 
 
+def _existing_embedding_ids(embedding_dir: Path, chain_ids: set[str]) -> set[str]:
+    """Chain ids in ``chain_ids`` that already have ``<embedding_dir>/<chain_id>.pt``.
+
+    One listing of ``embedding_dir`` replaces a stat per chain. The bar counts
+    directory entries as they arrive, which is the slow part on a shared filesystem.
+    """
+    if not chain_ids:
+        return set()
+    print(
+        f"Checking {len(chain_ids)} chains for existing embeddings in {embedding_dir}",
+        flush=True,
+    )
+    existing: set[str] = set()
+    with os.scandir(embedding_dir) as entries, tqdm(
+        desc="Checking existing embeddings",
+        unit="file",
+    ) as progress:
+        for entry in entries:
+            progress.update(1)
+            name = entry.name
+            if not name.endswith(".pt"):
+                continue
+            chain_id = name.removesuffix(".pt")
+            if chain_id not in chain_ids:
+                continue
+            try:
+                is_file = entry.is_file()
+            except OSError:
+                continue
+            if is_file:
+                existing.add(chain_id)
+    return existing
+
+
 def _read_pdb_sequence(
-    task: tuple[str, str, str, bool],
-) -> tuple[str, str | None, str | None, bool]:
-    chain_id, processed_dir, embedding_dir, skip_existing = task
-    if skip_existing and (Path(embedding_dir) / f"{chain_id}.pt").is_file():
-        return chain_id, None, None, True
+    task: tuple[str, str],
+) -> tuple[str, str | None, str | None]:
+    chain_id, processed_dir = task
     feature_path = Path(processed_dir) / f"{chain_id}.pkl"
     if not feature_path.is_file():
-        return chain_id, None, f"{chain_id}: missing feature file {feature_path}", False
+        return chain_id, None, f"{chain_id}: missing feature file {feature_path}"
     try:
         with feature_path.open("rb") as handle:
             feature_dict = pickle.load(handle)
@@ -649,8 +681,8 @@ def _read_pdb_sequence(
         if not sequence:
             raise ValueError("resseq is empty")
     except Exception as exc:
-        return chain_id, None, f"{chain_id}: {type(exc).__name__}: {exc}", False
-    return chain_id, sequence, None, False
+        return chain_id, None, f"{chain_id}: {type(exc).__name__}: {exc}"
+    return chain_id, sequence, None
 
 
 def _pdb_entries(
@@ -671,10 +703,17 @@ def _pdb_entries(
     chain_ids = sorted(
         set(pairs["chain1"].dropna().astype(str)) | set(pairs["chain2"].dropna().astype(str))
     )
-    tasks = [
-        (chain_id, str(processed_dir), str(embedding_dir), skip_existing)
-        for chain_id in chain_ids
-    ]
+    if skip_existing:
+        existing = _existing_embedding_ids(embedding_dir, set(chain_ids))
+        pending_ids = [chain_id for chain_id in chain_ids if chain_id not in existing]
+        skipped = len(chain_ids) - len(pending_ids)
+    else:
+        pending_ids = chain_ids
+        skipped = 0
+    if not pending_ids:
+        return [], [], skipped
+
+    tasks = [(chain_id, str(processed_dir)) for chain_id in pending_ids]
     if workers > 1 and len(tasks) > 1:
         chunksize = max(1, len(tasks) // (workers * 4))
         with mp.Pool(workers) as pool:
@@ -692,11 +731,7 @@ def _pdb_entries(
 
     entries = []
     errors = []
-    skipped = 0
-    for chain_id, sequence, error, was_skipped in results:
-        if was_skipped:
-            skipped += 1
-            continue
+    for chain_id, sequence, error in results:
         if error is not None:
             errors.append(error)
             continue
@@ -715,10 +750,16 @@ def _afdb_entries(
         raise FileNotFoundError(f"Cannot find AFDB FASTA: {fasta_path}")
     sequences = read_fasta_sequences(fasta_path)
     print(f"AFDB sequences: {fasta_path} ({len(sequences)} records)")
+    ordered = sorted(sequences.items())
+    existing = (
+        _existing_embedding_ids(embedding_dir, {chain_id for chain_id, _ in ordered})
+        if skip_existing
+        else set()
+    )
     entries = []
     skipped = 0
-    for chain_id, sequence in sorted(sequences.items()):
-        if skip_existing and (embedding_dir / f"{chain_id}.pt").is_file():
+    for chain_id, sequence in ordered:
+        if chain_id in existing:
             skipped += 1
             continue
         entries.append((chain_id, sequence))

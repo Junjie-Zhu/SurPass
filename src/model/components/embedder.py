@@ -1,10 +1,19 @@
+"""Residue and rectangular inter-chain pair embeddings.
+
+The model never materializes a square pair-input feature tensor. Expensive
+physics curves are projected on the 21x21 residue table first and only then
+looked up for the L1xL2 inter-chain block.
+"""
+
+from __future__ import annotations
+
 import math
+import warnings
 from functools import lru_cache
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.common.calvados.calvados_functions import (
     compute_ashbaugh_hatch,
@@ -14,396 +23,309 @@ from src.common.calvados.calvados_functions import (
 from src.common.mpipi.mpipi_functions import coulomb, load_mpipi_arrays, wang_frenkel
 from src.common.residue_constants import restypes, restypes_with_x
 from src.model.loss import distance_bin_centers
+from src.model.components.transformer import SwiGLU, Transition
 
 NUM_RESIDUE_TYPES = len(restypes_with_x)
 N_ENERGY_CHANNELS = 4
-k_BOLTZMANN = 0.0083144721  # kJ/mol/K
+K_BOLTZMANN = 0.0083144721
 CALVADOS_TEMP = 298.15
-_MIN_CALVADOS_DISTANCE_NM = 1e-6
 
 
-def normalize_pair_energy(energy_kt):
-    """asinh(E/kT) keeps attractive wells nearly linear and compresses the repulsive wall."""
-    return np.arcsinh(np.asarray(energy_kt, dtype=np.float64))
+def normalize_pair_energy(value: np.ndarray) -> np.ndarray:
+    return np.arcsinh(np.asarray(value, dtype=np.float64))
 
 
-def _calvados_energy_channels(centers_a: np.ndarray, temp: float) -> tuple[np.ndarray, np.ndarray]:
-    """Yukawa and Ashbaugh-Hatch, each asinh(E/kT), shape [20, 20, bins]."""
-    model = load_calvados_model(
-        version="CALVADOS2",
-        salt=0.150,
-        pH=7.4,
-        temp=temp,
+def _calvados_channels(
+    centers_a: np.ndarray,
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    model = load_calvados_model(temp=temperature)
+    distance_nm = np.maximum(
+        np.asarray(centers_a, dtype=np.float64) * 0.1,
+        1e-6,
     )
-    r_nm = np.maximum(np.asarray(centers_a, dtype=np.float64) * 0.1, _MIN_CALVADOS_DISTANCE_NM)
-    aa_names = list(restypes)
-    sigma = model.sigmamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
-    lam = model.lambdamap.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
-    yukawa_q = model.yukawa_eps.loc[aa_names, aa_names].to_numpy(dtype=np.float64)
-
-    r_b = r_nm[None, None, :]
+    names = list(restypes)
+    sigma = model.sigmamap.loc[names, names].to_numpy(dtype=np.float64)
+    lam = model.lambdamap.loc[names, names].to_numpy(dtype=np.float64)
+    charge = model.yukawa_eps.loc[names, names].to_numpy(dtype=np.float64)
+    r = distance_nm[None, None, :]
     yukawa = compute_yukawa(
-        r_b,
-        yukawa_q[:, :, None],
+        r,
+        charge[:, :, None],
         model.yukawa_kappa,
         yukawa_r_cut=model.yukawa_r_cut,
     )
     ashbaugh = compute_ashbaugh_hatch(
-        r_b,
+        r,
         sigma[:, :, None],
         lam[:, :, None],
         cutoff=model.cutoff,
         lj_eps=model.lj_eps,
     )
-    yukawa = np.where(r_b > model.yukawa_r_cut, 0.0, yukawa)
-    ashbaugh = np.where(r_b > model.cutoff, 0.0, ashbaugh)
-    kt = k_BOLTZMANN * float(temp)
+    yukawa = np.where(r > model.yukawa_r_cut, 0.0, yukawa)
+    ashbaugh = np.where(r > model.cutoff, 0.0, ashbaugh)
+    kt = K_BOLTZMANN * float(temperature)
     return normalize_pair_energy(yukawa / kt), normalize_pair_energy(ashbaugh / kt)
 
 
-def _mpipi_energy_channels(centers_a: np.ndarray, temp: float) -> tuple[np.ndarray, np.ndarray]:
-    """Coulomb and Wang-Frenkel, each asinh(E/kT), shape [20, 20, bins]."""
+def _mpipi_channels(
+    centers_a: np.ndarray,
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray]:
     params = load_mpipi_arrays(list(restypes))
-    r_b = np.asarray(centers_a, dtype=np.float64)[None, None, :]
+    r = np.asarray(centers_a, dtype=np.float64)[None, None, :]
     electrostatic = coulomb(
         params["charge"][:, None, None],
         params["charge"][None, :, None],
-        r_b,
+        r,
     )
-    lennard_jones = wang_frenkel(
-        r_b,
+    contact = wang_frenkel(
+        r,
         params["sigma"][:, :, None],
         params["epsilon"][:, :, None],
         params["mu"][:, :, None],
         params["nu"][:, :, None],
     )
-    kt = k_BOLTZMANN * float(temp)
-    return (
-        normalize_pair_energy(electrostatic / kt),
-        normalize_pair_energy(lennard_jones / kt),
-    )
-
-
-def _build_pair_bin_energy_table(
-    min_dist: float,
-    max_dist: float,
-    dim: int,
-    temp: float,
-) -> torch.Tensor:
-    """Four asinh(E/kT) channels at each shared distance-bin center.
-
-    Channel order is Calvados Yukawa, Calvados Ashbaugh-Hatch, Mpipi Coulomb,
-    Mpipi Wang-Frenkel. Shape [n_aa, n_aa, 4, bins]. Unknown residues stay zero.
-    """
-    centers_a = distance_bin_centers(min_dist, max_dist, dim).detach().cpu().numpy()
-    channels = (
-        *_calvados_energy_channels(centers_a, temp),
-        *_mpipi_energy_channels(centers_a, temp),
-    )
-    table = np.zeros(
-        (NUM_RESIDUE_TYPES, NUM_RESIDUE_TYPES, N_ENERGY_CHANNELS, int(dim)),
-        dtype=np.float32,
-    )
-    n_canonical = len(restypes)
-    for index, channel in enumerate(channels):
-        table[:n_canonical, :n_canonical, index] = np.asarray(channel, dtype=np.float32)
-    return torch.from_numpy(table)
+    kt = K_BOLTZMANN * float(temperature)
+    return normalize_pair_energy(electrostatic / kt), normalize_pair_energy(contact / kt)
 
 
 @lru_cache(maxsize=8)
-def _cached_pair_bin_energy_table(
-    min_dist: float,
-    max_dist: float,
-    dim: int,
-    temp: float,
+def _cached_energy_table(
+    minimum: float,
+    maximum: float,
+    count: int,
+    temperature: float,
 ) -> torch.Tensor:
-    return _build_pair_bin_energy_table(min_dist, max_dist, dim, temp)
+    centers = distance_bin_centers(minimum, maximum, count).numpy()
+    channels = (
+        *_calvados_channels(centers, temperature),
+        *_mpipi_channels(centers, temperature),
+    )
+    table = np.zeros(
+        (NUM_RESIDUE_TYPES, NUM_RESIDUE_TYPES, N_ENERGY_CHANNELS, int(count)),
+        dtype=np.float32,
+    )
+    canonical = len(restypes)
+    for index, channel in enumerate(channels):
+        table[:canonical, :canonical, index] = channel
+    return torch.from_numpy(table)
 
 
 def build_pair_bin_energy_table(
-    min_dist: float,
-    max_dist: float,
-    dim: int,
+    minimum: float,
+    maximum: float,
+    count: int,
     *,
-    temp: float = CALVADOS_TEMP,
+    temperature: float = CALVADOS_TEMP,
+    allow_missing: bool = False,
 ) -> torch.Tensor:
-    """Return a cloned residue-pair energy lookup. Physics is computed once per key."""
-    return _cached_pair_bin_energy_table(
-        float(min_dist),
-        float(max_dist),
-        int(dim),
-        float(temp),
-    ).clone()
+    """Build the fixed residue-pair physics table.
 
-
-# Adapted from frameflow code
-def get_index_embedding(indices, edim, max_len=2056):
-    """Creates sine / cosine positional embeddings from a prespecified indices.
-
-    Args:
-        indices: offsets of type integer, shape either [n] or [b, n].
-        edim: dimension of the embeddings to create.
-        max_len: maximum length.
-
-    Returns:
-        positional embedding of shape either [n, edim] or [b, n, edim]
+    Missing external parameter files are an explicit error in production.
+    Tests and lightweight installations may request a zero initialization.
     """
-    # indices [n] of [b, n]
-    K = torch.arange(edim // 2, device=indices.device)  # [edim / 2]
-
-    if len(indices.shape) == 1:  # [n]
-        K = K[None, ...]
-    elif len(indices.shape) == 2:  # [b, n]
-        K = K[None, None, ...]
-
-    pos_embedding_sin = torch.sin(
-        indices[..., None] * math.pi / (max_len ** (2 * K / edim))
-    ).to(indices.device)
-    # [n, 1] / [1, edim/2] -> [n, edim/2] or [b, n, 1] / [1, 1, edim/2] -> [b, n, edim/2]
-    pos_embedding_cos = torch.cos(
-        indices[..., None] * math.pi / (max_len ** (2 * K / edim))
-    ).to(indices.device)
-    pos_embedding = torch.cat(
-        [pos_embedding_sin, pos_embedding_cos], axis=-1
-    )  # [n, edim]
-    return pos_embedding
-
-
-def within_chain_index(chain_index: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Sequential position 0..L-1 inside each chain, ignoring padding.
-
-    PDB residue numbers have gaps and are not what inference provides.
-    Both sides use this count of earlier valid residues on the same chain.
-    """
-    length = int(chain_index.shape[-1])
-    position = torch.arange(length, device=chain_index.device)
-    valid = mask.to(dtype=torch.bool)
-    same_chain = chain_index[:, :, None] == chain_index[:, None, :]
-    both_valid = valid[:, :, None] & valid[:, None, :]
-    earlier = position.view(1, 1, length) < position.view(1, length, 1)
-    return (same_chain & both_valid & earlier).to(dtype=torch.long).sum(dim=-1)
+    try:
+        return _cached_energy_table(
+            float(minimum),
+            float(maximum),
+            int(count),
+            float(temperature),
+        ).clone()
+    except FileNotFoundError:
+        if not allow_missing:
+            raise
+        warnings.warn(
+            "CALVADOS/Mpipi parameters are unavailable; physics features are "
+            "zero-initialized.",
+            RuntimeWarning,
+        )
+        return torch.zeros(
+            NUM_RESIDUE_TYPES,
+            NUM_RESIDUE_TYPES,
+            N_ENERGY_CHANNELS,
+            int(count),
+        )
 
 
-def relative_position_encoding(
-    token_index: torch.Tensor,
-    residue_index: torch.Tensor,
+def sinusoidal_position_embedding(
+    position: torch.Tensor,
+    dimension: int,
+    *,
+    maximum_period: int = 4096,
+) -> torch.Tensor:
+    if dimension <= 0 or dimension % 2:
+        raise ValueError("position embedding dimension must be a positive even integer")
+    frequency = torch.arange(
+        dimension // 2,
+        device=position.device,
+        dtype=torch.float32,
+    )
+    frequency = math.pi / (
+        float(maximum_period) ** (2.0 * frequency / float(dimension))
+    )
+    angle = position.to(dtype=torch.float32)[..., None] * frequency
+    return torch.cat((torch.sin(angle), torch.cos(angle)), dim=-1)
+
+
+def within_chain_index(
     chain_index: torch.Tensor,
     mask: torch.Tensor,
-    r_max: int,
-):
-    pair_mask = mask.to(dtype=torch.bool)
-    pair_mask = pair_mask[..., None] & pair_mask[..., None, :]
-
-    same_chain_mask = (chain_index[:, :, None] == chain_index[:, None, :]).long()
-    rel_pos_chain = F.one_hot(same_chain_mask.clamp(0, 1), 2)
-
-    rel_pos_classes = 2 * (int(r_max) + 1)
-    d_residue = torch.clip(
-        input=residue_index[:, :, None] - residue_index[:, None, :] + r_max,
-        min=0, max=2 * r_max,
-    ) * same_chain_mask + (1 - same_chain_mask) * (2 * r_max + 1)
-    rel_pos_residue = F.one_hot(
-        d_residue.long().clamp(0, rel_pos_classes - 1), rel_pos_classes
-    )
-
-    # add a global position encoding
-    d_token = torch.clip(
-        input=token_index[:, :, None] - token_index[:, None, :] + r_max,
-        min=0, max=2 * r_max,
-    )
-    rel_pos_token = F.one_hot(
-        d_token.long().clamp(0, rel_pos_classes - 1), rel_pos_classes
-    )
-
-    rel_pos = torch.cat([rel_pos_token, rel_pos_residue, rel_pos_chain], dim=-1).float()
-    return rel_pos * pair_mask[..., None].to(dtype=rel_pos.dtype)  # [b, n, n, 2 + 4 * (r_max + 1)]
+) -> torch.Tensor:
+    """Return 0-based positions independently inside each chain."""
+    length = int(chain_index.shape[-1])
+    token = torch.arange(length, device=chain_index.device)
+    valid = mask.to(dtype=torch.bool)
+    same_chain = chain_index[:, :, None] == chain_index[:, None, :]
+    earlier = token.view(1, 1, length) < token.view(1, length, 1)
+    both_valid = valid[:, :, None] & valid[:, None, :]
+    return (same_chain & earlier & both_valid).sum(dim=-1)
 
 
-def bin_pairwise_distances(x, min_dist, max_dist, dim):
-    """
-    Takes coordinates and bins the pairwise distances.
-
-    Args:
-        x: Coordinates of shape [b, n, 3]
-        min_dist: Right limit of first bin
-        max_dist: Left limit of last bin
-        dim: Dimension of the final one hot vectors
-
-    Returns:
-        Tensor of shape [b, n, n, dim] consisting of one-hot vectors
-    """
-    pair_dists_nm = torch.norm(x[:, :, None, :] - x[:, None, :, :], dim=-1)  # [b, n, n]
-    bin_limits = torch.linspace(
-        min_dist, max_dist, dim - 1, device=x.device
-    )  # Open left and right
-    return bin_and_one_hot(pair_dists_nm, bin_limits)  # [b, n, n, pair_dist_dim]
-
-
-def bin_and_one_hot(tensor, bin_limits):
-    """
-    Converts a tensor of shape [*] to a tensor of shape [*, d] using the given bin limits.
-
-    Args:
-        tensor (Tensor): Input tensor of shape [*]
-        bin_limits (Tensor): bin limits [l1, l2, ..., l_{d-1}]. d-1 limits define
-            d-2 bins, and the first one is <l1, the last one is >l_{d-1}, giving a total of d bins.
-
-    Returns:
-        torch.Tensor: Output tensor of shape [*, d] where d = len(bin_limits) + 1
-    """
-    bin_indices = torch.bucketize(tensor, bin_limits)
-    return torch.nn.functional.one_hot(bin_indices, len(bin_limits) + 1) * 1.0
+def _normalized_position(mask: torch.Tensor) -> torch.Tensor:
+    length = mask.sum(dim=-1, keepdim=True).clamp_min(1)
+    index = torch.arange(mask.shape[-1], device=mask.device).view(1, -1)
+    denominator = (length - 1).clamp_min(1)
+    return (index / denominator).to(dtype=torch.float32) * mask
 
 
 class ResidueEmbedder(nn.Module):
+    """Embed residues and construct only the L1xL2 inter-chain pair block."""
+
     def __init__(
         self,
         dim_token: int,
         dim_pair: int,
-        **kwargs,
+        *,
+        plm_in_dim: int = 2560,
+        plm_out_dim: int = 384,
+        index_emb_dim: int = 64,
+        distance_bin_start: float = 2.0,
+        distance_bin_end: float = 22.0,
+        distance_bin_count: int = 16,
+        allow_missing_physics: bool = False,
+        **_: object,
     ):
-        # residue features contain:
-        # 1. plm embedding (single)
-        # 2. residue type (single)
-        # 3. within-chain sequential index (single)
-        # 4. chain break per residue (single)
-        # 5. four binned pair energies (pair; sequence, available at test time):
-        #    Calvados Yukawa, Calvados Ashbaugh-Hatch, Mpipi Coulomb, Mpipi Wang-Frenkel
-        # 6. relative position encoding (pair), using the same sequential index
-
         super().__init__()
-        self.dim_token = dim_token
-        self.dim_pair = dim_pair
+        self.dim_token = int(dim_token)
+        self.dim_pair = int(dim_pair)
+        self.distance_bin_count = int(distance_bin_count)
+        self.index_emb_dim = int(index_emb_dim)
 
-        self.r_max = kwargs.get('r_max', 32)
-        self.distance_bin_start = float(kwargs.get("distance_bin_start", 2.0))
-        self.distance_bin_end = float(kwargs.get("distance_bin_end", 22.0))
-        self.distance_bin_count = int(kwargs.get("distance_bin_count", 64))
-        if self.distance_bin_count < 2:
-            raise ValueError(
-                f"distance_bin_count must be at least 2, got {self.distance_bin_count}."
-            )
-        self.plm_in_dim = kwargs.get('plm_in_dim', 1280)
-        self.plm_out_dim = kwargs.get('plm_out_dim', 256)
-        self.index_emb_dim = int(kwargs.get("index_emb_dim", 128))
-        if self.index_emb_dim <= 0 or self.index_emb_dim % 2 != 0:
-            raise ValueError(
-                f"index_emb_dim must be a positive even integer, got {self.index_emb_dim}."
-            )
-        
-        self.plm_embedder = nn.Linear(self.plm_in_dim, self.plm_out_dim)
-        
-        single_dim = self.plm_out_dim + NUM_RESIDUE_TYPES + 1 + self.index_emb_dim
-        self.single_out = nn.Linear(single_dim, self.dim_token)
-
-        pair_dim = N_ENERGY_CHANNELS * self.distance_bin_count + 2 + 4 * (self.r_max + 1)
-        self.pair_out = nn.Linear(pair_dim, self.dim_pair)
-        self.register_buffer(
-            "pair_bin_energies",
-            build_pair_bin_energy_table(
-                self.distance_bin_start,
-                self.distance_bin_end,
-                self.distance_bin_count,
-            ),
-            persistent=False,
+        aa_dim = min(64, self.dim_token // 4)
+        self.plm_projection = nn.Linear(int(plm_in_dim), int(plm_out_dim))
+        self.residue_embedding = nn.Embedding(NUM_RESIDUE_TYPES, aa_dim)
+        single_input = int(plm_out_dim) + aa_dim + self.index_emb_dim
+        self.single_projection = nn.Sequential(
+            nn.LayerNorm(single_input),
+            nn.Linear(single_input, self.dim_token),
         )
 
-    def pair_energies(self, residue_type: torch.Tensor) -> torch.Tensor:
-        aa = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
-        return self.pair_bin_energies[aa[:, :, None], aa[:, None, :]]
+        energy_table = build_pair_bin_energy_table(
+            distance_bin_start,
+            distance_bin_end,
+            self.distance_bin_count,
+            allow_missing=bool(allow_missing_physics),
+        )
+        self.register_buffer("pair_bin_energies", energy_table, persistent=False)
+        energy_dimension = N_ENERGY_CHANNELS * self.distance_bin_count
+        self.physics_projection = nn.Linear(
+            energy_dimension,
+            self.dim_pair,
+            bias=False,
+        )
+
+        self.pair_left = nn.Linear(self.dim_token, self.dim_pair, bias=False)
+        self.pair_product = nn.Linear(self.dim_token, self.dim_pair, bias=False)
+        self.position_projection = nn.Sequential(
+            nn.Linear(4, self.dim_pair),
+            SwiGLU(),
+            nn.Linear(self.dim_pair, self.dim_pair),
+        )
+        self.inter_chain_embedding = nn.Parameter(torch.zeros(self.dim_pair))
+        self.pair_transition = Transition(self.dim_pair)
 
     def forward(
         self,
         plm_emb: torch.Tensor,
         residue_type: torch.Tensor,
-        residue_index: torch.Tensor,
-        residue_position: torch.Tensor,
         chain_index: torch.Tensor,
         mask: torch.Tensor,
-        **kwargs,
-    ):
-        plm_emb = self.plm_embedder(plm_emb)
-        if residue_index.shape[:2] != chain_index.shape[:2]:
-            raise ValueError(
-                f"residue_index shape {tuple(residue_index.shape)} does not match "
-                f"chain_index shape {tuple(chain_index.shape)}."
-            )
-
+        **_: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = mask.to(dtype=torch.bool)
         residue_type = residue_type.long().clamp(0, NUM_RESIDUE_TYPES - 1)
-        residue_type_emb = F.one_hot(residue_type, num_classes=NUM_RESIDUE_TYPES).to(
-            dtype=plm_emb.dtype
+        sequential_index = within_chain_index(chain_index.long(), mask)
+        position = sinusoidal_position_embedding(
+            sequential_index,
+            self.index_emb_dim,
+        ).to(dtype=plm_emb.dtype)
+        plm_features = self.plm_projection(plm_emb)
+        feature_dtype = plm_features.dtype
+        features = torch.cat(
+            (
+                plm_features,
+                self.residue_embedding(residue_type).to(dtype=feature_dtype),
+                position.to(dtype=feature_dtype),
+            ),
+            dim=-1,
         )
+        return self.single_projection(features) * mask[..., None]
 
-        chain_break_emb = (chain_index[:, 1:] != chain_index[:, :-1]).float()  # [b, n-1]
-        chain_break_emb = F.pad(chain_break_emb, (0, 1), mode="constant", value=0.0)[..., None]  # [b, n, 1]
-
-        seq_index = within_chain_index(chain_index, mask)
-        index_emb = get_index_embedding(seq_index, self.index_emb_dim).to(dtype=plm_emb.dtype)
-        token_index = torch.arange(
-            seq_index.shape[1], device=seq_index.device, dtype=seq_index.dtype
-        ).unsqueeze(0).expand_as(seq_index)
-        rel_pos_emb = relative_position_encoding(
-            token_index, seq_index, chain_index, mask, self.r_max
-        )
-
-        pairwise_dist_emb = self.pair_energies(residue_type).to(
-            device=residue_position.device,
-            dtype=residue_position.dtype,
-        ).flatten(start_dim=-2)
-
-        single_repr = self.single_out(
-            torch.cat([plm_emb, residue_type_emb, chain_break_emb, index_emb], dim=-1)
-            * mask[..., None]
-        )
-        pair_mask = mask[..., None] * mask[..., None, :]
-        pair_repr = self.pair_out(
-            torch.cat([pairwise_dist_emb, rel_pos_emb], dim=-1)
-            * pair_mask[..., None]
-        )
-        return single_repr, pair_repr, mask
-
-
-class AtomEmbedder(nn.Module):
-    def __init__(
+    def cross_pair(
         self,
-        dim_atom: int,
-        **kwargs,
-    ):
-        # atom features contain:
-        # 1. atom name (single)
-        # 2. atom element (single)
-        # 3. atom charge (single)
-        # 4. atom position (single)
-        super().__init__()
-        self.atom_name_vocab_size = int(kwargs.get("atom_name_vocab_size", 64))
-        self.linear_out = nn.Linear(3 + 1 + 4 * self.atom_name_vocab_size, dim_atom, bias=False)
+        chain_1: torch.Tensor,
+        chain_2: torch.Tensor,
+        type_1: torch.Tensor,
+        type_2: torch.Tensor,
+        mask_1: torch.Tensor,
+        mask_2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Construct an order-equivariant rectangular inter-chain map."""
+        mask_1 = mask_1.to(dtype=torch.bool)
+        mask_2 = mask_2.to(dtype=torch.bool)
+        pair_mask = mask_1[:, :, None] & mask_2[:, None, :]
 
-    def forward(
-        self,
-        atom_name: torch.Tensor,
-        atom_charge: torch.Tensor,
-        atom_position: torch.Tensor,
-        mask: torch.Tensor,
-        **kwargs,
-    ):
-        if atom_charge.dim() == atom_position.dim() - 1:
-            atom_charge = atom_charge.unsqueeze(-1)
-
-        if atom_name.dim() == atom_position.dim():
-            atom_name = F.one_hot(
-                atom_name.long().clamp_min(0).clamp_max(self.atom_name_vocab_size - 1),
-                num_classes=self.atom_name_vocab_size,
-            )
-        elif atom_name.dim() != atom_position.dim() + 1:
-            raise ValueError(
-                "atom_name must be either index-encoded (..., 4) or one-hot (..., 4, vocab)."
-            )
-
-        atom_name = atom_name.to(dtype=atom_position.dtype)
-        atom_name_feat = atom_name.reshape(*atom_position.shape[:-1], -1)
-
-        atom_repr = self.linear_out(
-            torch.cat([atom_position, atom_charge, atom_name_feat], dim=-1)
-            * mask[..., None]
+        left = self.pair_left(chain_1)
+        right = self.pair_left(chain_2)
+        left_product = self.pair_product(chain_1)
+        right_product = self.pair_product(chain_2)
+        pair = (
+            left[:, :, None, :]
+            + right[:, None, :, :]
+            + left_product[:, :, None, :] * right_product[:, None, :, :]
         )
-        return atom_repr, mask
+
+        symmetric_energy = 0.5 * (
+            self.pair_bin_energies
+            + self.pair_bin_energies.transpose(0, 1)
+        )
+        flat_energy = symmetric_energy.flatten(start_dim=-2)
+        projected_energy = self.physics_projection(
+            flat_energy.to(
+                device=pair.device,
+                dtype=self.physics_projection.weight.dtype,
+            )
+        )
+        projected_energy = projected_energy.to(dtype=pair.dtype)
+        type_1 = type_1.long().clamp(0, NUM_RESIDUE_TYPES - 1)
+        type_2 = type_2.long().clamp(0, NUM_RESIDUE_TYPES - 1)
+        pair = pair + projected_energy[type_1[:, :, None], type_2[:, None, :]]
+
+        position_1 = _normalized_position(mask_1)
+        position_2 = _normalized_position(mask_2)
+        p1 = position_1[:, :, None].expand(-1, -1, position_2.shape[1])
+        p2 = position_2[:, None, :].expand(-1, position_1.shape[1], -1)
+        position_features = torch.stack(
+            (
+                p1 + p2,
+                (p1 - p2).abs(),
+                (1.0 - p1) + (1.0 - p2),
+                ((1.0 - p1) - (1.0 - p2)).abs(),
+            ),
+            dim=-1,
+        ).to(dtype=pair.dtype)
+        pair = pair + self.position_projection(position_features)
+        pair = pair + self.inter_chain_embedding.to(dtype=pair.dtype)
+        pair = self.pair_transition(pair)
+        return pair * pair_mask[..., None], pair_mask

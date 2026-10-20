@@ -1,219 +1,313 @@
+"""SurPass v2: an O(L1*L2) inter-chain contact model."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict
+from typing import Mapping
 
 import torch
-import torch.nn as nn
+from torch import nn
 
+from src.data.labels import contact_bin_count
 from src.model.components.embedder import ResidueEmbedder
-from src.model.components.pair_block import PairBlock
-from src.model.components.transformer import ResidueTransformer
-
-_RESIDUE_LENGTH_KEYS = frozenset({"p1_length", "p2_length"})
+from src.model.components.inter_pair import InterPairBlock
+from src.model.components.transformer import (
+    BidirectionalCrossAttention,
+    ResidueTransformer,
+    SwiGLU,
+)
+from src.model.loss import (
+    pair_contact_probability,
+    pooled_contact_probability,
+    probability_to_logit,
+)
 
 
 @dataclass
 class SurpassOutput:
+    """Model outputs.
+
+    ``pair_logits`` and ``pair_mask`` are rectangular [B,L1,L2,...] tensors.
+    ``protein_logit`` is derived from those contacts and is the primary score.
+    """
+
     protein_logit: torch.Tensor
+    aux_protein_logit: torch.Tensor
     pair_logits: torch.Tensor
+    pair_mask: torch.Tensor
+
+
+def _layout_mask(
+    lengths_1: torch.Tensor,
+    lengths_2: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    total = lengths_1.long() + lengths_2.long()
+    if bool((total > int(width)).any()):
+        raise ValueError(
+            f"p1_length + p2_length exceeds concatenated width {int(width)}"
+        )
+    index = torch.arange(int(width), device=total.device).view(1, -1)
+    return index < total[:, None]
+
+
+def _gather_chain(
+    value: torch.Tensor,
+    start: torch.Tensor,
+    length: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    maximum = max(1, int(length.max().item()))
+    offset = torch.arange(maximum, device=value.device).view(1, -1)
+    index = start.long()[:, None] + offset
+    valid = offset < length.long()[:, None]
+    index = index.clamp(max=max(0, value.shape[1] - 1))
+    gather_shape = [value.shape[0], maximum] + list(value.shape[2:])
+    gather_index = index.view(value.shape[0], maximum, *([1] * (value.ndim - 2)))
+    gather_index = gather_index.expand(*gather_shape)
+    gathered = value.gather(1, gather_index)
+    return gathered, valid
+
+
+def split_concatenated(
+    value: torch.Tensor,
+    lengths_1: torch.Tensor,
+    lengths_2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    zeros = torch.zeros_like(lengths_1)
+    chain_1, mask_1 = _gather_chain(value, zeros, lengths_1)
+    chain_2, mask_2 = _gather_chain(value, lengths_1, lengths_2)
+    return chain_1, chain_2, mask_1, mask_2
+
+
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weight = mask.to(dtype=value.dtype)
+    return (value * weight[..., None]).sum(dim=1) / weight.sum(
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1.0)
+
+
+def _masked_max(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    filled = value.masked_fill(
+        ~mask[..., None],
+        torch.finfo(value.dtype).min,
+    )
+    maximum = filled.amax(dim=1)
+    return torch.where(mask.any(dim=1, keepdim=True), maximum, torch.zeros_like(maximum))
 
 
 class ResOnly(nn.Module):
+    """Sequence-only PPI model with a rectangular inter-chain pair track."""
+
+    architecture = "inter_pair_v2"
+
     def __init__(
         self,
-        n_layers=3,
-        dim_token=256,
-        dim_pair=128,
-        n_heads=8,
-        residual_mha=True,
-        residual_transition=True,
-        use_attn_pair_bias=True,
-        use_qkln=True,
-        dropout=0.0,
-        expansion_factor=2,
-        pair_update_interval=2,
-        pair_n_heads=8,
-        dim_opm_inner=32,
-        **kwargs,
+        n_layers: int = 2,
+        dim_token: int = 384,
+        dim_pair: int = 96,
+        n_heads: int = 8,
+        dropout: float = 0.0,
+        expansion_factor: int = 2,
+        distance_bin_start: float = 2.0,
+        distance_bin_end: float = 22.0,
+        distance_bin_count: int = 16,
+        contact_threshold: float = 8.0,
+        topk_fraction: float = 0.01,
+        maximum_topk: int = 64,
+        **embedder_kwargs: object,
     ):
         super().__init__()
-        if int(dim_token) % int(n_heads) != 0:
-            raise ValueError(
-                f"n_heads ({n_heads}) must divide dim_token ({dim_token})."
-            )
-        if int(dim_pair) % int(pair_n_heads) != 0:
-            raise ValueError(
-                f"pair_n_heads ({pair_n_heads}) must divide dim_pair ({dim_pair})."
-            )
-        if int(pair_update_interval) < 1:
-            raise ValueError(
-                f"pair_update_interval must be positive, got {pair_update_interval}."
-            )
+        dim_token = int(dim_token)
+        dim_pair = int(dim_pair)
+        n_heads = int(n_heads)
+        if dim_token % n_heads:
+            raise ValueError("n_heads must divide dim_token")
         self.dim_token = dim_token
         self.dim_pair = dim_pair
-        self.pair_update_interval = int(pair_update_interval)
-        self.checkpoint_pair_blocks = bool(checkpoint_pair_blocks)
-        self.distance_bin_count = int(kwargs.get("distance_bin_count", 64))
-        for unused_key in (
-            "contact_bins",
-            "num_classes",
-            "dim_triangle_hidden",
-            "n_pair_heads",
-            "xt_pair_dist_min",
-            "xt_pair_dist_max",
-            "xt_pair_dist_dim",
-        ):
-            kwargs.pop(unused_key, None)
+        self.distance_bin_count = int(distance_bin_count)
+        self.contact_bins = contact_bin_count(
+            contact_threshold,
+            distance_bin_start,
+            distance_bin_end,
+            self.distance_bin_count,
+        )
+        self.topk_fraction = float(topk_fraction)
+        self.maximum_topk = int(maximum_topk)
 
         self.residue_embedder = ResidueEmbedder(
             dim_token=dim_token,
             dim_pair=dim_pair,
-            **kwargs,
+            distance_bin_start=distance_bin_start,
+            distance_bin_end=distance_bin_end,
+            distance_bin_count=self.distance_bin_count,
+            **embedder_kwargs,
         )
-
-        self.n_layers = n_layers
-        self.pair_blocks = nn.ModuleList([
-            PairBlock(
-                dim_token=dim_token,
-                dim_pair=dim_pair,
-                n_heads=int(pair_n_heads),
-                dim_opm_inner=int(dim_opm_inner),
+        self.residue_blocks = nn.ModuleList(
+            ResidueTransformer(
+                dim_token,
+                n_heads,
                 dropout=dropout,
                 expansion_factor=expansion_factor,
             )
-            for layer_index in range(n_layers)
-            if layer_index % self.pair_update_interval == 0
-        ])
-        self.pair_head = nn.Sequential(
-            nn.LayerNorm(dim_pair),
-            nn.Linear(dim_pair, self.distance_bin_count),
+            for _ in range(int(n_layers))
         )
-        self.residue_blocks = nn.ModuleList([
-            ResidueTransformer(
-                dim_token=dim_token,
-                dim_pair=dim_pair,
-                nheads=n_heads,
-                residual_mha=residual_mha,
-                residual_transition=residual_transition,
-                use_attn_pair_bias=use_attn_pair_bias,
-                use_qkln=use_qkln,
+        self.cross_blocks = nn.ModuleList(
+            BidirectionalCrossAttention(
+                dim_token,
+                n_heads,
                 dropout=dropout,
                 expansion_factor=expansion_factor,
-            ) for _ in range(n_layers)
-        ])
+            )
+            for _ in range(int(n_layers))
+        )
+        self.pair_blocks = nn.ModuleList(
+            InterPairBlock(
+                dim_pair,
+                expansion_factor=expansion_factor,
+                dilation=1 if index == 0 else 2,
+                dropout=dropout,
+            )
+            for index in range(int(n_layers))
+        )
+        self.pair_left = nn.ModuleList(
+            nn.Linear(dim_pair, dim_pair)
+            for _ in range(int(n_layers))
+        )
+        self.pair_product = nn.ModuleList(
+            nn.Linear(dim_pair, dim_pair)
+            for _ in range(int(n_layers))
+        )
+        self.pair_update_bias = nn.ModuleList(
+            nn.Parameter(torch.zeros(dim_pair))
+            for _ in range(int(n_layers))
+        )
+        self.pair_transition = nn.ModuleList(
+            Transition(dim_pair)
+            for _ in range(int(n_layers))
+        )
+        self.n_layers = n_layers
 
-        self.protein_head = nn.Sequential(
+        self.pair_head = nn.Sequential(
+            nn.LayerNorm(dim_pair),
+            nn.Linear(dim_pair, distance_bin_count),
+        )
+        self.auxiliary_head = nn.Sequential(
             nn.LayerNorm(dim_token * 6),
             nn.Linear(dim_token * 6, dim_token),
-            nn.GELU(),
+            SwiGLU(),
             nn.Linear(dim_token, 1),
         )
 
+    def cross_pair_update(
+        self, 
+        chain_1: torch.Tensor, 
+        chain_2: torch.Tensor, 
+        pair: torch.Tensor, 
+        pair_mask: torch.Tensor,
+        layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        left_update = self.pair_left[layer](chain_1)
+        right_update = self.pair_left[layer](chain_2)
+        left_product_update = self.pair_product[layer](chain_1)
+        right_product_update = self.pair_product[layer](chain_2)
+        pair_update = (
+            left_update[:, :, None, :]
+            + right_update[:, None, :, :]
+            + left_product_update[:, :, None, :] * right_product_update[:, None, :, :]
+        )
+        pair_update = pair_update + self.pair_update_bias[layer]
+        pair_update = self.pair_transition[layer](pair_update, pair_mask)
+        return (pair + pair_update) * pair_mask
+
+
     def forward(
         self,
-        residue_batch: Dict[str, torch.Tensor],
+        residue_batch: Mapping[str, torch.Tensor],
     ) -> SurpassOutput:
-        embedder_inputs = {
-            key: value
-            for key, value in residue_batch.items()
-            if key not in _RESIDUE_LENGTH_KEYS
-        }
-        single_repr, pair_repr, mask = self.residue_embedder(**embedder_inputs)
-        mask = mask.to(dtype=torch.bool)
-
-        pair_block_index = 0
-        for layer_index, block in enumerate(self.residue_blocks):
-            single_repr = block(single_repr, pair_repr, mask)
-            if layer_index % self.pair_update_interval == 0:
-                pair_repr = self._apply_pair_block(
-                    self.pair_blocks[pair_block_index],
-                    single_repr,
-                    pair_repr,
-                    mask,
+        lengths_1 = residue_batch["p1_length"].long()
+        lengths_2 = residue_batch["p2_length"].long()
+        width = int(residue_batch["plm_emb"].shape[1])
+        layout_mask = _layout_mask(lengths_1, lengths_2, width)
+        if "padding_mask" in residue_batch:
+            supplied = residue_batch["padding_mask"].to(dtype=torch.bool)
+            if supplied.shape != layout_mask.shape or not torch.equal(supplied, layout_mask):
+                raise ValueError(
+                    "padding_mask must contain p1 followed by p2 followed by tail padding"
                 )
-                pair_block_index += 1
 
-        protein_logit = self._protein_logit(
-            single_repr,
-            mask,
-            residue_batch["p1_length"],
-            residue_batch["p2_length"],
+        single = self.residue_embedder(
+            plm_emb=residue_batch["plm_emb"],
+            residue_type=residue_batch["residue_type"],
+            chain_index=residue_batch["chain_index"],
+            mask=layout_mask,
         )
-        pair_logits = self.pair_head(pair_repr)
-        return SurpassOutput(protein_logit=protein_logit, pair_logits=pair_logits)
+        chain_1, chain_2, mask_1, mask_2 = split_concatenated(
+            single,
+            lengths_1,
+            lengths_2,
+        )
+        type_1, type_2, _, _ = split_concatenated(
+            residue_batch["residue_type"],
+            lengths_1,
+            lengths_2,
+        )
+        pair, pair_mask = self.residue_embedder.cross_pair(
+            chain_1,
+            chain_2,
+            type_1,
+            type_2,
+            mask_1,
+            mask_2,
+        )
 
-    def _apply_pair_block(
-        self,
-        block: PairBlock,
-        single_repr: torch.Tensor,
-        pair_repr: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        # if self.checkpoint_pair_blocks and self.training:
-        #     return checkpoint(
-        #         block,
-        #         single_repr,
-        #         pair_repr,
-        #         mask,
-        #         use_reentrant=False,
-        #     )
-        return block(single_repr, pair_repr, mask)
+        for layer in range(self.n_layers):
+            # update chains seperately
+            chain_1 = self.residue_blocks[layer](chain_1, mask_1)
+            chain_2 = self.residue_blocks[layer](chain_2, mask_2)
 
-    def _protein_logit(
-        self,
-        single_repr: torch.Tensor,
-        mask: torch.Tensor,
-        p1_length: torch.Tensor,
-        p2_length: torch.Tensor,
-    ) -> torch.Tensor:
-        m1 = _masked_chain_mean(single_repr, mask, p1_length, p2_length, chain=1)
-        m2 = _masked_chain_mean(single_repr, mask, p1_length, p2_length, chain=2)
-        x1 = _masked_chain_max(single_repr, mask, p1_length, p2_length, chain=1)
-        x2 = _masked_chain_max(single_repr, mask, p1_length, p2_length, chain=2)
-        features = torch.cat([m1, m2, m1 * m2, x1, x2, x1 * x2], dim=-1)
-        return self.protein_head(features).squeeze(-1)
+            # update with cross attention
+            chain_1, chain_2 = self.cross_blocks[layer](chain_1, chain_2, mask_1, mask_2)
 
+            # update pair
+            pair = self.pair_blocks[layer](pair, pair_mask)
 
-def _chain_selector(
-    single_repr: torch.Tensor,
-    mask: torch.Tensor,
-    p1_length: torch.Tensor,
-    p2_length: torch.Tensor,
-    chain: int,
-) -> torch.Tensor:
-    length = single_repr.shape[1]
-    index = torch.arange(length, device=single_repr.device).view(1, length)
-    p1 = p1_length.to(device=single_repr.device).view(-1, 1)
-    p2 = p2_length.to(device=single_repr.device).view(-1, 1)
-    if chain == 1:
-        return (index < p1) & mask
-    return (index >= p1) & (index < p1 + p2) & mask
+            # update pair with single chains
+            pair = self.cross_pair_update(chain_1, chain_2, pair, pair_mask, layer)
 
+        pair_logits = self.pair_head(pair)
 
-def _masked_chain_mean(
-    single_repr: torch.Tensor,
-    mask: torch.Tensor,
-    p1_length: torch.Tensor,
-    p2_length: torch.Tensor,
-    chain: int,
-) -> torch.Tensor:
-    selected = _chain_selector(single_repr, mask, p1_length, p2_length, chain)
-    weight = selected.to(dtype=single_repr.dtype)
-    denom = weight.sum(dim=1, keepdim=True).clamp_min(1.0)
-    return (single_repr * weight[..., None]).sum(dim=1) / denom
+        contact_probability = pair_contact_probability(
+            pair_logits,
+            self.contact_bins,
+        )
+        primary_probability = pooled_contact_probability(
+            contact_probability,
+            pair_mask,
+            topk_fraction=self.topk_fraction,
+            maximum_topk=self.maximum_topk,
+        )
+        protein_logit = probability_to_logit(primary_probability)
 
-
-def _masked_chain_max(
-    single_repr: torch.Tensor,
-    mask: torch.Tensor,
-    p1_length: torch.Tensor,
-    p2_length: torch.Tensor,
-    chain: int,
-) -> torch.Tensor:
-    selected = _chain_selector(single_repr, mask, p1_length, p2_length, chain)
-    filled = single_repr.masked_fill(
-        ~selected[..., None],
-        torch.finfo(single_repr.dtype).min,
-    )
-    pooled = filled.amax(dim=1)
-    empty = ~selected.any(dim=1)
-    return torch.where(empty[:, None], torch.zeros_like(pooled), pooled)
+        mean_1 = _masked_mean(chain_1, mask_1)
+        mean_2 = _masked_mean(chain_2, mask_2)
+        max_1 = _masked_max(chain_1, mask_1)
+        max_2 = _masked_max(chain_2, mask_2)
+        auxiliary_features = torch.cat(
+            (
+                mean_1 + mean_2,
+                (mean_1 - mean_2).abs(),
+                mean_1 * mean_2,
+                max_1 + max_2,
+                (max_1 - max_2).abs(),
+                max_1 * max_2,
+            ),
+            dim=-1,
+        )
+        auxiliary_logit = self.auxiliary_head(auxiliary_features).squeeze(-1)
+        return SurpassOutput(
+            protein_logit=protein_logit,
+            aux_protein_logit=auxiliary_logit,
+            pair_logits=pair_logits,
+            pair_mask=pair_mask,
+        )

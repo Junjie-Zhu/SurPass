@@ -3,6 +3,5 @@ __pycache__/
 
 logs/
 outputs/
-tests/
 
 tmp*

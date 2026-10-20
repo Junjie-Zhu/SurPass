@@ -1,14 +1,23 @@
+"""SurPass training entrypoint.
+
+The primary complex score is derived from the rectangular inter-chain contact
+map. Training and validation therefore optimize and select checkpoints using
+the same score used by inference.
+"""
+
+from __future__ import annotations
+
 import datetime
 import os
-import warnings
-from typing import Any, Callable, Dict
+from pathlib import Path
+from typing import Any, Callable
 
 import hydra
-from sklearn.metrics import average_precision_score, roc_curve, auc
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -19,515 +28,248 @@ except Exception:
 
 from src.data.balancing import DistributedWeightedSampler, build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
-from src.model.loss import DistogramCELoss, ProteinBindLoss, SampleTverskyLoss
 from src.model.ema import EMAWrapper
+from src.model.loss import SurpassLoss
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
+from src.runtime.checkpoint import load_checkpoint, save_checkpoint
+from src.runtime.config import build_model_kwargs, cfg_get
+from src.runtime.device import (
+    autocast_context,
+    resolve_cuda_device,
+    resolve_dist_backend,
+    to_device,
+)
+from src.runtime.metrics import binary_classification_metrics
 from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
-# from src.utils.nan_monitor import abort_if_nonfinite_loss
-
-try:
-    import torch_npu
-    from torch_npu.contrib import transfer_to_npu
-except Exception:
-    warnings.warn("torch_npu is not available")
-warnings.filterwarnings("ignore")
 
 
-def log_info(message: str):
+TRAIN_KEYS = ("total", "protein", "contact", "distance", "aux_protein")
+VALID_KEYS = ("total", "pair_auroc", "pair_auprc")
+
+
+def log_info(message: str) -> None:
     if DIST_WRAPPER.rank == 0:
         print(message)
 
 
-def _cfg_get(cfg: DictConfig, *paths: str, default=None):
-    for path in paths:
-        selected = OmegaConf.select(cfg, path, default=None)
-        if selected is not None:
-            return selected
-    return default
-
-
-def to_device(obj, device):
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(value, dict):
-                to_device(value, device)
-            elif isinstance(value, torch.Tensor):
-                obj[key] = value.to(device)
-    elif isinstance(obj, torch.Tensor):
-        obj = obj.to(device)
-    else:
-        try:
-            obj = obj.to(device)
-        except Exception as exc:
-            raise TypeError(f"Unsupported type for to_device: {type(obj)}") from exc
-    return obj
-
-
-def _binary_classification_metrics(
-    scores: torch.Tensor,
-    target: torch.Tensor,
-    positive_weight: float = 1.0,
-) -> dict[str, float]:
-    scores = scores.detach().flatten().to(dtype=torch.float32).cpu().numpy()
-    target_bool = target.detach().flatten().to(dtype=torch.bool).cpu().numpy()
-    pos_count = int(target_bool.sum())
-    neg_count = int(target_bool.size - pos_count)
-    weight = float(positive_weight)
-    if scores.size == 0 or pos_count == 0 or neg_count == 0 or weight <= 0.0:
-        return {"auroc": float("nan"), "auprc": float("nan")}
-    sample_weight = None
-    if weight != 1.0:
-        sample_weight = 1.0 + (weight - 1.0) * target_bool.astype("float64")
-    fpr, tpr, _ = roc_curve(target_bool, scores, sample_weight=sample_weight)
-    auroc = auc(fpr, tpr)
-    auprc = average_precision_score(
-        target_bool, scores, sample_weight=sample_weight
-    )
-    return {"auroc": float(auroc), "auprc": float(auprc)}
-
-
-def _compute_protein_loss(
-    loss_fn: Dict[str, torch.nn.Module],
-    loss_weights: Dict[str, float],
-    protein_logit: torch.Tensor,
-    is_positive: torch.Tensor,
-    pair_logits: torch.Tensor | None = None,
-    target_bins: torch.Tensor | None = None,
-    pair_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    raw_loss = protein_logit.new_zeros(())
-    terms: dict[str, torch.Tensor] = {}
-    for name in ("bce", "tversky"):
-        term_weight = float(loss_weights.get(name, 0.0))
-        if term_weight <= 0.0 or name not in loss_fn:
-            continue
-        value = loss_fn[name](protein_logit, is_positive)
-        terms[name] = value.detach()
-        raw_loss = raw_loss + term_weight * value
-    pair_weight = float(loss_weights.get("pair_ce", 0.0))
-    if (
-        pair_weight > 0.0
-        and "pair_ce" in loss_fn
-        and pair_logits is not None
-        and target_bins is not None
-        and pair_mask is not None
-    ):
-        value = loss_fn["pair_ce"](pair_logits, target_bins, pair_mask)
-        terms["pair_ce"] = value.detach()
-        raw_loss = raw_loss + pair_weight * value
-    terms["total"] = raw_loss.detach()
-    return raw_loss, terms
-
-
-def _as_float(value: torch.Tensor | float) -> float:
-    if isinstance(value, torch.Tensor):
-        return float(value.detach().item())
-    return float(value)
-
-
-def _terms_to_floats(terms: dict[str, torch.Tensor]) -> dict[str, float]:
-    return {name: _as_float(value) for name, value in terms.items()}
-
-
-def _accumulate_floats(
-    totals: dict[str, float],
-    values: dict[str, float],
-) -> None:
-    for name, value in values.items():
-        totals[name] = totals.get(name, 0.0) + value
-
-
-def _mean_floats(totals: dict[str, float], count: int) -> dict[str, float]:
-    scale = max(int(count), 1)
-    return {name: value / scale for name, value in totals.items()}
-
-
-_TRAIN_LOG_KEYS = (
-    "total",
-    "bce",
-    "tversky",
-    "pair_ce",
-)
-_TEST_LOG_KEYS = (
-    "total",
-    "protein_auroc",
-    "protein_auprc",
-)
-
-
-def _select_log_keys(metrics: dict[str, float], keys: tuple[str, ...]) -> dict[str, float]:
-    return {name: metrics[name] for name in keys if name in metrics}
-
-
-def _progress_postfix(terms: dict[str, float]) -> dict[str, str]:
-    aliases = (
-        ("loss", "total"),
-        ("bce", "bce"),
-        ("tv", "tversky"),
-        ("pair", "pair_ce"),
-    )
-    return {
-        label: f"{terms[key]:.3f}"
-        for label, key in aliases
-        if key in terms
-    }
-
-
-def _prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
-    return {f"{prefix}/{name}": value for name, value in metrics.items()}
-
-
-def _wandb_enabled(cfg: DictConfig) -> bool:
-    return bool(_cfg_get(cfg, "wandb.enabled", default=True))
-
-
-def _init_wandb(cfg: DictConfig, logging_dir: str, run_name: str):
-    if DIST_WRAPPER.rank != 0 or not _wandb_enabled(cfg):
-        return None
-    if wandb is None:
-        log_info("wandb is enabled in config but the package is not installed")
-        return None
-
-    init_kwargs: dict[str, Any] = {
-        "project": str(_cfg_get(cfg, "wandb.project", default="surpass")),
-        "name": str(_cfg_get(cfg, "wandb.name", default=run_name)),
-        "dir": logging_dir,
-        "config": OmegaConf.to_container(cfg, resolve=True),
-        "mode": str(_cfg_get(cfg, "wandb.mode", default="online")),
-        "resume": str(_cfg_get(cfg, "wandb.resume", default="allow")),
-        "tags": list(_cfg_get(cfg, "wandb.tags", default=[]) or []),
-    }
-    entity = _cfg_get(cfg, "wandb.entity", default=None)
-    if entity:
-        init_kwargs["entity"] = str(entity)
-    run_id = _cfg_get(cfg, "wandb.id", default=None)
-    if run_id:
-        init_kwargs["id"] = str(run_id)
-
-    try:
-        run = wandb.init(**init_kwargs)
-    except Exception as exc:
-        log_info(f"wandb.init failed ({exc}); continuing without wandb")
-        return None
-    return run
-
-
-def _wandb_log(payload: dict[str, Any], step: int) -> None:
-    if wandb is None or wandb.run is None:
-        return
-    wandb.log(payload, step=int(step))
-
-
-def _build_loss_weights(cfg: DictConfig) -> dict[str, float]:
-    return {
-        "bce": float(_cfg_get(cfg, "loss.bce.weight", default=1.0)),
-        "tversky": float(_cfg_get(cfg, "loss.tversky.weight", default=1.0)),
-        "pair_ce": float(_cfg_get(cfg, "loss.pair_ce.weight", default=1.0)),
-    }
-
-
-_MODEL_BIN_KEYS = (
-    "xt_pair_dist_min",
-    "xt_pair_dist_max",
-    "xt_pair_dist_dim",
-    "num_classes",
-)
-
-
-def build_model_kwargs(cfg: DictConfig, *, checkpoint_default: bool = True) -> dict:
-    model_kwargs = _cfg_get(cfg, "model", default={})
-    if isinstance(model_kwargs, DictConfig):
-        model_kwargs = OmegaConf.to_container(model_kwargs, resolve=True)
-    model_kwargs = dict(model_kwargs or {})
-    for key in _MODEL_BIN_KEYS:
-        model_kwargs.pop(key, None)
-    model_kwargs.pop("n_pair_heads", None)
-    model_kwargs["distance_bin_start"] = float(cfg.data.distance_bin_start)
-    model_kwargs["distance_bin_end"] = float(cfg.data.distance_bin_end)
-    model_kwargs["distance_bin_count"] = int(cfg.data.distance_bin_count)
-    model_kwargs["checkpoint_pair_blocks"] = bool(
-        _cfg_get(cfg, "performance.checkpoint_pair_blocks", default=checkpoint_default)
-    )
-    return model_kwargs
-
-
 def _live_model(model: torch.nn.Module) -> torch.nn.Module:
-    if DIST_WRAPPER.world_size > 1:
-        return model.module
-    return model
+    return model.module if isinstance(model, DDP) else model
 
 
-def _ema_keywords(cfg: DictConfig) -> list:
-    keywords = _cfg_get(cfg, "ema.mutable_param_keywords", default=[""])
-    if keywords is None:
-        return [""]
-    if OmegaConf.is_config(keywords):
-        keywords = OmegaConf.to_container(keywords, resolve=True)
-    return list(keywords)
+def _mean_terms(sums: dict[str, float], count: int) -> dict[str, float]:
+    denominator = max(1, int(count))
+    return {name: value / denominator for name, value in sums.items()}
 
 
-def _unpack_batch(step_batch, device):
-    residue_batch, labels = step_batch
-    residue_batch = to_device(residue_batch, device)
-    labels = to_device(labels, device)
-    return residue_batch, labels
+def _add_terms(sums: dict[str, float], values: dict[str, torch.Tensor]) -> None:
+    for name, value in values.items():
+        sums[name] = sums.get(name, 0.0) + float(value.detach().item())
 
 
-def _set_progress_postfix(progress, **kwargs) -> None:
-    set_postfix = getattr(progress, "set_postfix", None)
-    if callable(set_postfix):
-        set_postfix(**kwargs)
-
-
-def _release_rejected_loss_graph(loss: torch.Tensor) -> None:
-    loss.backward(gradient=torch.zeros_like(loss))
-
-
-def resolve_cuda_device(local_rank: int, device_count: int) -> torch.device:
-    if device_count <= 0:
-        return torch.device("cpu")
-    index = 0 if device_count == 1 else int(local_rank)
-    if index >= device_count:
-        index = int(local_rank) % device_count
-    return torch.device(f"cuda:{index}")
-
-
-def resolve_dist_backend(use_cuda: bool) -> str:
-    return "nccl" if use_cuda else "gloo"
-
-
-def wrap_ddp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
-    if device.type == "cuda":
-        return DDP(
-            model,
-            device_ids=[device.index],
-            output_device=device.index,
-            find_unused_parameters=False,
-        )
-    return DDP(model, find_unused_parameters=False)
+def _gather_validation(
+    term_sums: dict[str, float],
+    step_count: int,
+    scores: list[float],
+    targets: list[bool],
+) -> tuple[dict[str, float], list[float], list[bool]]:
+    payload = {
+        "term_sums": term_sums,
+        "step_count": int(step_count),
+        "scores": scores,
+        "targets": targets,
+    }
+    gathered = DIST_WRAPPER.all_gather_object(payload)
+    merged_sums: dict[str, float] = {}
+    merged_steps = 0
+    merged_scores: list[float] = []
+    merged_targets: list[bool] = []
+    for rank_payload in gathered:
+        merged_steps += int(rank_payload["step_count"])
+        merged_scores.extend(rank_payload["scores"])
+        merged_targets.extend(rank_payload["targets"])
+        for name, value in rank_payload["term_sums"].items():
+            merged_sums[name] = merged_sums.get(name, 0.0) + float(value)
+    return _mean_terms(merged_sums, merged_steps), merged_scores, merged_targets
 
 
 def train_epoch(
     model: torch.nn.Module,
     loader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: Dict[str, torch.nn.Module],
-    loss_weights: Dict[str, float],
+    scheduler,
+    loss_module: SurpassLoss,
     device: torch.device,
-    max_grad_norm: float = 0.0,
-    grad_accum_steps: int = 1,
-    scheduler: Any | None = None,
-    max_batches: int | None = None,
+    *,
+    precision: str,
+    grad_accum_steps: int,
+    max_grad_norm: float,
+    ema: EMAWrapper | None,
     step_logger: Callable[[dict[str, float]], None] | None = None,
-    ema_wrapper: EMAWrapper | None = None,
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    term_totals: dict[str, float] = {}
-    num_steps = 0
-    grad_accum_steps = max(1, int(grad_accum_steps))
-
-    for step, step_batch in enumerate(loader):
-        if max_batches is not None and step >= max_batches:
-            break
-        residue_batch, labels = _unpack_batch(step_batch, device)
-
-        output = model(residue_batch)
-        raw_loss, terms = _compute_protein_loss(
-            loss_fn,
-            loss_weights,
-            output.protein_logit,
-            labels["is_positive"],
-            pair_logits=output.pair_logits,
-            target_bins=labels["label_2d_bins"],
-            pair_mask=labels["label_2d_mask"],
-        )
-
-        loss = raw_loss / grad_accum_steps
+    totals: dict[str, float] = {}
+    steps = 0
+    accumulation = max(1, int(grad_accum_steps))
+    for step, (residue_batch, labels) in enumerate(loader):
+        residue_batch = to_device(residue_batch, device)
+        labels = to_device(labels, device)
+        with autocast_context(device, precision):
+            output = model(residue_batch)
+            raw_loss, terms = loss_module(output, labels)
+            loss = raw_loss / accumulation
         loss.backward()
 
-        should_step = ((step + 1) % grad_accum_steps == 0) or (
-            step + 1 == len(loader)
-        )
+        should_step = (step + 1) % accumulation == 0 or step + 1 == len(loader)
         if should_step:
-            clip_limit = float(max_grad_norm) if float(max_grad_norm) > 0.0 else float("inf")
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_limit)
+            if float(max_grad_norm) > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
             optimizer.step()
-            if ema_wrapper is not None:
-                ema_wrapper.update()
-            if scheduler is not None:
-                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            if ema is not None:
+                ema.update()
 
-        term_floats = _terms_to_floats(terms)
-        _accumulate_floats(term_totals, term_floats)
-        num_steps += 1
-        _set_progress_postfix(loader, **_progress_postfix(term_floats))
+        _add_terms(totals, terms)
+        steps += 1
+        floats = {name: float(value.item()) for name, value in terms.items()}
+        if hasattr(loader, "set_postfix"):
+            loader.set_postfix(
+                loss=f"{floats['total']:.3f}",
+                contact=f"{floats['contact']:.3f}",
+            )
         if step_logger is not None:
-            step_logger(term_floats)
-
-    return _mean_floats(term_totals, num_steps)
-
-
-def _contact_metrics_from_rows(
-    score_rows: list[torch.Tensor],
-    target_rows: list[torch.Tensor],
-    positive_weight: float = 1.0,
-) -> dict[str, float]:
-    if not score_rows:
-        return {
-            "auroc": float("nan"),
-            "auprc": float("nan"),
-            "contact_prev": float("nan"),
-        }
-    all_scores = torch.cat(score_rows, dim=0)
-    all_targets = torch.cat(target_rows, dim=0)
-    if all_scores.numel() == 0:
-        return {
-            "auroc": float("nan"),
-            "auprc": float("nan"),
-            "contact_prev": float("nan"),
-        }
-    metrics = _binary_classification_metrics(
-        all_scores, all_targets, positive_weight=positive_weight
-    )
-    contact_prev = (
-        float(all_targets.to(dtype=torch.float32).mean().item())
-        if all_targets.numel() > 0
-        else float("nan")
-    )
-    return {
-        "auroc": metrics["auroc"],
-        "auprc": metrics["auprc"],
-        "contact_prev": contact_prev,
-    }
+            step_logger(floats)
+    return _mean_terms(totals, steps)
 
 
 def evaluate_epoch(
     model: torch.nn.Module,
     loader,
-    loss_fn: Dict[str, torch.nn.Module],
-    loss_weights: Dict[str, float],
+    loss_module: SurpassLoss,
     device: torch.device,
-    max_batches: int | None = None,
-    positive_weight: float = 1.0,
+    *,
+    precision: str,
+    positive_weight: float,
 ) -> dict[str, float]:
     model.eval()
-    term_totals: dict[str, float] = {}
-    num_steps = 0
-    protein_score_rows = []
-    protein_target_rows = []
-
-    with torch.no_grad():
-        for step, step_batch in enumerate(loader):
-            if max_batches is not None and step >= max_batches:
-                break
-            residue_batch, labels = _unpack_batch(step_batch, device)
-            output = model(residue_batch)
-            _, terms = _compute_protein_loss(
-                loss_fn,
-                loss_weights,
-                output.protein_logit,
-                labels["is_positive"],
-                pair_logits=output.pair_logits,
-                target_bins=labels["label_2d_bins"],
-                pair_mask=labels["label_2d_mask"],
+    totals: dict[str, float] = {}
+    steps = 0
+    scores: list[float] = []
+    targets: list[bool] = []
+    with torch.inference_mode():
+        for residue_batch, labels in loader:
+            residue_batch = to_device(residue_batch, device)
+            labels = to_device(labels, device)
+            with autocast_context(device, precision):
+                output = model(residue_batch)
+                _, terms = loss_module(output, labels)
+            _add_terms(totals, terms)
+            steps += 1
+            scores.extend(
+                torch.sigmoid(output.protein_logit.float()).cpu().tolist()
             )
+            targets.extend(labels["crop_is_positive"].bool().cpu().tolist())
 
-            protein_score_rows.append(torch.sigmoid(output.protein_logit.reshape(-1)).detach().cpu())
-            protein_target_rows.append(
-                labels["is_positive"].reshape(-1).to(dtype=torch.bool).detach().cpu()
-            )
-
-            term_floats = _terms_to_floats(terms)
-            _accumulate_floats(term_totals, term_floats)
-            num_steps += 1
-            _set_progress_postfix(loader, **_progress_postfix(term_floats))
-
-    protein_metrics = _contact_metrics_from_rows(
-        protein_score_rows, protein_target_rows, positive_weight=positive_weight
+    means, scores, targets = _gather_validation(totals, steps, scores, targets)
+    metrics = binary_classification_metrics(
+        scores,
+        targets,
+        positive_weight=float(positive_weight),
     )
-    return _select_log_keys(
-        {
-            "total": _mean_floats(term_totals, num_steps).get("total", float("nan")),
-            "protein_auroc": protein_metrics["auroc"],
-            "protein_auprc": protein_metrics["auprc"],
-        },
-        _TEST_LOG_KEYS,
+    return {
+        "total": means.get("total", float("nan")),
+        "pair_auroc": metrics["auroc"],
+        "pair_auprc": metrics["auprc"],
+    }
+
+
+def _init_distributed(use_cuda: bool) -> None:
+    if DIST_WRAPPER.world_size <= 1 or dist.is_initialized():
+        return
+    timeout = datetime.timedelta(
+        seconds=int(os.environ.get("NCCL_TIMEOUT_SECOND", 600))
+    )
+    dist.init_process_group(
+        backend=resolve_dist_backend(use_cuda),
+        timeout=timeout,
+    )
+
+
+def _build_datasets(args: DictConfig):
+    sources = cfg_get(args, "data.datasets")
+    if not sources:
+        raise ValueError("data.datasets must list at least one source")
+    sources = OmegaConf.to_container(sources, resolve=True)
+    return (
+        sources,
+        *build_multi_source_split(
+            sources,
+            root_dir=str(args.data.root_dir),
+            dataset_kwargs={
+                "distance_bin_start": float(args.data.distance_bin_start),
+                "distance_bin_end": float(args.data.distance_bin_end),
+                "distance_bin_count": int(args.data.distance_bin_count),
+                "crop_size": int(args.data.crop_size),
+                "contact_threshold": float(args.data.contact_threshold),
+                "interface_crop_probability": float(
+                    cfg_get(args, "data.interface_crop_probability", 0.8)
+                ),
+            },
+        ),
+    )
+
+
+def _ema_keywords(args: DictConfig) -> list[str]:
+    value = cfg_get(args, "ema.mutable_param_keywords", [""])
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    return list(value or [""])
+
+
+def _wandb_init(args: DictConfig, output_dir: Path):
+    if DIST_WRAPPER.rank != 0 or not bool(cfg_get(args, "wandb.enabled", False)):
+        return None
+    if wandb is None:
+        log_info("wandb is enabled but not installed; continuing without it")
+        return None
+    return wandb.init(
+        project=str(cfg_get(args, "wandb.project", "surpass")),
+        entity=cfg_get(args, "wandb.entity"),
+        name=cfg_get(args, "wandb.name", output_dir.name),
+        dir=str(output_dir),
+        mode=str(cfg_get(args, "wandb.mode", "online")),
+        config=OmegaConf.to_container(args, resolve=True),
+        tags=list(cfg_get(args, "wandb.tags", []) or []),
     )
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train")
-def main(args: DictConfig):
-    logging_dir = os.path.join(
-        args.logging_dir,
-        f"{str(args.task_prefix).upper()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+def main(args: DictConfig) -> None:
+    use_cuda = torch.cuda.is_available()
+    device = (
+        resolve_cuda_device(DIST_WRAPPER.local_rank, torch.cuda.device_count())
+        if use_cuda
+        else torch.device("cpu")
     )
-    if DIST_WRAPPER.rank == 0:
-        os.makedirs(args.logging_dir, exist_ok=True)
-        os.makedirs(logging_dir, exist_ok=True)
-        os.makedirs(os.path.join(logging_dir, "checkpoints"), exist_ok=True)
-        with open(f"{logging_dir}/config.yaml", "w", encoding="utf-8") as f:
-            OmegaConf.save(args, f)
-
-    use_cuda = torch.cuda.device_count() > 0
     if use_cuda:
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        device = resolve_cuda_device(DIST_WRAPPER.local_rank, torch.cuda.device_count())
-        all_gpu_ids = ",".join(str(x) for x in range(torch.cuda.device_count()))
-        devices = os.getenv("CUDA_VISIBLE_DEVICES", all_gpu_ids)
         torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-        devices = "cpu"
+    _init_distributed(use_cuda)
+    seed_everything(int(args.seed), bool(args.deterministic))
+    precision = str(cfg_get(args, "runtime.precision", "bfloat16"))
 
-    if DIST_WRAPPER.world_size > 1 and not dist.is_initialized():
-        if DIST_WRAPPER.rank == 0:
-            log_info(
-                f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
-            )
-            log_info(
-                f"Using DDP with {DIST_WRAPPER.world_size} processes, rank: {DIST_WRAPPER.rank}"
-            )
-        timeout_seconds = int(os.environ.get("NCCL_TIMEOUT_SECOND", 600))
-        dist.init_process_group(
-            backend=resolve_dist_backend(use_cuda),
-            timeout=datetime.timedelta(seconds=timeout_seconds),
-        )
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = Path(args.logging_dir) / f"{str(args.task_prefix).upper()}_{timestamp}"
+    if DIST_WRAPPER.rank == 0:
+        (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(args, output_dir / "config.yaml")
+    wandb_run = _wandb_init(args, output_dir)
 
-    seed_everything(seed=args.seed, deterministic=args.deterministic)
-
-    run_name = os.path.basename(logging_dir)
-    wandb_run = _init_wandb(args, logging_dir, run_name)
-    wandb_log_interval = max(1, int(_cfg_get(args, "wandb.log_interval", default=1)))
-    global_step = 0
-    if wandb_run is not None:
-        log_info(
-            f"wandb run: {getattr(wandb_run, 'name', None)} "
-            f"({getattr(wandb_run, 'id', None)})"
-        )
-
-    sources = _cfg_get(args, "data.datasets", default=None)
-    if sources is None:
-        raise ValueError("data.datasets must list at least one cluster source.")
-    sources = OmegaConf.to_container(sources, resolve=True)
-    train_dataset, test_dataset, train_weights, source_info = build_multi_source_split(
-        sources,
-        root_dir=args.data.root_dir,
-        test_fraction=args.data.test_fraction,
-        seed=args.seed,
-        negative_ratio=int(_cfg_get(args, "data.negative_ratio", default=1)),
-        dataset_kwargs={
-            "distance_bin_start": args.data.distance_bin_start,
-            "distance_bin_end": args.data.distance_bin_end,
-            "distance_bin_count": args.data.distance_bin_count,
-            "crop_size": args.data.crop_size,
-            "contact_threshold": args.data.contact_threshold,
-        },
+    sources, train_dataset, validation_dataset, train_weights, source_info = (
+        _build_datasets(args)
     )
-    single_source = len(sources) == 1
-    if single_source:
+    if len(sources) == 1:
         train_sampler = (
             DistributedSampler(
                 train_dataset,
@@ -539,277 +281,217 @@ def main(args: DictConfig):
             else None
         )
     else:
-        epoch_size = int(_cfg_get(args, "data.epoch_size", default=30000))
         train_sampler = DistributedWeightedSampler(
             train_weights,
-            num_samples=epoch_size,
+            num_samples=int(cfg_get(args, "data.epoch_size", 30000)),
             num_replicas=DIST_WRAPPER.world_size,
             rank=DIST_WRAPPER.rank,
-            seed=args.seed,
+            seed=int(args.seed),
         )
-    for info in source_info:
-        if info["assemble_negatives"]:
-            kind = "on-the-fly negatives"
-        elif info["is_positive"]:
-            kind = "static positive"
-        else:
-            kind = "static negative"
-        if single_source:
-            log_info(
-                f"Source {info['name']}: train={info['train_length']} test={info['test_length']} "
-                f"({kind}); one shuffled pass per epoch"
-            )
-        else:
-            log_info(
-                f"Source {info['name']}: train={info['train_length']} test={info['test_length']} "
-                f"probability={info['probability']:.3f} ({kind})"
-            )
-    if single_source:
-        samples_per_rank = len(train_dataset) if train_sampler is None else len(train_sampler)
-        log_info(
-            f"One shuffled pass: {samples_per_rank} samples per rank "
-            f"across {DIST_WRAPPER.world_size} ranks"
-        )
-    else:
-        log_info(
-            f"Epoch size {epoch_size}: {len(train_sampler)} samples per rank "
-            f"across {DIST_WRAPPER.world_size} ranks"
-        )
-    test_sampler = (
-        DistributedSampler(
-            test_dataset,
-            num_replicas=DIST_WRAPPER.world_size,
-            rank=DIST_WRAPPER.rank,
-            shuffle=False,
-        )
-        if DIST_WRAPPER.world_size > 1
-        else None
-    )
 
+    validation_indices = range(
+        DIST_WRAPPER.rank,
+        len(validation_dataset),
+        DIST_WRAPPER.world_size,
+    )
+    validation_shard = Subset(validation_dataset, list(validation_indices))
     train_loader = get_dataloader(
         train_dataset,
         collate_fn=collate_fn,
-        batch_size=args.data.batch_size,
+        batch_size=int(args.data.batch_size),
         shuffle=train_sampler is None,
-        num_workers=args.data.num_workers,
+        num_workers=int(args.data.num_workers),
         sampler=train_sampler,
-        pin_memory=args.data.pin_memory,
+        pin_memory=bool(args.data.pin_memory),
     )
-    test_loader = get_dataloader(
-        test_dataset,
+    validation_loader = get_dataloader(
+        validation_shard,
         collate_fn=collate_fn,
-        batch_size=args.data.batch_size,
+        batch_size=int(args.data.batch_size),
         shuffle=False,
-        num_workers=args.data.num_workers,
-        sampler=test_sampler,
-        pin_memory=args.data.pin_memory,
+        num_workers=int(args.data.num_workers),
+        pin_memory=bool(args.data.pin_memory),
     )
-
-    model_kwargs = build_model_kwargs(args, checkpoint_default=True)
-    model = ResOnly(**model_kwargs).to(device)
-    if DIST_WRAPPER.world_size > 1:
-        model = wrap_ddp(model, device)
-    ema_decay = float(_cfg_get(args, "ema.decay", default=0.0))
-    ema_wrapper = None
-    if ema_decay > 0:
-        ema_wrapper = EMAWrapper(
-            model=model,
-            decay=ema_decay,
-            mutable_param_keywords=_ema_keywords(args),
+    for info in source_info:
+        log_info(
+            f"source={info['name']} train={info['train_length']} "
+            f"validation={info['validation_length']}"
         )
-        ema_wrapper.register()
+
+    model = ResOnly(**build_model_kwargs(args)).to(device)
+    if DIST_WRAPPER.world_size > 1:
+        model = DDP(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=False,
+        )
+    live_model = _live_model(model)
     log_info(
-        f"Model instantiated with {sum(p.numel() for p in model.parameters()):,} parameters"
+        f"architecture={live_model.architecture} "
+        f"parameters={sum(parameter.numel() for parameter in model.parameters()):,}"
     )
 
-    pos_weight = float(_cfg_get(args, "loss.bce.pos_weight", default=0.1))
-    loss_fn = {
-        "bce": ProteinBindLoss(pos_weight=pos_weight).to(device),
-        "tversky": SampleTverskyLoss(
-            pos_weight=pos_weight,
-            alpha=float(_cfg_get(args, "loss.tversky.alpha", default=0.7)),
-            beta=float(_cfg_get(args, "loss.tversky.beta", default=0.3)),
-            smooth=float(_cfg_get(args, "loss.tversky.smooth", default=1e-6)),
-        ).to(device),
-        "pair_ce": DistogramCELoss().to(device),
+    loss_weights = {
+        name: float(cfg_get(args, f"loss.{name}.weight", default))
+        for name, default in (
+            ("protein", 1.0),
+            ("contact", 1.0),
+            ("distance", 0.1),
+            ("aux_protein", 0.1),
+        )
     }
-    loss_weights = _build_loss_weights(args)
-    log_info(f"Loss setup: pos_weight={pos_weight}, weights={loss_weights}")
+    loss_module = SurpassLoss(
+        live_model.contact_bins,
+        loss_weights,
+        focal_gamma=float(cfg_get(args, "loss.contact.gamma", 1.5)),
+        contact_positive_weight=float(
+            cfg_get(args, "loss.contact.positive_weight", 4.0)
+        ),
+        negatives_per_positive=float(
+            cfg_get(args, "loss.contact.negatives_per_positive", 8.0)
+        ),
+    ).to(device)
     optimizer = get_optimizer(
         model,
-        lr=args.optimizer.lr,
-        weight_decay=args.optimizer.weight_decay,
-        betas=(args.optimizer.beta1, args.optimizer.beta2),
-        use_adamw=args.optimizer.use_adamw,
+        lr=float(args.optimizer.lr),
+        weight_decay=float(args.optimizer.weight_decay),
+        betas=(float(args.optimizer.beta1), float(args.optimizer.beta2)),
+        use_adamw=bool(args.optimizer.use_adamw),
     )
     scheduler = get_lr_scheduler(
         optimizer,
-        lr_scheduler=args.optimizer.lr_scheduler,
-        lr=args.optimizer.lr,
-        max_steps=args.epochs * len(train_loader) + 100,
-        warmup_steps=args.optimizer.warmup_steps,
-        decay_every_n_steps=args.optimizer.decay_every_n_steps,
-        decay_factor=args.optimizer.decay_factor,
+        lr_scheduler=str(args.optimizer.lr_scheduler),
+        lr=float(args.optimizer.lr),
+        max_steps=int(args.epochs) * len(train_loader) + 100,
+        warmup_steps=int(args.optimizer.warmup_steps),
+        decay_every_n_steps=int(args.optimizer.decay_every_n_steps),
+        decay_factor=float(args.optimizer.decay_factor),
     )
+    ema = None
+    ema_decay = float(cfg_get(args, "ema.decay", 0.0))
+    if ema_decay > 0:
+        ema = EMAWrapper(model, ema_decay, _ema_keywords(args))
+        ema.register()
 
     start_epoch = 1
-    ema_dir = _cfg_get(args, "ema_dir", default=None)
-    if ema_dir is not None and ema_wrapper is not None:
-        ema_checkpoint = torch.load(ema_dir, map_location=device)
-        _live_model(model).load_state_dict(ema_checkpoint["model_state_dict"])
-        ema_wrapper.register()
-        del ema_checkpoint
+    if args.ckpt_dir:
+        payload = load_checkpoint(
+            args.ckpt_dir,
+            live_model,
+            map_location=device,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            load_training_state=not bool(args.load_model_only),
+        )
+        if not bool(args.load_model_only):
+            start_epoch = int(payload["epoch"]) + 1
+    if args.ema_dir and ema is not None:
+        load_checkpoint(args.ema_dir, live_model, map_location=device)
+        ema.register()
 
-    if args.ckpt_dir is not None:
-        checkpoint = torch.load(args.ckpt_dir, map_location=device)
-        _live_model(model).load_state_dict(checkpoint["model_state_dict"])
-        if not args.load_model_only:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            start_epoch = checkpoint["epoch"] + 1
-        del checkpoint
-
-    csv_path = os.path.join(logging_dir, "loss.csv")
-    csv_fields = (
-        ["epoch"]
-        + [f"train_{name}" for name in _TRAIN_LOG_KEYS]
-        + [f"test_{name}" for name in _TEST_LOG_KEYS]
-    )
+    csv_path = output_dir / "metrics.csv"
     if DIST_WRAPPER.rank == 0:
-        with open(csv_path, "w", encoding="utf-8") as f:
-            f.write(",".join(csv_fields) + "\n")
+        csv_path.write_text(
+            ",".join(
+                ["epoch"]
+                + [f"train_{key}" for key in TRAIN_KEYS]
+                + [f"validation_{key}" for key in VALID_KEYS]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
-    epoch_progress = (
-        tqdm(total=args.epochs, leave=False, position=0)
-        if DIST_WRAPPER.rank == 0
-        else None
-    )
-
-    for crt_epoch in range(start_epoch, args.epochs + 1):
+    best_auprc = float("-inf")
+    global_step = 0
+    for epoch in range(start_epoch, int(args.epochs) + 1):
         if train_sampler is not None:
-            train_sampler.set_epoch(crt_epoch)
+            train_sampler.set_epoch(epoch)
+        train_iter = (
+            tqdm(train_loader, desc=f"Train {epoch}")
+            if DIST_WRAPPER.rank == 0
+            else train_loader
+        )
 
-        def log_train_step(term_floats: dict[str, float]) -> None:
+        def log_step(values: dict[str, float]) -> None:
             nonlocal global_step
             global_step += 1
-            if DIST_WRAPPER.rank != 0 or global_step % wandb_log_interval != 0:
-                return
-            payload = _prefix_metrics("train", _select_log_keys(term_floats, _TRAIN_LOG_KEYS))
-            payload["train/lr"] = float(optimizer.param_groups[0]["lr"])
-            _wandb_log(payload, step=global_step)
+            if wandb_run is not None:
+                wandb.log(
+                    {f"train/{key}": value for key, value in values.items()},
+                    step=global_step,
+                )
 
-        train_iter = train_loader
-        if DIST_WRAPPER.rank == 0:
-            train_iter = tqdm(
-                train_loader,
-                desc="Train",
-                total=len(train_loader),
-                leave=True,
-                position=1,
-            )
         train_metrics = train_epoch(
-            model=model,
-            loader=train_iter,
-            optimizer=optimizer,
-            loss_fn=loss_fn,
-            loss_weights=loss_weights,
-            device=device,
+            model,
+            train_iter,
+            optimizer,
+            scheduler,
+            loss_module,
+            device,
+            precision=precision,
+            grad_accum_steps=int(args.optimizer.grad_accum_steps),
             max_grad_norm=float(args.optimizer.max_grad_norm),
-            grad_accum_steps=max(1, int(args.optimizer.grad_accum_steps)),
-            scheduler=scheduler,
-            step_logger=log_train_step,
-            ema_wrapper=ema_wrapper,
+            ema=ema,
+            step_logger=log_step,
         )
-
-        test_iter = test_loader
-        if DIST_WRAPPER.rank == 0:
-            test_iter = tqdm(
-                test_loader,
-                desc="Test",
-                total=len(test_loader),
-                leave=True,
-                position=1,
-            )
-        if ema_wrapper is not None:
-            ema_wrapper.apply_shadow()
-        test_metrics = evaluate_epoch(
-            model=model,
-            loader=test_iter,
-            loss_fn=loss_fn,
-            loss_weights=loss_weights,
-            device=device,
-            positive_weight=float(_cfg_get(args, "metrics.positive_weight", default=1.0)),
+        if ema is not None:
+            ema.apply_shadow()
+        validation_metrics = evaluate_epoch(
+            model,
+            validation_loader,
+            loss_module,
+            device,
+            precision=precision,
+            positive_weight=float(cfg_get(args, "metrics.positive_weight", 1.0)),
         )
-        if ema_wrapper is not None:
-            ema_wrapper.restore()
+        if ema is not None:
+            ema.restore()
 
         if DIST_WRAPPER.rank == 0:
-            if epoch_progress is not None:
-                epoch_progress.set_postfix(
-                    loss=f"{train_metrics.get('total', float('nan')):.3f}",
-                    test=f"{test_metrics.get('total', float('nan')):.3f}",
-                    pAUC=f"{test_metrics.get('protein_auroc', float('nan')):.3f}",
-                    pAP=f"{test_metrics.get('protein_auprc', float('nan')):.3f}",
-                )
-                epoch_progress.update()
-
-            logged_train = _select_log_keys(train_metrics, _TRAIN_LOG_KEYS)
-            logged_test = _select_log_keys(test_metrics, _TEST_LOG_KEYS)
-            row = {"epoch": crt_epoch}
-            row.update({f"train_{name}": value for name, value in logged_train.items()})
-            row.update({f"test_{name}": value for name, value in logged_test.items()})
-            with open(csv_path, "a", encoding="utf-8") as f:
-                f.write(
-                    ",".join(
-                        "" if name not in row else f"{row[name]}"
-                        for name in csv_fields
-                    )
-                    + "\n"
-                )
-            _wandb_log(
-                _prefix_metrics("test", logged_test),
-                step=max(global_step, 1),
-            )
+            row = [str(epoch)]
+            row.extend(str(train_metrics.get(key, "")) for key in TRAIN_KEYS)
+            row.extend(str(validation_metrics.get(key, "")) for key in VALID_KEYS)
+            with csv_path.open("a", encoding="utf-8") as handle:
+                handle.write(",".join(row) + "\n")
             log_info(
-                f"[epoch={crt_epoch}] "
-                + " ".join(
-                    f"train/{name}={logged_train.get(name, float('nan')):.4f}"
-                    for name in _TRAIN_LOG_KEYS
-                    if name in logged_train
-                )
-                + " "
-                + " ".join(
-                    f"test/{name}={logged_test.get(name, float('nan')):.4f}"
-                    for name in _TEST_LOG_KEYS
-                )
+                f"epoch={epoch} train_loss={train_metrics['total']:.4f} "
+                f"pair_auprc={validation_metrics['pair_auprc']:.4f}"
             )
-
-            if crt_epoch % args.checkpoint_interval == 0 or crt_epoch == args.epochs:
-                checkpoint_path = os.path.join(logging_dir, f"checkpoints/epoch_{crt_epoch}.pth")
-                torch.save(
+            if wandb_run is not None:
+                wandb.log(
                     {
-                        "epoch": crt_epoch,
-                        "model_state_dict": _live_model(model).state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
+                        f"validation/{key}": value
+                        for key, value in validation_metrics.items()
                     },
-                    checkpoint_path,
+                    step=max(global_step, 1),
                 )
-                if ema_wrapper is not None:
-                    ema_wrapper.apply_shadow()
-                    ema_path = os.path.join(
-                        logging_dir,
-                        f"checkpoints/_ema_{ema_wrapper.decay}_{crt_epoch}.pth",
-                    )
-                    torch.save(
-                        {"model_state_dict": _live_model(model).state_dict()},
-                        ema_path,
-                    )
-                    ema_wrapper.restore()
 
-    if wandb is not None and wandb.run is not None:
+            should_save = epoch % int(args.checkpoint_interval) == 0 or epoch == int(
+                args.epochs
+            )
+            if should_save:
+                save_checkpoint(
+                    output_dir / "checkpoints" / f"epoch_{epoch}.pth",
+                    live_model,
+                    epoch=epoch,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                )
+            if validation_metrics["pair_auprc"] > best_auprc:
+                best_auprc = validation_metrics["pair_auprc"]
+                if ema is not None:
+                    ema.apply_shadow()
+                save_checkpoint(
+                    output_dir / "checkpoints" / "best_pair_auprc.pth",
+                    live_model,
+                    epoch=epoch,
+                )
+                if ema is not None:
+                    ema.restore()
+
+    if wandb_run is not None:
         wandb.finish()
-    if dist.is_available() and dist.is_initialized():
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 

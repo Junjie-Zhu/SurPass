@@ -18,61 +18,64 @@ data:
   datasets:
     - name: pdb_ppi
       subdir: PDB_PPI
-      cluster_tsv: verified_heterodimers.clustered.tsv
-      assemble_negatives: true
+      train_tsv: splits/sources/pdb_ppi.train.tsv
+      validation_tsv: splits/sources/pdb_ppi.validation.tsv
+      require_labels: true
       weight: 50
     - name: afdb_pos
       subdir: AFDB_DDI
-      cluster_tsv: verified_heterodimers.clustered.tsv
-      assemble_negatives: false
-      is_positive: true
+      train_tsv: splits/sources/afdb_pos.train.tsv
+      validation_tsv: splits/sources/afdb_pos.validation.tsv
+      require_labels: true
       weight: 25
     - name: afdb_neg
       subdir: AFDB_DDI
-      cluster_tsv: verified_negative_heterodimers.clustered.tsv
-      assemble_negatives: false
-      is_positive: false
+      train_tsv: splits/sources/afdb_neg.train.tsv
+      validation_tsv: splits/sources/afdb_neg.validation.tsv
+      require_labels: false
       weight: 25
   batch_size: 2
   num_workers: 16
   pin_memory: true
-  test_fraction: 0.1
-  negative_ratio: 1
   distance_bin_start: 2.0
   distance_bin_end: 22.0
-  distance_bin_count: 64
+  distance_bin_count: 16
   contact_threshold: 8.0
-  crop_size: 128
+  # One total budget shared by both proteins.
+  crop_size: 256
+  interface_crop_probability: 1.0
 
 model:
-  n_layers: 9
-  dim_token: 768 
-  dim_pair: 512 
-  n_heads: 12
-  residual_mha: true
-  residual_transition: true
-  use_attn_pair_bias: true
-  use_qkln: true
-  dropout: 0.0 
+  n_layers: 2
+  cross_n_layers: 2
+  pair_n_layers: 2
+  dim_token: 384
+  dim_pair: 96
+  n_heads: 8
+  dropout: 0.0
   expansion_factor: 2
   plm_in_dim: 2560
-  plm_out_dim: 512 
-  r_max: 32
-  pair_update_interval: 3
-  pair_n_heads: 8
-  dim_opm_inner: 128 
+  plm_out_dim: 384
+  index_emb_dim: 64
+  topk_fraction: 0.01
+  maximum_topk: 64
+  allow_missing_physics: false
 
 loss:
-  bce:
+  protein:
     weight: 1.0
-    pos_weight: 0.1
-  tversky:
+  contact:
+    weight: 1.0
+    gamma: 1.5
+    positive_weight: 4.0
+    negatives_per_positive: 8.0
+  distance:
     weight: 0.1
-    alpha: 0.7
-    beta: 0.3
-    smooth: 1.0e-6
-  pair_ce:
-    weight: 1.0
+  aux_protein:
+    weight: 0.1
+
+runtime:
+  precision: bfloat16
 
 optimizer:
   lr: 0.0005

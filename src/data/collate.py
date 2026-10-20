@@ -48,14 +48,23 @@ def pad_residue_dicts(samples: list[dict]) -> dict:
     return feature_batch
 
 
-def pad_pair_maps(tensors: list[torch.Tensor], max_total: int) -> torch.Tensor:
+def pad_rectangular_pair_maps(
+    tensors: list[torch.Tensor],
+    max_p1_length: int,
+    max_p2_length: int,
+) -> torch.Tensor:
     out = tensors[0].new_full(
-        (len(tensors), max_total, max_total, *tensors[0].shape[2:]),
+        (
+            len(tensors),
+            max_p1_length,
+            max_p2_length,
+            *tensors[0].shape[2:],
+        ),
         fill_value=_pad_value(tensors[0]),
     )
     for index, tensor in enumerate(tensors):
-        length = int(tensor.shape[0])
-        out[index, :length, :length] = tensor
+        p1_length, p2_length = int(tensor.shape[0]), int(tensor.shape[1])
+        out[index, :p1_length, :p2_length] = tensor
     return out
 
 
@@ -69,23 +78,94 @@ def collate_concatenated_pairs(proteins: list[dict], peptides: list[dict]) -> di
     residue_batch = pad_residue_dicts(concatenated)
     residue_batch["p1_length"] = torch.tensor(p1_lengths, dtype=torch.long)
     residue_batch["p2_length"] = torch.tensor(p2_lengths, dtype=torch.long)
+    index = torch.arange(residue_batch["plm_emb"].shape[1]).view(1, -1)
+    total = (
+        residue_batch["p1_length"] + residue_batch["p2_length"]
+    ).view(-1, 1)
+    residue_batch["padding_mask"] = index < total
     return residue_batch
 
 
+def _unpack_sample(sample):
+    if len(sample) == 7:
+        return tuple(sample)
+    raise ValueError(f"Expected a seven-field PairSample, got {len(sample)}.")
+
+
+def _as_inter_chain_map(
+    tensor: torch.Tensor,
+    p1_length: int,
+    p2_length: int,
+) -> torch.Tensor:
+    """Accept a rectangular map, or extract the forward block from a legacy square map."""
+    expected_rectangular = (int(p1_length), int(p2_length))
+    if tuple(tensor.shape[:2]) == expected_rectangular:
+        return tensor
+
+    total = int(p1_length) + int(p2_length)
+    if tuple(tensor.shape[:2]) == (total, total):
+        return tensor[:p1_length, p1_length:total]
+    raise ValueError(
+        f"Pair map shape {tuple(tensor.shape[:2])} is neither "
+        f"{expected_rectangular} nor legacy square {(total, total)}."
+    )
+
+
 def collate_fn(batch):
-    proteins, peptides, labels_2d_bins, labels_2d_mask, is_positive = zip(*batch)
-    residue_batch = collate_concatenated_pairs(list(proteins), list(peptides))
-    max_total = int(residue_batch["mask"].shape[1])
+    unpacked = [_unpack_sample(sample) for sample in batch]
+    (
+        proteins,
+        peptides,
+        label_inter_bins,
+        label_inter_mask,
+        crop_is_positive,
+        source_is_positive,
+        metadata,
+    ) = zip(*unpacked)
+    proteins = list(proteins)
+    peptides = list(peptides)
+    residue_batch = collate_concatenated_pairs(proteins, peptides)
+    p1_lengths = [int(features["mask"].shape[0]) for features in proteins]
+    p2_lengths = [int(features["mask"].shape[0]) for features in peptides]
+    max_p1_length = max(p1_lengths)
+    max_p2_length = max(p2_lengths)
+    rectangular_bins = [
+        _as_inter_chain_map(tensor, p1_length, p2_length).to(dtype=torch.long)
+        for tensor, p1_length, p2_length in zip(
+            label_inter_bins, p1_lengths, p2_lengths
+        )
+    ]
+    rectangular_masks = [
+        _as_inter_chain_map(tensor, p1_length, p2_length).to(dtype=torch.bool)
+        for tensor, p1_length, p2_length in zip(
+            label_inter_mask, p1_lengths, p2_lengths
+        )
+    ]
     label_batch = {
-        "label_2d_bins": pad_pair_maps(
-            [tensor.to(dtype=torch.long) for tensor in labels_2d_bins],
-            max_total,
+        "label_inter_bins": pad_rectangular_pair_maps(
+            rectangular_bins,
+            max_p1_length,
+            max_p2_length,
         ),
-        "label_2d_mask": pad_pair_maps(
-            [tensor.to(dtype=torch.bool) for tensor in labels_2d_mask],
-            max_total,
+        "label_inter_mask": pad_rectangular_pair_maps(
+            rectangular_masks,
+            max_p1_length,
+            max_p2_length,
         ),
-        "is_positive": torch.tensor(list(is_positive), dtype=torch.bool),
+        "crop_is_positive": torch.tensor(
+            list(crop_is_positive), dtype=torch.bool
+        ),
+        "source_is_positive": torch.tensor(
+            list(source_is_positive), dtype=torch.bool
+        ),
+        "sample_confidence": torch.tensor(
+            [
+                float(item.get("sample_confidence", 1.0))
+                for item in metadata
+            ],
+            dtype=torch.float32,
+        ),
+        "crop_metadata": list(metadata),
     }
     return residue_batch, label_batch
 

@@ -17,13 +17,11 @@ if str(ROOT) not in sys.path:
 
 from src.inference import (  # noqa: E402
     load_fasta_sequences,
-    metrics_from_prediction_rows,
     parse_ppi_label,
     parse_protein_pair,
-    protein_metric_weights,
     resolve_label_column,
-    write_metrics,
 )
+from src.runtime.metrics import metrics_from_rows  # noqa: E402
 
 DEFAULT_DATA_ROOT = "/groups/sbinlab/clschf/datasets/PDB_PPI"
 BENCHMARK_COLUMNS = [
@@ -103,10 +101,12 @@ def write_benchmark_results(
         sep="\t",
         index=False,
     )
-    weights = protein_metric_weights(float(positive_weight))
+    weights = [1.0]
+    if float(positive_weight) != 1.0:
+        weights.append(float(positive_weight))
     metrics_by_head = {
         "interaction": {
-            weight: metrics_from_prediction_rows(
+            weight: metrics_from_rows(
                 rows,
                 "p_interaction",
                 positive_weight=weight,
@@ -114,7 +114,20 @@ def write_benchmark_results(
             for weight in weights
         }
     }
-    write_metrics(metrics_path, metrics_by_head)
+    pd.DataFrame(
+        [
+            {
+                "head": "interaction",
+                "positive_weight": weight,
+                "AUROC": metrics["auroc"],
+                "AUPRC": metrics["auprc"],
+                "N": metrics["n"],
+                "N_pos": metrics["n_pos"],
+                "N_neg": metrics["n_neg"],
+            }
+            for weight, metrics in metrics_by_head["interaction"].items()
+        ]
+    ).to_csv(metrics_path, index=False)
     for weight, metrics in metrics_by_head["interaction"].items():
         print(
             f"[test-metrics] head=interaction "

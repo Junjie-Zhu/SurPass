@@ -11,9 +11,9 @@ from pathlib import Path
 
 import torch
 
-BENCHMARK_DIR = Path(__file__).resolve().parent
-if str(BENCHMARK_DIR) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_DIR))
+BENCHMARK_DIR = "/groups/sbinlab/clschf/mint"
+if BENCHMARK_DIR not in sys.path:
+    sys.path.insert(0, BENCHMARK_DIR)
 
 from common import (  # noqa: E402
     DEFAULT_DATA_ROOT,
