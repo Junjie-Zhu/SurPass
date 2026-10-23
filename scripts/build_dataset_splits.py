@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Join pair tables to a precomputed family mapping, split whole "
-            "connected components, exclude benchmark-connected components, "
+            "positive interaction components, exclude benchmark-matching sequences, "
             "and optionally generate matched synthetic hard negatives."
         )
     )
@@ -47,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Pair TSV/CSV/JSONL. Repeat for multiple positive, curated, or "
             "static-negative sources. Rows without the positive column are "
-            "treated as known positives."
+            "treated as positive except for afdb_neg/pdb_neg sources."
         ),
     )
     parser.add_argument(
@@ -69,17 +70,32 @@ def _parser() -> argparse.ArgumentParser:
             "same order. Use from-table to read --positive-column."
         ),
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("splits"))
     parser.add_argument(
         "--benchmark-families",
         type=Path,
         help="Optional one-column or tabular benchmark family/entity list.",
     )
     parser.add_argument("--benchmark-column", default="family_id")
+    parser.add_argument(
+        "--benchmark-entities", type=Path,
+        help="Direct training-sequence hits from build_mmseqs_families.py; excludes only pairs containing these entities.",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hard-negative-count", type=int, default=0)
-    parser.add_argument("--synthetic-confidence", type=float, default=0.5)
+    parser.add_argument(
+        "--pdb-negative-ratio", type=float, default=1.0,
+        help="Negative clusters per positive PPI cluster in each pdb_ppi split (default: 1). Each generated negative is one cluster; written separately as pdb_neg.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Candidate-ranking worker processes (default: 1). Selection stays deterministic.",
+    )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="Disable progress bars/status messages on stderr; stdout always contains the JSON summary.",
+    )
 
     parser.add_argument("--entity-column", default="entity_id")
     parser.add_argument("--family-column", default="family_id")
@@ -92,10 +108,10 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_benchmark_values(path: Path | None, column: str) -> set[str]:
+def _read_benchmark_values(path: Path | None, column: str, *, progress: bool = False) -> set[str]:
     if path is None:
         return set()
-    records = read_records(path)
+    records = read_records(path, progress=progress)
     if not records:
         return set()
     if column not in records[0]:
@@ -110,6 +126,18 @@ def _read_benchmark_values(path: Path | None, column: str) -> set[str]:
         for record in records
         if str(record.get(column, "")).strip()
     }
+
+
+def _default_source_name(path: Path) -> str:
+    """Match the standard preparation outputs to the training source names."""
+    standard = {
+        "verified_pdb_pairs.tsv": "pdb_ppi",
+        "verified_heterodimers.tsv": "pdb_ppi",
+        "verified_heterodimers.clustered.tsv": "pdb_ppi",
+        "verified_positive_pairs.dissimilar.tsv": "afdb_pos",
+        "verified_negative_pairs.dissimilar.tsv": "afdb_neg",
+    }
+    return standard.get(path.name, f"{path.parent.name}.{path.stem}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,12 +158,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--validation-fraction must be in [0, 1)")
     if args.hard_negative_count < 0:
         parser.error("--hard-negative-count must be non-negative")
-    if not 0.0 < args.synthetic_confidence < 1.0:
-        parser.error("--synthetic-confidence must be between 0 and 1")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if not math.isfinite(args.pdb_negative_ratio) or args.pdb_negative_ratio < 0:
+        parser.error("--pdb-negative-ratio must be finite and non-negative")
 
-    family_tables = [read_records(path) for path in args.family_mapping]
+    progress = not args.no_progress
+    family_tables = [read_records(path, progress=progress) for path in args.family_mapping]
     family_rows = [row for table in family_tables for row in table]
-    pair_tables = [read_records(path) for path in args.pair_table]
+    pair_tables = [read_records(path, progress=progress) for path in args.pair_table]
     if args.source_label:
         for table, policy in zip(pair_tables, args.source_label):
             if policy == "from-table":
@@ -159,16 +190,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"pair tables are empty: {', '.join(empty_pair_tables)}")
 
     benchmark_families = _read_benchmark_values(
-        args.benchmark_families, args.benchmark_column
+        args.benchmark_families, args.benchmark_column, progress=progress,
     )
     manifests = build_dataset_splits(
         family_rows,
         pair_tables,
         benchmark_families=benchmark_families,
+        benchmark_entities=_read_benchmark_values(args.benchmark_entities, "entity_id", progress=progress),
         validation_fraction=args.validation_fraction,
         seed=args.seed,
         hard_negative_count=args.hard_negative_count,
-        synthetic_confidence=args.synthetic_confidence,
         entity_column=args.entity_column,
         family_column=args.family_column,
         length_column=args.length_column,
@@ -181,12 +212,15 @@ def main(argv: list[str] | None = None) -> int:
             args.source_name
             if args.source_name
             else [
-                f"{path.parent.name}.{path.stem}"
+                _default_source_name(path)
                 for path in args.pair_table
             ]
         ),
+        pdb_negative_ratio=args.pdb_negative_ratio,
+        workers=args.workers,
+        progress=progress,
     )
-    paths = write_split_manifests(args.output_dir, manifests)
+    paths = write_split_manifests(args.output_dir, manifests, progress=progress)
     print(
         json.dumps(
             {
@@ -202,4 +236,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nDataset build interrupted; worker processes stopped.", file=sys.stderr, flush=True)
+        raise SystemExit(130)

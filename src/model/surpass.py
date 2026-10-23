@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -15,12 +16,9 @@ from src.model.components.transformer import (
     BidirectionalCrossAttention,
     ResidueTransformer,
     SwiGLU,
+    Transition,
 )
-from src.model.loss import (
-    pair_contact_probability,
-    pooled_contact_probability,
-    probability_to_logit,
-)
+from src.model.loss import noisy_or_contact_logit
 
 
 @dataclass
@@ -28,7 +26,8 @@ class SurpassOutput:
     """Model outputs.
 
     ``pair_logits`` and ``pair_mask`` are rectangular [B,L1,L2,...] tensors.
-    ``protein_logit`` is derived from those contacts and is the primary score.
+    ``protein_logit`` is the noisy-OR training logit. Inference and checkpoint
+    selection use the maximum valid contact probability from ``pair_logits``.
     """
 
     protein_logit: torch.Tensor
@@ -99,7 +98,7 @@ def _masked_max(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 class ResOnly(nn.Module):
     """Sequence-only PPI model with a rectangular inter-chain pair track."""
 
-    architecture = "inter_pair_v2"
+    architecture = "inter_pair_v3"
 
     def __init__(
         self,
@@ -113,8 +112,7 @@ class ResOnly(nn.Module):
         distance_bin_end: float = 22.0,
         distance_bin_count: int = 16,
         contact_threshold: float = 8.0,
-        topk_fraction: float = 0.01,
-        maximum_topk: int = 64,
+        contact_prior: float = 1e-4,
         **embedder_kwargs: object,
     ):
         super().__init__()
@@ -132,8 +130,12 @@ class ResOnly(nn.Module):
             distance_bin_end,
             self.distance_bin_count,
         )
-        self.topk_fraction = float(topk_fraction)
-        self.maximum_topk = int(maximum_topk)
+        if not 0 < self.contact_bins < self.distance_bin_count:
+            raise ValueError("The distance bins must include non-contact distances")
+        if not 0.0 < float(contact_prior) < 1.0:
+            raise ValueError("contact_prior must be between zero and one")
+        if int(n_layers) < 0:
+            raise ValueError("n_layers must be non-negative")
 
         self.residue_embedder = ResidueEmbedder(
             dim_token=dim_token,
@@ -171,30 +173,44 @@ class ResOnly(nn.Module):
             for index in range(int(n_layers))
         )
         self.pair_left = nn.ModuleList(
-            nn.Linear(dim_pair, dim_pair)
+            nn.Linear(dim_token, dim_pair)
             for _ in range(int(n_layers))
         )
         self.pair_product = nn.ModuleList(
-            nn.Linear(dim_pair, dim_pair)
+            nn.Linear(dim_token, dim_pair)
             for _ in range(int(n_layers))
         )
-        self.pair_update_bias = nn.ModuleList(
+        self.pair_update_bias = nn.ParameterList(
             nn.Parameter(torch.zeros(dim_pair))
             for _ in range(int(n_layers))
         )
         self.pair_transition = nn.ModuleList(
-            Transition(dim_pair)
+            Transition(dim_pair, expansion_factor)
             for _ in range(int(n_layers))
         )
-        self.n_layers = n_layers
+        self.pair_token_norm = nn.ModuleList(
+            nn.LayerNorm(dim_token) for _ in range(int(n_layers))
+        )
+        self.n_layers = int(n_layers)
 
         self.pair_head = nn.Sequential(
             nn.LayerNorm(dim_pair),
             nn.Linear(dim_pair, distance_bin_count),
         )
+        # A sparse contact prior prevents a uniform distance softmax from
+        # immediately saturating noisy-OR on thousands of residue pairs.
+        with torch.no_grad():
+            self.pair_head[-1].bias[:self.contact_bins].fill_(
+                math.log(float(contact_prior) / self.contact_bins)
+            )
+            self.pair_head[-1].bias[self.contact_bins:].fill_(
+                math.log((1.0 - float(contact_prior)) / (
+                    self.distance_bin_count - self.contact_bins
+                ))
+            )
         self.auxiliary_head = nn.Sequential(
             nn.LayerNorm(dim_token * 6),
-            nn.Linear(dim_token * 6, dim_token),
+            nn.Linear(dim_token * 6, dim_token * 2),
             SwiGLU(),
             nn.Linear(dim_token, 1),
         )
@@ -206,7 +222,9 @@ class ResOnly(nn.Module):
         pair: torch.Tensor, 
         pair_mask: torch.Tensor,
         layer: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        chain_1 = self.pair_token_norm[layer](chain_1)
+        chain_2 = self.pair_token_norm[layer](chain_2)
         left_update = self.pair_left[layer](chain_1)
         right_update = self.pair_left[layer](chain_2)
         left_product_update = self.pair_product[layer](chain_1)
@@ -218,7 +236,7 @@ class ResOnly(nn.Module):
         )
         pair_update = pair_update + self.pair_update_bias[layer]
         pair_update = self.pair_transition[layer](pair_update, pair_mask)
-        return (pair + pair_update) * pair_mask
+        return (pair + pair_update) * pair_mask[..., None]
 
 
     def forward(
@@ -262,7 +280,7 @@ class ResOnly(nn.Module):
         )
 
         for layer in range(self.n_layers):
-            # update chains seperately
+            # Update chains separately, then exchange context and update pairs.
             chain_1 = self.residue_blocks[layer](chain_1, mask_1)
             chain_2 = self.residue_blocks[layer](chain_2, mask_2)
 
@@ -277,17 +295,11 @@ class ResOnly(nn.Module):
 
         pair_logits = self.pair_head(pair)
 
-        contact_probability = pair_contact_probability(
+        protein_logit = noisy_or_contact_logit(
             pair_logits,
+            pair_mask,
             self.contact_bins,
         )
-        primary_probability = pooled_contact_probability(
-            contact_probability,
-            pair_mask,
-            topk_fraction=self.topk_fraction,
-            maximum_topk=self.maximum_topk,
-        )
-        protein_logit = probability_to_logit(primary_probability)
 
         mean_1 = _masked_mean(chain_1, mask_1)
         mean_2 = _masked_mean(chain_2, mask_2)

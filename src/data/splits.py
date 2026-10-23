@@ -7,20 +7,51 @@ notebooks, or the thin command-line wrapper without a dataframe dependency.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
+import math
+import multiprocessing
 import random
+import sys
+import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack
+from itertools import islice
 from pathlib import Path
 from typing import Any
+
+from src.data.negative_sampling import (
+    CandidateIndex,
+    NegativeQuery,
+    init_candidate_worker,
+    rank_candidate_queries,
+)
 
 Record = dict[str, Any]
 FamilyMapping = Mapping[str, str] | Iterable[Mapping[str, Any]]
 
 
+def _progress(items=None, *, progress: bool = False, **kwargs):
+    if not progress:
+        return items
+    from tqdm import tqdm
+
+    return tqdm(
+        items, file=sys.stderr, dynamic_ncols=True,
+        mininterval=0.2 if sys.stderr.isatty() else 5.0, **kwargs,
+    )
+
+
+def _status(progress: bool, message: str) -> None:
+    if progress:
+        from tqdm import tqdm
+
+        tqdm.write(message, file=sys.stderr)
+
+
 PAIR_MANIFEST_COLUMNS = [
     "pair_id",
+    "ppi_cluster_id",
     "chain1",
     "chain2",
     "family1",
@@ -28,8 +59,8 @@ PAIR_MANIFEST_COLUMNS = [
     "length1",
     "length2",
     "source_is_positive",
+    "label_path",
     "negative_kind",
-    "sample_confidence",
     "source_table",
     "split",
     "component_id",
@@ -66,7 +97,7 @@ def canonical_family_pair(family1: str, family2: str) -> tuple[str, str]:
     return tuple(sorted((family1, family2)))
 
 
-def read_records(path: str | Path) -> list[Record]:
+def read_records(path: str | Path, *, progress: bool = False) -> list[Record]:
     """Read a TSV, CSV, or JSON-lines table into plain dictionaries."""
     path = Path(path)
     if not path.is_file():
@@ -74,7 +105,9 @@ def read_records(path: str | Path) -> list[Record]:
     if path.suffix.lower() in {".jsonl", ".ndjson"}:
         records = []
         with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
+            for line_number, line in enumerate(_progress(
+                handle, progress=progress, desc=f"Read {path.name}", unit="rows",
+            ), start=1):
                 if not line.strip():
                     continue
                 value = json.loads(line)
@@ -90,7 +123,9 @@ def read_records(path: str | Path) -> list[Record]:
         reader = csv.DictReader(handle, delimiter=delimiter)
         if reader.fieldnames is None:
             raise ValueError(f"Input table has no header: {path}")
-        return [dict(row) for row in reader]
+        return [dict(row) for row in _progress(
+            reader, progress=progress, desc=f"Read {path.name}", unit="rows",
+        )]
 
 
 def normalize_family_mapping(
@@ -158,6 +193,7 @@ def annotate_pair_tables(
     length1_column: str = "length1",
     length2_column: str = "length2",
     source_names: Sequence[str] | None = None,
+    progress: bool = False,
 ) -> list[Record]:
     """Join pair rows to families while preserving negative provenance."""
     if not pair_tables:
@@ -173,7 +209,9 @@ def annotate_pair_tables(
             if source_names is not None
             else f"table_{table_index}"
         )
-        for row_index, raw_row in enumerate(table):
+        for row_index, raw_row in enumerate(_progress(
+            table, progress=progress, desc=f"Annotate {source_name}", unit="pairs",
+        )):
             row = dict(raw_row)
             if chain1_column not in row or chain2_column not in row:
                 raise ValueError(
@@ -194,14 +232,12 @@ def annotate_pair_tables(
                 )
 
             source_is_positive = _as_bool(
-                row.get(positive_column), default=True
+                row.get(positive_column), default=source_name not in {"afdb_neg", "pdb_neg"}
             )
             negative_kind = ""
-            confidence = float(
-                row.get("sample_confidence")
-                or row.get("confidence")
-                or 1.0
-            )
+            # Legacy input columns must not propagate into the manifests.
+            row.pop("sample_confidence", None)
+            row.pop("confidence", None)
             if not source_is_positive:
                 negative_kind = str(
                     row.get("negative_kind")
@@ -231,10 +267,19 @@ def annotate_pair_tables(
                     "length2": length2,
                     "source_is_positive": source_is_positive,
                     "negative_kind": negative_kind,
-                    "sample_confidence": confidence,
-                    "source_table": str(row.get("source_table") or source_name),
+                    "source_table": (
+                        source_name if source_names is not None
+                        else str(row.get("source_table") or source_name)
+                    ),
                 }
             )
+            # Keep curated AFDB pair clusters (not one training item per row).
+            # Raw PDB heterodimers instead use the unordered 30% family pair.
+            if not row.get("ppi_cluster_id"):
+                cluster = row.get("CLUSTER")
+                if cluster is None or str(cluster).strip() == "":
+                    cluster = json.dumps(canonical_family_pair(row["family1"], row["family2"]))
+                row["ppi_cluster_id"] = f"{row['source_table']}:{cluster}"
             annotated.append(row)
 
     if not annotated:
@@ -247,10 +292,14 @@ class _UnionFind:
         self.parent = {str(value): str(value) for value in values}
 
     def find(self, value: str) -> str:
-        parent = self.parent[value]
-        if parent != value:
-            self.parent[value] = self.find(parent)
-        return self.parent[value]
+        root = value
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[value] != value:
+            parent = self.parent[value]
+            self.parent[value] = root
+            value = parent
+        return root
 
     def union(self, left: str, right: str) -> None:
         left_root, right_root = self.find(left), self.find(right)
@@ -265,13 +314,15 @@ class _UnionFind:
 def connected_family_components(
     families: Iterable[str],
     pair_records: Iterable[Mapping[str, Any]],
+    *,
+    progress: bool = False,
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Build deterministic components from all observed family-pair edges."""
     family_values = sorted({str(family) for family in families})
     if not family_values:
         raise ValueError("Cannot build components without families.")
     union_find = _UnionFind(family_values)
-    for row in pair_records:
+    for row in _progress(pair_records, progress=progress, desc="Connect families", unit="pairs"):
         family1, family2 = str(row["family1"]), str(row["family2"])
         if family1 not in union_find.parent or family2 not in union_find.parent:
             raise ValueError("Pair record references an unknown family.")
@@ -351,11 +402,6 @@ def known_positive_family_pairs(
     }
 
 
-def _stable_tie_breaker(seed: int, *values: Any) -> str:
-    payload = "|".join([str(seed), *(str(value) for value in values)])
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def _collect_entity_lengths(
     pair_records: Sequence[Mapping[str, Any]],
     entity_lengths: Mapping[str, int] | None,
@@ -377,7 +423,11 @@ def generate_hard_negative_candidates(
     entity_lengths: Mapping[str, int] | None = None,
     family_splits: Mapping[str, str] | None = None,
     seed: int = 42,
-    synthetic_confidence: float = 0.5,
+    template_source: str | None = None,
+    template_split: str | None = None,
+    output_source: str | None = None,
+    workers: int = 1,
+    progress: bool = False,
 ) -> list[Record]:
     """Generate deterministic endpoint-rewired, length/degree matched negatives.
 
@@ -386,18 +436,20 @@ def generate_hard_negative_candidates(
     split, so synthetic negatives cannot create cross-split family leakage.
     """
     count = int(count)
+    if int(workers) < 1:
+        raise ValueError("workers must be at least 1")
     if count < 0:
         raise ValueError("count must be non-negative.")
     if count == 0:
         return []
-    if not 0.0 < float(synthetic_confidence) < 1.0:
-        raise ValueError("synthetic_confidence must be between 0 and 1.")
 
     positive_rows = [
-        dict(row)
+        row
         for row in pair_records
         if _as_bool(row.get("source_is_positive"), default=True)
         and str(row.get("split", "train")) != "excluded"
+        and (template_source is None or str(row.get("source_table")) == template_source)
+        and (template_split is None or str(row.get("split")) == template_split)
     ]
     if not positive_rows:
         raise ValueError("Hard-negative generation requires known-positive pairs.")
@@ -419,7 +471,7 @@ def generate_hard_negative_candidates(
         family_neighbors[family1].add(family2)
         family_neighbors[family2].add(family1)
     family_degree = {
-        family: len(family_neighbors.get(family, set()))
+        family: len(family_neighbors.get(family, ()))
         for family in set(entity_to_family.values())
     }
 
@@ -430,106 +482,149 @@ def generate_hard_negative_candidates(
             inferred_splits.setdefault(str(row["family1"]), split)
             inferred_splits.setdefault(str(row["family2"]), split)
 
-    existing_entity_pairs = {
-        tuple(sorted((str(row["chain1"]), str(row["chain2"]))))
-        for row in pair_records
-    }
+    existing_neighbors: dict[str, set[str]] = defaultdict(set)
     entity_sources: dict[str, set[str]] = defaultdict(set)
-    for row in pair_records:
+    for row in _progress(
+        pair_records, progress=progress, desc="Index negative exclusions", unit="pairs",
+    ):
+        first, second = str(row["chain1"]), str(row["chain2"])
+        existing_neighbors[first].add(second)
+        existing_neighbors[second].add(first)
         source = str(row.get("source_table", "unknown"))
-        entity_sources[str(row["chain1"])].add(source)
-        entity_sources[str(row["chain2"])].add(source)
-    entities = sorted(entity_to_family)
+        if row.get("split", "train") != "excluded":
+            entity_sources[first].add(source)
+            entity_sources[second].add(source)
+
+    # Filter source/split once, then group by degree and length. Each query
+    # visits buckets in score order and stops beyond the best eligible score.
+    buckets = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for entity, sources in _progress(
+        entity_sources.items(), progress=progress, desc="Index candidate pools", unit="entities",
+    ):
+        family = str(entity_to_family[entity])
+        split = inferred_splits.get(family)
+        if split == "excluded":
+            continue
+        for source in sources:
+            buckets[(source, split)][family_degree[family]][lengths[entity]].append(entity)
+    pools = {
+        key: tuple(
+            (degree, tuple(sorted(by_length)), tuple(by_length[length] for length in sorted(by_length)))
+            for degree, by_length in sorted(by_degree.items())
+        )
+        for key, by_degree in buckets.items()
+    }
+    del buckets
+    index = CandidateIndex(
+        dict(entity_to_family), lengths, family_degree, dict(family_neighbors),
+        dict(existing_neighbors), pools, int(seed),
+    )
     templates = sorted(positive_rows, key=lambda row: str(row.get("pair_id", "")))
     random.Random(int(seed)).shuffle(templates)
+    description = "Negatives " + "/".join(
+        value for value in (output_source or template_source or "all sources", template_split) if value
+    )
+    _status(progress, f"{description}: {len(templates):,} templates, {len(pools):,} indexed pools, workers={workers}")
 
     generated: list[Record] = []
+    added_neighbors: dict[str, set[str]] = defaultdict(set)
     exhausted_templates: set[tuple[str, bool]] = set()
-    while len(generated) < count:
-        made_progress = False
-        for template in templates:
-            if len(generated) >= count:
+
+    def make_query(template, reverse):
+        key = (str(template.get("pair_id", "")), reverse)
+        if key in exhausted_templates:
+            return None
+        anchor_key, target_key = ("chain2", "chain1") if reverse else ("chain1", "chain2")
+        anchor, target = str(template[anchor_key]), str(template[target_key])
+        split = inferred_splits.get(str(entity_to_family[anchor]), str(template.get("split", "train")))
+        if split == "excluded":
+            return None
+        return NegativeQuery(
+            anchor, target, str(template.get("source_table", "unknown")), split,
+            template.get("pair_id"), reverse, frozenset(added_neighbors.get(anchor, ())),
+        )
+
+    with ExitStack() as stack:
+        bar = stack.enter_context(_progress(
+            progress=True, total=count, desc=description, unit="pairs",
+        )) if progress else None
+        pool = stack.enter_context(multiprocessing.Pool(
+            processes=int(workers), initializer=init_candidate_worker, initargs=(index,),
+        )) if int(workers) > 1 else None
+        batch_size = max(1, int(workers) * 8) if pool is not None else 1
+        attempts = 0
+        while len(generated) < count:
+            made_progress = False
+            remaining = iter(templates)
+            while len(generated) < count:
+                batch = list(islice(remaining, batch_size))
+                if not batch:
+                    break
+                pending = pool.imap(rank_candidate_queries, [
+                    tuple(make_query(template, reverse) for reverse in (False, True))
+                    for template in batch
+                ], chunksize=1) if pool is not None else None
+                for template in batch:
+                    if len(generated) >= count:
+                        break
+                    proposals = None
+                    if pending is not None:
+                        while True:
+                            try:
+                                proposals = pending.next(timeout=5.0)
+                                break
+                            except multiprocessing.TimeoutError:
+                                # A heartbeat also shows elapsed time while a worker
+                                # is searching a large equal-score bucket.
+                                if bar is not None:
+                                    bar.refresh()
+                    attempts += 1
+                    for reverse in (False, True):
+                        template_key = (str(template.get("pair_id", "")), reverse)
+                        if template_key in exhausted_templates:
+                            continue
+                        query = make_query(template, reverse)
+                        proposal = None if query is None else (
+                            index.best(query)
+                            if proposals is None or (reverse and proposals[0] is not None)
+                            else proposals[int(reverse)]
+                        )
+                        if proposal is not None and proposal[1] in added_neighbors.get(query.anchor, ()):
+                            # Earlier commits in this batch may have consumed the
+                            # worker's proposal. Requery in the parent, in order.
+                            proposal = index.best(query)
+                        if proposal is None:
+                            exhausted_templates.add(template_key)
+                            continue
+                        score, candidate = proposal
+                        anchor = query.anchor
+                        added_neighbors[anchor].add(candidate)
+                        added_neighbors[candidate].add(anchor)
+                        generated.append({
+                            "pair_id": f"synthetic_{len(generated):06d}",
+                            "ppi_cluster_id": f"synthetic_{len(generated):06d}",
+                            "chain1": anchor,
+                            "chain2": candidate,
+                            "family1": str(entity_to_family[anchor]),
+                            "family2": str(entity_to_family[candidate]),
+                            "length1": lengths[anchor],
+                            "length2": lengths[candidate],
+                            "source_is_positive": False,
+                            "negative_kind": "synthetic",
+                            "source_table": output_source or f"{query.source}.synthetic",
+                            "split": query.split,
+                            "component_id": "",
+                            "exclusion_reason": "",
+                            "matched_positive_pair_id": str(template.get("pair_id", "")),
+                            "match_score": score,
+                        })
+                        made_progress = True
+                        if bar is not None:
+                            bar.set_postfix(attempts=attempts, refresh=False)
+                            bar.update(1)
+                        break
+            if not made_progress:
                 break
-            for reverse in (False, True):
-                template_key = (str(template.get("pair_id", "")), reverse)
-                if template_key in exhausted_templates:
-                    continue
-                anchor_key, target_key = (
-                    ("chain2", "chain1") if reverse else ("chain1", "chain2")
-                )
-                anchor = str(template[anchor_key])
-                target = str(template[target_key])
-                template_source = str(template.get("source_table", "unknown"))
-                anchor_family = str(entity_to_family[anchor])
-                target_family = str(entity_to_family[target])
-                split = inferred_splits.get(
-                    anchor_family, str(template.get("split", "train"))
-                )
-                if split == "excluded":
-                    exhausted_templates.add(template_key)
-                    continue
-
-                candidates: list[tuple[float, str, str]] = []
-                for candidate in entities:
-                    candidate_family = str(entity_to_family[candidate])
-                    if template_source not in entity_sources.get(candidate, set()):
-                        continue
-                    if candidate == anchor or candidate_family == anchor_family:
-                        continue
-                    if inferred_splits.get(candidate_family, split) != split:
-                        continue
-                    if canonical_family_pair(anchor_family, candidate_family) in known_positive:
-                        continue
-                    entity_pair = tuple(sorted((anchor, candidate)))
-                    if entity_pair in existing_entity_pairs:
-                        continue
-
-                    length_score = abs(lengths[candidate] - lengths[target]) / max(
-                        lengths[target], 1
-                    )
-                    degree_score = abs(
-                        family_degree.get(candidate_family, 0)
-                        - family_degree.get(target_family, 0)
-                    ) / max(family_degree.get(target_family, 0), 1)
-                    score = float(length_score + degree_score)
-                    tie = _stable_tie_breaker(
-                        seed, template.get("pair_id"), reverse, candidate
-                    )
-                    candidates.append((score, tie, candidate))
-
-                if not candidates:
-                    exhausted_templates.add(template_key)
-                    continue
-                score, _, candidate = min(candidates)
-                candidate_family = str(entity_to_family[candidate])
-                existing_entity_pairs.add(tuple(sorted((anchor, candidate))))
-                pair_index = len(generated)
-                generated.append(
-                    {
-                        "pair_id": f"synthetic_{pair_index:06d}",
-                        "chain1": anchor,
-                        "chain2": candidate,
-                        "family1": anchor_family,
-                        "family2": candidate_family,
-                        "length1": lengths[anchor],
-                        "length2": lengths[candidate],
-                        "source_is_positive": False,
-                        "negative_kind": "synthetic",
-                        "sample_confidence": float(synthetic_confidence),
-                        "source_table": f"{template_source}.synthetic",
-                        "split": split,
-                        "component_id": "",
-                        "exclusion_reason": "",
-                        "matched_positive_pair_id": str(
-                            template.get("pair_id", "")
-                        ),
-                        "match_score": score,
-                    }
-                )
-                made_progress = True
-                break
-        if not made_progress:
-            break
     return generated
 
 
@@ -573,10 +668,10 @@ def build_dataset_splits(
     pair_tables: Sequence[Sequence[Mapping[str, Any]]],
     *,
     benchmark_families: Iterable[str] = (),
+    benchmark_entities: Iterable[str] = (),
     validation_fraction: float = 0.1,
     seed: int = 42,
     hard_negative_count: int = 0,
-    synthetic_confidence: float = 0.5,
     entity_column: str = "entity_id",
     family_column: str = "family_id",
     length_column: str = "length",
@@ -586,8 +681,16 @@ def build_dataset_splits(
     length1_column: str = "length1",
     length2_column: str = "length2",
     source_names: Sequence[str] | None = None,
+    pdb_negative_ratio: float = 1.0,
+    workers: int = 1,
+    progress: bool = False,
 ) -> dict[str, Any]:
     """Build all pair, family, component, leakage, and statistics manifests."""
+    if not math.isfinite(float(pdb_negative_ratio)) or float(pdb_negative_ratio) < 0:
+        raise ValueError("pdb_negative_ratio must be finite and non-negative")
+    if int(workers) < 1:
+        raise ValueError("workers must be at least 1")
+    _status(progress, "Normalize family mapping and annotate input pairs")
     entity_to_family, entity_lengths = normalize_family_mapping(
         family_mapping,
         entity_column=entity_column,
@@ -604,22 +707,63 @@ def build_dataset_splits(
         length1_column=length1_column,
         length2_column=length2_column,
         source_names=source_names,
+        progress=progress,
     )
     all_families = sorted(set(entity_to_family.values()))
-    family_to_component, components = connected_family_components(
-        all_families, rows
-    )
-
-    component_weights = defaultdict(int)
-    for row in rows:
-        component_weights[family_to_component[str(row["family1"])]] += 1
     benchmark = {
         entity_to_family.get(str(value), str(value))
         for value in benchmark_families
     }
+    # Benchmark similarity is a sequence property, not an interaction edge.
+    # Exclude affected pairs BEFORE constructing interaction components.
+    blocked_entities = {str(value) for value in benchmark_entities}
+    blocked_entities.update(
+        entity for entity, family in entity_to_family.items() if family in benchmark
+    )
+    unknown = blocked_entities.difference(entity_to_family)
+    if unknown:
+        raise ValueError(f"Benchmark exclusions absent from family mapping: {sorted(unknown)[:5]}")
+    positive_entity_pairs = {
+        tuple(sorted((str(row["chain1"]), str(row["chain2"]))))
+        for row in rows if row["source_is_positive"]
+    }
+    eligible_rows = []
+    for row in rows:
+        reason = ""
+        if not row["source_is_positive"] and tuple(sorted((row["chain1"], row["chain2"]))) in positive_entity_pairs:
+            reason = "negative_conflicts_known_positive_entity_pair"
+        elif blocked_entities.intersection((row["chain1"], row["chain2"])):
+            reason = "sequence_matches_benchmark"
+        row["exclusion_reason"] = reason
+        if not reason:
+            eligible_rows.append(row)
+
+    # Negative observations must not merge unrelated positive components.
+    # Preserve curated pair clusters in one split as well as sequence families.
+    cluster_anchors = {}
+
+    def component_edges():
+        for row in eligible_rows:
+            if not row["source_is_positive"]:
+                continue
+            yield row
+            key = (row["source_table"], str(row["ppi_cluster_id"]))
+            anchor = cluster_anchors.setdefault(key, row["family1"])
+            for family in (row["family1"], row["family2"]):
+                yield {"family1": anchor, "family2": family}
+
+    family_to_component, components = connected_family_components(
+        all_families, component_edges(), progress=progress,
+    )
+    component_weights = defaultdict(int)
+    component_positive_counts = defaultdict(int)
+    for row in eligible_rows:
+        component_id = family_to_component[row["family1"]]
+        component_weights[component_id] += 1
+        component_positive_counts[component_id] += bool(row["source_is_positive"])
+    _status(progress, f"Assign {len(components):,} positive interaction components to splits")
     component_splits = assign_component_splits(
         components,
-        benchmark_families=benchmark,
         validation_fraction=validation_fraction,
         seed=seed,
         component_weights=component_weights,
@@ -628,33 +772,86 @@ def build_dataset_splits(
         family: component_splits[component_id]
         for family, component_id in family_to_component.items()
     }
-
-    partitions: dict[str, list[Record]] = {
-        "train": [],
-        "validation": [],
-        "excluded": [],
-    }
-    positive_family_pairs = known_positive_family_pairs(rows)
-    for raw_row in rows:
-        row = dict(raw_row)
-        component_id = family_to_component[str(row["family1"])]
-        split = component_splits[component_id]
-        conflicts_with_positive = (
-            not _as_bool(row.get("source_is_positive"), default=True)
-            and canonical_family_pair(row["family1"], row["family2"])
-            in positive_family_pairs
-        )
-        if conflicts_with_positive:
+    partitions: dict[str, list[Record]] = {"train": [], "validation": [], "excluded": []}
+    for row in _progress(rows, progress=progress, desc="Partition pairs", unit="pairs"):
+        component_id = family_to_component[row["family1"]]
+        split = family_splits[row["family1"]]
+        if not row["exclusion_reason"] and split != family_splits[row["family2"]]:
+            row["exclusion_reason"] = "negative_crosses_train_validation_families"
+        if row["exclusion_reason"]:
             split = "excluded"
-        row["component_id"] = component_id
-        row["split"] = split
-        if conflicts_with_positive:
-            row["exclusion_reason"] = "negative_conflicts_known_positive_family_pair"
-        elif split == "excluded":
-            row["exclusion_reason"] = "component_touches_benchmark_family"
-        else:
-            row["exclusion_reason"] = ""
+        row.update(component_id=component_id, split=split)
         partitions[split].append(row)
+
+    # A curated negative cluster can span disconnected families. Keep its
+    # rows in a single split without joining those families through negatives.
+    negative_cluster_counts = defaultdict(lambda: defaultdict(int))
+    for split in ("train", "validation"):
+        for row in partitions[split]:
+            if not row["source_is_positive"]:
+                key = (row["source_table"], str(row["ppi_cluster_id"]))
+                negative_cluster_counts[key][split] += 1
+    negative_cluster_splits = {
+        key: max(counts, key=lambda split: (counts[split], split == "train"))
+        for key, counts in negative_cluster_counts.items()
+    }
+    for split in ("train", "validation"):
+        kept = []
+        for row in partitions[split]:
+            key = (row["source_table"], str(row["ppi_cluster_id"]))
+            if not row["source_is_positive"] and negative_cluster_splits[key] != split:
+                row.update(split="excluded", exclusion_reason="negative_cluster_crosses_train_validation")
+                partitions["excluded"].append(row)
+            else:
+                kept.append(row)
+        partitions[split] = kept
+
+    # Generate PDB negatives only after family/component assignment. Each split
+    # receives its own budget; AFDB negatives cannot consume the PDB budget.
+    pdb_negative_counts = {}
+    pdb_synthetic = []
+    for split in ("train", "validation"):
+        positive_rows = [
+            row for row in partitions[split]
+            if row["source_table"] == "pdb_ppi" and row["source_is_positive"]
+        ]
+        positive_cluster_count = len({
+            str(row.get("ppi_cluster_id") or row["pair_id"])
+            for row in positive_rows
+        })
+        requested = int(math.ceil(positive_cluster_count * float(pdb_negative_ratio)))
+        generated = generate_hard_negative_candidates(
+            [*partitions["train"], *partitions["validation"], *partitions["excluded"]],
+            entity_to_family,
+            count=requested,
+            entity_lengths=entity_lengths,
+            family_splits=family_splits,
+            seed=seed,
+            template_source="pdb_ppi",
+            template_split=split,
+            output_source="pdb_neg",
+            workers=workers,
+            progress=progress,
+        )
+        # Include split in IDs because each generator call starts at zero.
+        for row in generated:
+            row["pair_id"] = f"pdb_neg:{split}:{row['pair_id']}"
+            row["ppi_cluster_id"] = row["pair_id"]
+        partitions[split].extend(generated)
+        pdb_synthetic.extend(generated)
+        pdb_negative_counts[split] = {
+            "positive_pairs": len(positive_rows),
+            "positive_clusters": positive_cluster_count,
+            "requested": requested,
+            "generated": len(generated),
+            "negative_clusters": len(generated),
+        }
+        if len(generated) < requested:
+            warnings.warn(
+                f"PDB {split}: generated {len(generated)}/{requested} negatives; "
+                "no more within-split, source-matched family pairs are available.",
+                RuntimeWarning,
+            )
 
     synthetic = generate_hard_negative_candidates(
         [*partitions["train"], *partitions["validation"], *partitions["excluded"]],
@@ -663,11 +860,13 @@ def build_dataset_splits(
         entity_lengths=entity_lengths,
         family_splits=family_splits,
         seed=seed,
-        synthetic_confidence=synthetic_confidence,
+        workers=workers,
+        progress=progress,
     )
     for row in synthetic:
         partitions[str(row["split"])].append(row)
 
+    _status(progress, "Build family/component manifests and validate leakage")
     family_entities: dict[str, list[str]] = defaultdict(list)
     for entity, family in entity_to_family.items():
         family_entities[family].append(entity)
@@ -676,19 +875,17 @@ def build_dataset_splits(
             "entity_id": entity,
             "family_id": family,
             "component_id": family_to_component[family],
-            "split": family_splits[family],
+            "split": "excluded" if entity in blocked_entities else family_splits[family],
             "length": entity_lengths.get(entity),
             "benchmark_family": family in benchmark,
+            "benchmark_entity": entity in blocked_entities,
         }
         for entity, family in sorted(entity_to_family.items())
     ]
     component_manifest = []
-    for component_id, families in sorted(components.items()):
-        component_rows = [
-            row
-            for row in rows
-            if family_to_component[str(row["family1"])] == component_id
-        ]
+    for component_id, families in _progress(
+        sorted(components.items()), progress=progress, desc="Summarize components", unit="components",
+    ):
         component_manifest.append(
             {
                 "component_id": component_id,
@@ -697,11 +894,8 @@ def build_dataset_splits(
                 "entity_count": sum(
                     len(family_entities[family]) for family in families
                 ),
-                "pair_count": len(component_rows),
-                "positive_pair_count": sum(
-                    _as_bool(row.get("source_is_positive"), default=True)
-                    for row in component_rows
-                ),
+                "pair_count": component_weights[component_id],
+                "positive_pair_count": component_positive_counts[component_id],
                 "families": list(families),
             }
         )
@@ -709,9 +903,23 @@ def build_dataset_splits(
     leakage = validate_family_leakage(
         partitions, benchmark_families=benchmark
     )
+    benchmark_entity_overlap = sorted({
+        row[key] for split in ("train", "validation") for row in partitions[split]
+        for key in ("chain1", "chain2") if row[key] in blocked_entities
+    })
+    leakage["benchmark_entities_in_kept_splits"] = benchmark_entity_overlap
+    leakage["passed"] = leakage["passed"] and not benchmark_entity_overlap
+    cluster_sets = {
+        split: {(row["source_table"], str(row["ppi_cluster_id"])) for row in partitions[split]}
+        for split in ("train", "validation")
+    }
+    cluster_overlap = sorted(cluster_sets["train"] & cluster_sets["validation"])
+    leakage["train_validation_cluster_overlap"] = cluster_overlap
+    leakage["passed"] = leakage["passed"] and not cluster_overlap
     if not leakage["passed"]:
         raise RuntimeError(f"Family leakage detected: {leakage}")
 
+    all_sources = sorted({row["source_table"] for split_rows in partitions.values() for row in split_rows} | {"pdb_neg"})
     stats = {
         "seed": int(seed),
         "validation_fraction": float(validation_fraction),
@@ -719,6 +927,22 @@ def build_dataset_splits(
         "family_count": len(all_families),
         "component_count": len(components),
         "benchmark_family_count": len(benchmark),
+        "benchmark_entity_count": len(blocked_entities),
+        "source_input_counts": {
+            source: sum(row["source_table"] == source for row in rows)
+            for source in sorted({row["source_table"] for row in rows})
+        },
+        "source_input_cluster_counts": {
+            source: len({str(row["ppi_cluster_id"]) for row in rows if row["source_table"] == source})
+            for source in sorted({row["source_table"] for row in rows})
+        },
+        "source_cluster_counts": {
+            split: {
+                source: len({str(row["ppi_cluster_id"]) for row in split_rows if row["source_table"] == source})
+                for source in all_sources
+            }
+            for split, split_rows in partitions.items()
+        },
         "pair_counts": {
             split: len(split_rows) for split, split_rows in partitions.items()
         },
@@ -754,20 +978,56 @@ def build_dataset_splits(
             )
             for split, split_rows in partitions.items()
         },
+        "source_counts": {
+            split: {
+                source: sum(row["source_table"] == source for row in split_rows)
+                for source in all_sources
+            }
+            for split, split_rows in partitions.items()
+        },
+        "source_exclusion_counts": {
+            source: dict(sorted((
+                reason, sum(
+                    row["source_table"] == source and row["exclusion_reason"] == reason
+                    for row in partitions["excluded"]
+                )
+            ) for reason in {
+                row["exclusion_reason"] for row in partitions["excluded"]
+                if row["source_table"] == source
+            }))
+            for source in sorted({row["source_table"] for row in rows})
+        },
         "requested_hard_negatives": int(hard_negative_count),
         "generated_hard_negatives": len(synthetic),
+        "pdb_negative_ratio": float(pdb_negative_ratio),
+        "pdb_negative_counts": pdb_negative_counts,
+        "generated_pdb_negatives": len(pdb_synthetic),
         "conflicting_negative_count": sum(
             row.get("exclusion_reason")
-            == "negative_conflicts_known_positive_family_pair"
+            == "negative_conflicts_known_positive_entity_pair"
             for row in partitions["excluded"]
         ),
     }
+    for source in {"afdb_neg"}.intersection(row["source_table"] for row in rows):
+        if not any(not row["source_is_positive"] and row["source_table"] == source
+                   for split in ("train", "validation") for row in partitions[split]):
+            warnings.warn(
+                f"No {source} negatives survived. Inspect source_exclusion_counts; "
+                "if sequence_matches_benchmark removed them all with identity-only filtering, "
+                "rerun build_mmseqs_families.py with --coverage 0.8 (identity stays 0.3).",
+                RuntimeWarning,
+            )
     return {
         **partitions,
         "families": family_manifest,
         "components": component_manifest,
         "leakage": leakage,
         "stats": stats,
+        "source_names": sorted(
+            {str(row["source_table"]) for row in rows}
+            | {str(row["source_table"]) for row in [*pdb_synthetic, *synthetic]}
+            | ({"pdb_neg"} if any(row["source_table"] == "pdb_ppi" for row in rows) else set())
+        ),
     }
 
 
@@ -786,6 +1046,7 @@ def write_tsv(
     rows: Sequence[Mapping[str, Any]],
     *,
     preferred_columns: Sequence[str] = (),
+    progress: bool = False,
 ) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,7 +1065,7 @@ def write_tsv(
             extrasaction="ignore",
         )
         writer.writeheader()
-        for row in rows:
+        for row in _progress(rows, progress=progress, desc=f"Write {path.name}", unit="rows"):
             writer.writerow(
                 {key: _serialize_cell(row.get(key)) for key in fieldnames}
             )
@@ -814,23 +1075,30 @@ def write_tsv(
 def write_split_manifests(
     output_dir: str | Path,
     manifests: Mapping[str, Any],
+    *,
+    progress: bool = False,
 ) -> dict[str, Path]:
     """Write the seven required manifest groups with stable filenames."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
+    sources = set(manifests.get("source_names", ())) | {
+        str(row.get("source_table", "unknown"))
+        for split in ("train", "validation", "excluded")
+        for row in manifests[split]
+    }
     for split in ("train", "validation", "excluded"):
         paths[split] = write_tsv(
             output_dir / f"{split}.tsv",
             manifests[split],
             preferred_columns=PAIR_MANIFEST_COLUMNS,
+            progress=progress,
         )
-        by_source: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+        by_source: dict[str, list[Mapping[str, Any]]] = {source: [] for source in sources}
         for row in manifests[split]:
             source = str(row.get("source_table", "unknown"))
-            source = source.removesuffix(".synthetic")
             by_source[source].append(row)
-        for source, rows in by_source.items():
+        for source, rows in sorted(by_source.items()):
             safe_source = "".join(
                 character if character.isalnum() or character in "._-" else "_"
                 for character in source
@@ -839,6 +1107,7 @@ def write_split_manifests(
                 output_dir / "sources" / f"{safe_source}.{split}.tsv",
                 rows,
                 preferred_columns=PAIR_MANIFEST_COLUMNS,
+                progress=progress,
             )
     paths["families"] = write_tsv(
         output_dir / "families.tsv",
@@ -851,6 +1120,7 @@ def write_split_manifests(
             "length",
             "benchmark_family",
         ),
+        progress=progress,
     )
     paths["components"] = write_tsv(
         output_dir / "components.tsv",
@@ -864,6 +1134,7 @@ def write_split_manifests(
             "positive_pair_count",
             "families",
         ),
+        progress=progress,
     )
     for name in ("leakage", "stats"):
         path = output_dir / f"{name}.json"

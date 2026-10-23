@@ -93,6 +93,7 @@ def _resolve_manifest(
     source_root: Path,
     source: Mapping,
     split: str,
+    split_dir: Path,
 ) -> Path:
     value = _source_value(
         source,
@@ -100,14 +101,12 @@ def _resolve_manifest(
         _source_value(source, f"{split}_cluster_tsv"),
     )
     if not value:
-        raise ValueError(
-            f"Dataset source {_source_value(source, 'name', '<unnamed>')!r} "
-            f"must provide {split}_tsv from build_dataset_splits.py. "
-            "Runtime random splitting is intentionally unsupported."
-        )
-    path = Path(str(value))
-    if not path.is_absolute():
-        path = source_root / path
+        name = str(source["name"])
+        path = split_dir / "sources" / f"{name}.{split}.tsv"
+    else:
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = source_root / path
     if not path.is_file():
         raise FileNotFoundError(f"Missing {split} manifest: {path}")
     return path
@@ -118,12 +117,14 @@ def build_multi_source_split(
     *,
     root_dir: str,
     dataset_kwargs: Mapping | None = None,
+    split_dir: str | None = None,
 ) -> tuple[Dataset, Dataset, torch.Tensor, list[dict]]:
     """Load immutable train/validation manifests for every data source."""
     if not sources:
         raise ValueError("At least one dataset source is required")
     shared_kwargs = dict(dataset_kwargs or {})
     parent = Path(root_dir)
+    manifest_root = Path(split_dir) if split_dir else parent / "splits"
     train_datasets: list[Dataset] = []
     validation_datasets: list[Dataset] = []
     proportions: list[float] = []
@@ -133,8 +134,8 @@ def build_multi_source_split(
         name = str(_source_value(source, "name", f"source_{index}"))
         subdir = str(_source_value(source, "subdir", "") or "")
         source_root = parent / subdir if subdir else parent
-        train_path = _resolve_manifest(source_root, source, "train")
-        validation_path = _resolve_manifest(source_root, source, "validation")
+        train_path = _resolve_manifest(source_root, source, "train", manifest_root)
+        validation_path = _resolve_manifest(source_root, source, "validation", manifest_root)
         require_labels = bool(_source_value(source, "require_labels", True))
         train_dataset = PepoTrainDataset(
             root_dir=str(source_root),
@@ -148,8 +149,8 @@ def build_multi_source_split(
             require_labels=require_labels,
             **shared_kwargs,
         )
-        if not train_dataset or not validation_dataset:
-            raise ValueError(f"Source {name!r} has an empty immutable split")
+        if not train_dataset:
+            raise ValueError(f"Source {name!r} has an empty train split; check preprocessing stats.json")
         train_datasets.append(train_dataset)
         validation_datasets.append(validation_dataset)
         proportions.append(float(_source_value(source, "weight", 1.0)))
@@ -177,4 +178,6 @@ def build_multi_source_split(
         if len(validation_datasets) == 1
         else ConcatDataset(validation_datasets)
     )
+    if not validation:
+        raise ValueError("The combined validation split is empty; check preprocessing stats.json")
     return train, validation, weights, descriptions

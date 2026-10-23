@@ -238,7 +238,7 @@ class ResidueEmbedder(nn.Module):
         self.pair_left = nn.Linear(self.dim_token, self.dim_pair, bias=False)
         self.pair_product = nn.Linear(self.dim_token, self.dim_pair, bias=False)
         self.position_projection = nn.Sequential(
-            nn.Linear(4, self.dim_pair),
+            nn.Linear(4, self.dim_pair * 2),
             SwiGLU(),
             nn.Linear(self.dim_pair, self.dim_pair),
         )
@@ -327,5 +327,6 @@ class ResidueEmbedder(nn.Module):
         ).to(dtype=pair.dtype)
         pair = pair + self.position_projection(position_features)
         pair = pair + self.inter_chain_embedding.to(dtype=pair.dtype)
-        pair = self.pair_transition(pair)
+        # Transition returns an update; preserve the physics/position inputs.
+        pair = pair + self.pair_transition(pair, pair_mask)
         return pair * pair_mask[..., None], pair_mask

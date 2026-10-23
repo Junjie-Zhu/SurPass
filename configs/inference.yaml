@@ -24,8 +24,6 @@ metrics:
 
 model:
   n_layers: 2
-  cross_n_layers: 2
-  pair_n_layers: 2
   dim_token: 384
   dim_pair: 96
   n_heads: 8
@@ -34,8 +32,7 @@ model:
   plm_in_dim: 2560
   plm_out_dim: 384
   index_emb_dim: 64
-  topk_fraction: 0.01
-  maximum_topk: 64
+  contact_prior: 0.0001
   allow_missing_physics: false
 
 runtime:

@@ -14,24 +14,23 @@ ema:
 
 data:
   root_dir: /groups/sbinlab/clschf/datasets
+  split_dir: ${data.root_dir}/splits
   epoch_size: 30000
   datasets:
     - name: pdb_ppi
       subdir: PDB_PPI
-      train_tsv: splits/sources/pdb_ppi.train.tsv
-      validation_tsv: splits/sources/pdb_ppi.validation.tsv
       require_labels: true
-      weight: 50
+      weight: 25
+    - name: pdb_neg
+      subdir: PDB_PPI
+      require_labels: false
+      weight: 25
     - name: afdb_pos
       subdir: AFDB_DDI
-      train_tsv: splits/sources/afdb_pos.train.tsv
-      validation_tsv: splits/sources/afdb_pos.validation.tsv
       require_labels: true
       weight: 25
     - name: afdb_neg
       subdir: AFDB_DDI
-      train_tsv: splits/sources/afdb_neg.train.tsv
-      validation_tsv: splits/sources/afdb_neg.validation.tsv
       require_labels: false
       weight: 25
   batch_size: 2
@@ -43,12 +42,9 @@ data:
   contact_threshold: 8.0
   # One total budget shared by both proteins.
   crop_size: 256
-  interface_crop_probability: 1.0
 
 model:
   n_layers: 2
-  cross_n_layers: 2
-  pair_n_layers: 2
   dim_token: 384
   dim_pair: 96
   n_heads: 8
@@ -57,8 +53,7 @@ model:
   plm_in_dim: 2560
   plm_out_dim: 384
   index_emb_dim: 64
-  topk_fraction: 0.01
-  maximum_topk: 64
+  contact_prior: 0.0001
   allow_missing_physics: false
 
 loss:
@@ -88,7 +83,7 @@ optimizer:
   decay_every_n_steps: 15000
   decay_factor: 0.95
   grad_accum_steps: 1
-  max_grad_norm: 0.0
+  max_grad_norm: 1.0
 
 metrics:
   positive_weight: 1.0

@@ -8,6 +8,7 @@ from torch.utils.data import Subset
 from src.data.balancing import build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
 from src.model.surpass import ResOnly
+from src.model.loss import max_contact_probability, pair_contact_probability
 from src.runtime.checkpoint import load_checkpoint
 from src.runtime.config import build_model_kwargs, cfg_get
 from src.runtime.device import autocast_context, resolve_cuda_device, to_device
@@ -39,10 +40,8 @@ def build_preview_loader(args: DictConfig):
             "distance_bin_count": args.data.distance_bin_count,
             "crop_size": args.data.crop_size,
             "contact_threshold": args.data.contact_threshold,
-            "interface_crop_probability": float(
-                cfg_get(args, "data.interface_crop_probability", 0.8)
-            ),
         },
+        split_dir=cfg_get(args, "data.split_dir"),
     )
     sample_count = min(PREVIEW_SAMPLE_COUNT, len(train_dataset))
     if sample_count == 0:
@@ -93,7 +92,10 @@ def main(args: DictConfig):
                 str(cfg_get(args, "runtime.precision", "bfloat16")),
             ):
                 output = model(residue_batch)
-            probability = float(torch.sigmoid(output.protein_logit.reshape(-1))[0].item())
+            probability = float(max_contact_probability(
+                pair_contact_probability(output.pair_logits, model.contact_bins),
+                output.pair_mask,
+            )[0].item())
             label = bool(labels["crop_is_positive"].reshape(-1)[0].item())
             print(
                 f"[sample {index:02d}] p_pair={probability:.4f} label={label}"

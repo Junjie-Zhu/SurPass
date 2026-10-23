@@ -12,7 +12,6 @@ from torch.utils.data import Dataset
 from src.data.cropping import (
     DEFAULT_CONTACT_THRESHOLD_A,
     DEFAULT_CROP_SIZE,
-    DEFAULT_INTERFACE_CROP_PROBABILITY,
     crop_negative_pair,
     crop_positive_pair,
 )
@@ -54,7 +53,6 @@ class PepoTrainDataset(Dataset):
         distance_bin_count: int = DISTANCE_BIN_NUM,
         crop_size: int | None = DEFAULT_CROP_SIZE,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
-        interface_crop_probability: float = DEFAULT_INTERFACE_CROP_PROBABILITY,
         require_labels: bool = True,
     ):
         self.root_dir = Path(root_dir)
@@ -66,16 +64,15 @@ class PepoTrainDataset(Dataset):
         self.distance_bin_count = int(distance_bin_count)
         self.crop_size = None if crop_size is None else int(crop_size)
         self.contact_threshold = float(contact_threshold)
-        self.interface_crop_probability = float(interface_crop_probability)
 
         if self.distance_bin_count <= 0:
             raise ValueError("distance_bin_count must be positive.")
         if self.crop_size is not None and self.crop_size < 2:
             raise ValueError("crop_size must be at least 2 when provided.")
-        if not 0.0 <= self.interface_crop_probability <= 1.0:
-            raise ValueError("interface_crop_probability must be between 0 and 1.")
 
-        self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t")
+        self.metadata = pd.read_csv(self.cluster_tsv_path, sep="\t").drop(
+            columns=["sample_confidence", "confidence"], errors="ignore",
+        )
         if "ppi_cluster_id" not in self.metadata.columns:
             if "pair_id" not in self.metadata.columns:
                 raise ValueError(
@@ -119,9 +116,6 @@ class PepoTrainDataset(Dataset):
             p1_features,
             p2_features,
             negative_kind=str(self._row_value(row, "negative_kind", "curated")),
-            confidence=float(
-                self._row_value(row, "sample_confidence", 1.0)
-            ),
         )
 
     def _sample_row(self, idx):
@@ -154,7 +148,6 @@ class PepoTrainDataset(Dataset):
             pairwise_mask,
             crop_size=self.crop_size,
             contact_threshold=self.contact_threshold,
-            interface_crop_probability=self.interface_crop_probability,
         )
         p1_length = int(p1_features["mask"].shape[0])
         label_inter_dist = pairwise_dist[:p1_length, p1_length:]
@@ -168,7 +161,6 @@ class PepoTrainDataset(Dataset):
         crop_metadata.update(
             {
                 "source_kind": "positive",
-                "sample_confidence": 1.0,
             }
         )
         return PairSample(
@@ -205,7 +197,6 @@ class PepoTrainDataset(Dataset):
         p2_features: dict,
         *,
         negative_kind: str,
-        confidence: float,
     ):
         p1_features, p2_features, crop_metadata = crop_negative_pair(
             p1_features,
@@ -224,7 +215,6 @@ class PepoTrainDataset(Dataset):
         crop_metadata.update(
             {
                 "source_kind": str(negative_kind),
-                "sample_confidence": float(confidence),
             }
         )
         sample = PairSample(

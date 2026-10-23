@@ -158,13 +158,6 @@ def collate_fn(batch):
         "source_is_positive": torch.tensor(
             list(source_is_positive), dtype=torch.bool
         ),
-        "sample_confidence": torch.tensor(
-            [
-                float(item.get("sample_confidence", 1.0))
-                for item in metadata
-            ],
-            dtype=torch.float32,
-        ),
         "crop_metadata": list(metadata),
     }
     return residue_batch, label_batch

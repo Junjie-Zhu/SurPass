@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.collate import collate_concatenated_pairs, get_dataloader
-from src.model.loss import pair_contact_probability, pooled_contact_probability
+from src.model.loss import pair_contact_probability, max_contact_probability
 from src.model.surpass import ResOnly
 from src.runtime.checkpoint import load_checkpoint
 from src.runtime.config import build_model_kwargs, cfg_get
@@ -241,15 +241,11 @@ def pair_contact_summary(
     *,
     contact_bins: int,
     score_threshold: float,
-    topk_fraction: float,
-    maximum_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     probability = pair_contact_probability(pair_logits, contact_bins)
-    pooled = pooled_contact_probability(
+    pooled = max_contact_probability(
         probability,
         pair_mask,
-        topk_fraction=topk_fraction,
-        maximum_topk=maximum_topk,
     )
     contact_count = (
         (probability >= float(score_threshold)) & pair_mask.to(dtype=torch.bool)
@@ -282,8 +278,6 @@ def evaluate_ppi(
                 output.pair_mask,
                 contact_bins=model.contact_bins,
                 score_threshold=score_threshold,
-                topk_fraction=model.topk_fraction,
-                maximum_topk=model.maximum_topk,
             )
             auxiliary = torch.sigmoid(output.aux_protein_logit.float())
             for index, meta in enumerate(metadata):

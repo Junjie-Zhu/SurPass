@@ -60,7 +60,7 @@ class InterPairBlock(nn.Module):
             nn.Linear(dim_pair, hidden * 2),
             SwiGLU(),
         )
-        self.transition_out = nn.Linear(hidden * 2, dim_pair)
+        self.transition_out = nn.Linear(hidden, dim_pair)
         self.dropout = float(dropout)
         nn.init.zeros_(self.axis_projection.weight)
         nn.init.zeros_(self.axis_projection.bias)

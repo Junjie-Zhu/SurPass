@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Mapping
 
 import torch
@@ -45,32 +44,45 @@ def pair_contact_probability(
     return torch.softmax(pair_logits.float(), dim=-1)[..., :contact_bins].sum(dim=-1)
 
 
-def pooled_contact_probability(
+def max_contact_probability(
     contact_probability: torch.Tensor,
     pair_mask: torch.Tensor,
-    *,
-    topk_fraction: float = 0.01,
-    maximum_topk: int = 64,
 ) -> torch.Tensor:
-    """Length-normalized mean of the strongest inter-chain contacts."""
-    probabilities: list[torch.Tensor] = []
-    fraction = float(topk_fraction)
-    if fraction <= 0.0:
-        raise ValueError("topk_fraction must be positive")
-    for sample_probability, sample_mask in zip(contact_probability, pair_mask):
-        valid = sample_probability[sample_mask.to(dtype=torch.bool)]
-        if valid.numel() == 0:
-            probabilities.append(sample_probability.new_zeros(()))
-            continue
-        count = max(1, int(math.ceil(valid.numel() * fraction)))
-        count = min(int(maximum_topk), count, int(valid.numel()))
-        probabilities.append(valid.topk(count, sorted=False).values.mean())
-    return torch.stack(probabilities)
+    """Inference score: one above-threshold valid contact is sufficient."""
+    return contact_probability.float().masked_fill(
+        ~pair_mask.bool(), 0.0
+    ).flatten(1).amax(dim=1)
 
 
-def probability_to_logit(probability: torch.Tensor) -> torch.Tensor:
-    probability = probability.clamp(1e-6, 1.0 - 1e-6)
-    return torch.log(probability) - torch.log1p(-probability)
+def pair_contact_logit(pair_logits: torch.Tensor, contact_bins: int) -> torch.Tensor:
+    """Binary contact logits without an intermediate rounded probability."""
+    contact_bins = int(contact_bins)
+    if pair_logits.ndim != 4 or not 0 < contact_bins < pair_logits.shape[-1]:
+        raise ValueError("contact logits require both contact and non-contact bins")
+    logits = pair_logits.float()
+    return torch.logsumexp(logits[..., :contact_bins], dim=-1) - torch.logsumexp(
+        logits[..., contact_bins:], dim=-1
+    )
+
+
+def noisy_or_contact_logit(
+    pair_logits: torch.Tensor,
+    pair_mask: torch.Tensor,
+    contact_bins: int,
+) -> torch.Tensor:
+    """Logit of 1 - product(1 - p_ij), evaluated in float32 log space.
+
+    Compute binary contact logits directly from the categorical logits. This
+    avoids rounding p to one, and retains negative-bag gradients even when
+    the noisy-OR probability would round to one. No length normalization is
+    applied: this is an OR over valid contacts, not a mean contact score.
+    Empty bags have a finite near-zero probability and no gradient.
+    """
+    contact_logit = pair_contact_logit(pair_logits, contact_bins)
+    hazard = F.softplus(contact_logit).masked_fill(~pair_mask.bool(), 0.0)
+    hazard = hazard.flatten(1).sum(dim=1)
+    hazard = hazard.clamp_min(torch.finfo(hazard.dtype).tiny)
+    return hazard + torch.log(-torch.expm1(-hazard))
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -83,17 +95,11 @@ class ProteinBindLoss(nn.Module):
         self,
         protein_logit: torch.Tensor,
         target: torch.Tensor,
-        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        loss = F.binary_cross_entropy_with_logits(
+        return F.binary_cross_entropy_with_logits(
             protein_logit.reshape(-1),
             target.reshape(-1).to(dtype=protein_logit.dtype),
-            reduction="none",
         )
-        if sample_weight is None:
-            return loss.mean()
-        weight = sample_weight.reshape(-1).to(device=loss.device, dtype=loss.dtype)
-        return (loss * weight).sum() / weight.sum().clamp_min(1e-6)
 
 
 class InterContactFocalLoss(nn.Module):
@@ -120,24 +126,23 @@ class InterContactFocalLoss(nn.Module):
         pair_logits: torch.Tensor,
         target_bins: torch.Tensor,
         pair_mask: torch.Tensor,
-        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        probability = pair_contact_probability(pair_logits, self.contact_bins)
+        contact_logits = pair_contact_logit(pair_logits, self.contact_bins)
         target = target_bins.long() < self.contact_bins
         losses: list[torch.Tensor] = []
-        used_weights: list[torch.Tensor] = []
-        for sample_index, (sample_probability, sample_target, sample_mask) in enumerate(zip(
-            probability,
+        for sample_logit, sample_target, sample_mask in zip(
+            contact_logits,
             target,
             pair_mask,
-        )):
+        ):
             valid = sample_mask.to(dtype=torch.bool)
-            p = sample_probability[valid].clamp(1e-6, 1.0 - 1e-6)
+            logit = sample_logit[valid]
+            p = logit.sigmoid()
             y = sample_target[valid]
             if p.numel() == 0:
                 continue
-            positive_loss = -((1.0 - p) ** self.gamma) * torch.log(p)
-            negative_loss = -(p**self.gamma) * torch.log1p(-p)
+            positive_loss = ((-logit).sigmoid() ** self.gamma) * F.softplus(-logit)
+            negative_loss = (p**self.gamma) * F.softplus(logit)
             positive_values = positive_loss[y]
             negative_values = negative_loss[~y]
             if positive_values.numel():
@@ -158,20 +163,9 @@ class InterContactFocalLoss(nn.Module):
             else:
                 negative_term = p.new_zeros(())
             sample_loss = positive_term + negative_term
-            if sample_weight is not None:
-                weight = sample_weight[sample_index].to(
-                    device=sample_loss.device,
-                    dtype=sample_loss.dtype,
-                )
-                sample_loss = sample_loss * weight
-                used_weights.append(weight)
             losses.append(sample_loss)
         if not losses:
             return pair_logits.sum() * 0.0
-        if used_weights:
-            return torch.stack(losses).sum() / torch.stack(used_weights).sum().clamp_min(
-                1e-6
-            )
         return torch.stack(losses).mean()
 
 
@@ -181,24 +175,17 @@ class InterDistanceLoss(nn.Module):
         pair_logits: torch.Tensor,
         target_bins: torch.Tensor,
         pair_mask: torch.Tensor,
-        sample_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         loss = F.cross_entropy(
             pair_logits.permute(0, 3, 1, 2),
             target_bins.long(),
             reduction="none",
         )
-        if sample_weight is None:
-            return _masked_mean(loss, pair_mask)
-        weight = pair_mask.to(dtype=loss.dtype) * sample_weight.to(
-            device=loss.device,
-            dtype=loss.dtype,
-        )[:, None, None]
-        return (loss * weight).sum() / weight.sum().clamp_min(1e-6)
+        return _masked_mean(loss, pair_mask)
 
 
 class SurpassLoss(nn.Module):
-    """One explicit objective matching the primary pair-derived score."""
+    """Noisy-OR protein supervision plus direct contact/distance supervision."""
 
     def __init__(
         self,
@@ -221,29 +208,24 @@ class SurpassLoss(nn.Module):
         self.distance = InterDistanceLoss()
 
     def forward(self, output, labels: Mapping[str, torch.Tensor]):
-        sample_weight = labels.get("sample_confidence")
         terms = {
             "protein": self.protein(
                 output.protein_logit,
                 labels["crop_is_positive"],
-                sample_weight,
             ),
             "contact": self.contact(
                 output.pair_logits,
                 labels["label_inter_bins"],
                 labels["label_inter_mask"],
-                sample_weight,
             ),
             "distance": self.distance(
                 output.pair_logits,
                 labels["label_inter_bins"],
                 labels["label_inter_mask"],
-                sample_weight,
             ),
             "aux_protein": self.protein(
                 output.aux_protein_logit,
                 labels["source_is_positive"],
-                sample_weight,
             ),
         }
         total = output.protein_logit.new_zeros(())

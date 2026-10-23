@@ -1,8 +1,8 @@
 """SurPass training entrypoint.
 
 The primary complex score is derived from the rectangular inter-chain contact
-map. Training and validation therefore optimize and select checkpoints using
-the same score used by inference.
+map. The protein loss uses noisy-OR; validation ranking and checkpoint
+selection use the same maximum-contact score as inference.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ except Exception:
 from src.data.balancing import DistributedWeightedSampler, build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
 from src.model.ema import EMAWrapper
-from src.model.loss import SurpassLoss
+from src.model.loss import SurpassLoss, max_contact_probability, pair_contact_probability
 from src.model.optimizer import get_lr_scheduler, get_optimizer
 from src.model.surpass import ResOnly
 from src.runtime.checkpoint import load_checkpoint, save_checkpoint
@@ -168,7 +168,10 @@ def evaluate_epoch(
             _add_terms(totals, terms)
             steps += 1
             scores.extend(
-                torch.sigmoid(output.protein_logit.float()).cpu().tolist()
+                max_contact_probability(
+                    pair_contact_probability(output.pair_logits, loss_module.contact.contact_bins),
+                    output.pair_mask,
+                ).cpu().tolist()
             )
             targets.extend(labels["crop_is_positive"].bool().cpu().tolist())
 
@@ -213,10 +216,8 @@ def _build_datasets(args: DictConfig):
                 "distance_bin_count": int(args.data.distance_bin_count),
                 "crop_size": int(args.data.crop_size),
                 "contact_threshold": float(args.data.contact_threshold),
-                "interface_crop_probability": float(
-                    cfg_get(args, "data.interface_crop_probability", 0.8)
-                ),
             },
+            split_dir=cfg_get(args, "data.split_dir"),
         ),
     )
 

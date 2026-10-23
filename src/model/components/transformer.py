@@ -72,10 +72,9 @@ class GatedAttention(nn.Module):
         update = self.output_projection(attended * gate)
         return update * query_mask.to(dtype=update.dtype)[..., None]
 
-    @staticmethod
-    def split_heads(value: torch.Tensor, length: int) -> torch.Tensor:
+    def split_heads(self, value: torch.Tensor, length: int) -> torch.Tensor:
         return value.view(
-            batch,
+            value.shape[0],
             length,
             self.heads,
             self.head_dimension,
@@ -106,7 +105,7 @@ class Transition(nn.Module):
             nn.Linear(int(dimension), hidden * 2),
             SwiGLU(),
         )
-        self.output_projection = nn.Linear(hidden * 2, int(dimension))
+        self.output_projection = nn.Linear(hidden, int(dimension))
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 

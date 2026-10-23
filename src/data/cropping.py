@@ -11,7 +11,6 @@ from src.data.labels import has_inter_chain_contact, inter_chain_contact_mask
 
 DEFAULT_CROP_SIZE = 256
 DEFAULT_CONTACT_THRESHOLD_A = 8.0
-DEFAULT_INTERFACE_CROP_PROBABILITY = 0.8
 
 CropMetadata = dict[str, Any]
 
@@ -153,7 +152,6 @@ def crop_positive_pair(
     *,
     crop_size: int | None = DEFAULT_CROP_SIZE,
     contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
-    interface_crop_probability: float = DEFAULT_INTERFACE_CROP_PROBABILITY,
     rng: random.Random | Any = random,
 ) -> tuple[
     dict,
@@ -163,15 +161,12 @@ def crop_positive_pair(
     bool,
     CropMetadata,
 ]:
-    """Crop a known-positive source and report the observed crop label.
+    """Crop a known-positive source while always retaining an observed contact.
 
-    ``crop_size`` is a *total* residue budget. Interface mode centers both
-    contiguous chain windows on one observed contact. Random mode samples the
-    two windows independently; it may legitimately crop every contact away.
+    ``crop_size`` is a *total* residue budget. Both contiguous chain windows
+    are centered on one sampled observed contact. Invalid positive sources
+    without a contact raise an error, including when no crop is necessary.
     """
-    if not 0.0 <= float(interface_crop_probability) <= 1.0:
-        raise ValueError("interface_crop_probability must be between 0 and 1.")
-
     p1_length = int(p1_features["mask"].shape[0])
     p2_length = int(p2_features["mask"].shape[0])
     p1_budget, p2_budget = split_total_crop_budget(
@@ -185,13 +180,15 @@ def crop_positive_pair(
         p1_length,
         contact_threshold,
     ).nonzero(as_tuple=False)
+    if contacts.numel() == 0:
+        raise ValueError("Positive pair has no valid inter-chain contact at the configured threshold")
     selected_contact: tuple[int, int] | None = None
 
     if no_crop:
         mode = "full"
         p1_idx = torch.arange(p1_length, dtype=torch.long)
         p2_idx = torch.arange(p2_length, dtype=torch.long)
-    elif contacts.numel() > 0 and rng.random() < float(interface_crop_probability):
+    else:
         mode = "interface"
         contact = contacts[rng.randrange(int(contacts.shape[0]))]
         selected_contact = (int(contact[0].item()), int(contact[1].item()))
@@ -201,15 +198,6 @@ def crop_positive_pair(
         p2_idx = select_centered_crop_indices(
             p2_length, p2_budget, selected_contact[1]
         )
-    else:
-        mode = "random"
-        p1_idx = select_contiguous_crop_indices(
-            p1_length, p1_budget, rng=rng
-        )
-        p2_idx = select_contiguous_crop_indices(
-            p2_length, p2_budget, rng=rng
-        )
-
     p1_features, p2_features, pairwise_dist, pairwise_mask = _slice_pair_maps(
         p1_features,
         p2_features,

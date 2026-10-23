@@ -153,8 +153,6 @@ def _load_config(args: argparse.Namespace):
             {
                 "model": {
                     "n_layers": 1,
-                    "cross_n_layers": 1,
-                    "pair_n_layers": 1,
                     "dim_token": 32,
                     "dim_pair": 16,
                     "n_heads": 4,

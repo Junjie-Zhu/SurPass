@@ -55,7 +55,6 @@ class DataSideContractTest(unittest.TestCase):
             masks,
             crop_size=8,
             contact_threshold=8.0,
-            interface_crop_probability=1.0,
             rng=random.Random(7),
         )
         p1, p2, _, _, contains_contact, metadata = result
@@ -64,31 +63,26 @@ class DataSideContractTest(unittest.TestCase):
         self.assertEqual(metadata["mode"], "interface")
         self.assertEqual(metadata["selected_contact"], (8, 2))
 
-    def test_random_positive_crop_can_preserve_source_but_lose_contact(self):
+    def test_positive_crops_always_retain_contact_at_chain_boundaries(self):
+        for contact in ((0, 0), (9, 9), (0, 9), (9, 0)):
+            distances, masks = _pair_maps(10, 10, contact)
+            for seed in range(10):
+                result = crop_positive_pair(
+                    _features(10), _features(10), distances, masks,
+                    crop_size=2, rng=random.Random(seed),
+                )
+                self.assertTrue(result[4])
+                self.assertEqual(result[5]["mode"], "interface")
+
+    def test_positive_without_valid_contact_is_rejected_even_without_crop(self):
         distances, masks = _pair_maps(10, 10, (9, 9))
-        result = crop_positive_pair(
-            _features(10),
-            _features(10),
-            distances,
-            masks,
-            crop_size=8,
-            contact_threshold=8.0,
-            interface_crop_probability=0.0,
-            rng=random.Random(2),
-        )
-        p1, p2, _, _, crop_is_positive, metadata = result
-        sample = PairSample(
-            p1,
-            p2,
-            torch.zeros((4, 4), dtype=torch.long),
-            torch.ones((4, 4), dtype=torch.bool),
-            crop_is_positive,
-            True,
-            metadata,
-        )
-        self.assertFalse(sample.crop_is_positive)
-        self.assertTrue(sample.source_is_positive)
-        self.assertEqual(sample.metadata["mode"], "random")
+        masks[:] = False
+        for budget in (8, None):
+            with self.assertRaisesRegex(ValueError, "no valid inter-chain contact"):
+                crop_positive_pair(
+                    _features(10), _features(10), distances, masks,
+                    crop_size=budget,
+                )
 
     def test_negative_crop_reallocates_short_chain_budget(self):
         p1, p2, metadata = crop_negative_pair(
@@ -134,6 +128,7 @@ class DataSideContractTest(unittest.TestCase):
             residues["residue_type"][1].tolist(),
             [3, 7, 8, 9],
         )
+        self.assertNotIn("sample_confidence", labels)
         self.assertEqual(residues["p1_length"].tolist(), [2, 1])
         self.assertEqual(residues["p2_length"].tolist(), [1, 3])
 

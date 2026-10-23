@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
 
 from src.inference import pair_contact_summary
 from src.model.surpass import ResOnly
+from src.model.loss import SurpassLoss
+from src.model.components.transformer import ResidueTransformer
+from src.model.components.inter_pair import InterPairBlock
 from src.runtime.checkpoint import load_checkpoint, save_checkpoint
 
 
@@ -20,8 +23,6 @@ def _model() -> ResOnly:
     torch.manual_seed(0)
     return ResOnly(
         n_layers=1,
-        cross_n_layers=1,
-        pair_n_layers=1,
         dim_token=32,
         dim_pair=16,
         n_heads=4,
@@ -98,9 +99,80 @@ class ModelV2Test(unittest.TestCase):
             save_checkpoint(path, model, epoch=3)
             restored = _model()
             payload = load_checkpoint(path, restored)
-        self.assertEqual(payload["architecture"], "inter_pair_v2")
+        self.assertEqual(payload["architecture"], "inter_pair_v3")
         for expected, actual in zip(model.parameters(), restored.parameters()):
             torch.testing.assert_close(expected, actual)
+
+    def test_residual_blocks_start_as_identity_on_valid_features(self):
+        single = torch.randn(2, 5, 32)
+        mask = torch.tensor([[True] * 5, [True, True, False, False, False]])
+        block = ResidueTransformer(32, 4)
+        torch.testing.assert_close(block(single, mask), single * mask[..., None])
+        pair = torch.randn(2, 5, 3, 16)
+        pair_mask = mask[..., None].expand(-1, -1, 3)
+        torch.testing.assert_close(
+            InterPairBlock(16)(pair, pair_mask), pair * pair_mask[..., None],
+        )
+
+    def test_pair_initializer_preserves_input_feature_gradients(self):
+        model = _model()
+        output = model(_batch(torch.randn(4, 8), torch.randn(3, 8)))
+        output.pair_logits.square().mean().backward()
+        # A zero-initialized Transition must not replace its input.
+        grad = model.residue_embedder.pair_left.weight.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(grad.abs().sum().item(), 0)
+
+    def test_training_loss_backward_and_optimizer_step_in_float32_and_bfloat16(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            model = _model().train()
+            batch = _batch(torch.randn(4, 8), torch.randn(3, 8))
+            batch = {key: value.expand(2, *value.shape[1:]).clone() for key, value in batch.items()}
+            labels = {
+                "crop_is_positive": torch.tensor([True, False]),
+                "source_is_positive": torch.tensor([True, False]),
+                "label_inter_bins": torch.full((2, 4, 3), 7),
+                "label_inter_mask": torch.ones((2, 4, 3), dtype=torch.bool),
+            }
+            labels["label_inter_bins"][0, 0, 0] = 0
+            criterion = SurpassLoss(model.contact_bins, {
+                "protein": 1, "contact": 1, "distance": 0.1, "aux_protein": 0.1,
+            })
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast("cpu", dtype=dtype, enabled=dtype != torch.float32):
+                    output = model(batch)
+                    loss, _ = criterion(output, labels)
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                self.assertTrue(all(
+                    torch.isfinite(parameter.grad).all()
+                    for parameter in model.parameters() if parameter.grad is not None
+                ))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+    def test_chain_swap_after_residual_updates_are_active(self):
+        model = _model()
+        with torch.no_grad():
+            # Initial zero residual branches would hide ordering/masking bugs.
+            for name, parameter in model.named_parameters():
+                if "output_projection" in name or "axis_projection" in name or "transition_out" in name:
+                    parameter.normal_(std=0.02)
+        first, second = torch.randn(5, 8), torch.randn(3, 8)
+        forward = model(_batch(first, second))
+        reverse = model(_batch(second, first))
+        torch.testing.assert_close(forward.pair_logits, reverse.pair_logits.transpose(1, 2))
+        torch.testing.assert_close(forward.protein_logit, reverse.protein_logit)
+
+    def test_old_architecture_checkpoint_is_rejected(self):
+        model = _model()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.pth"
+            save_checkpoint(path, model, architecture="inter_pair_v2")
+            with self.assertRaisesRegex(ValueError, "architecture"):
+                load_checkpoint(path, model)
 
     def test_rectangular_contact_count_is_not_double_counted(self):
         logits = torch.full((1, 2, 3, 4), -8.0)
@@ -112,8 +184,6 @@ class ModelV2Test(unittest.TestCase):
             torch.ones((1, 2, 3), dtype=torch.bool),
             contact_bins=1,
             score_threshold=0.5,
-            topk_fraction=0.1,
-            maximum_topk=4,
         )
         self.assertEqual(count.tolist(), [1])
         self.assertGreater(float(probability.item()), 0.99)
