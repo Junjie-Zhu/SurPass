@@ -9,7 +9,7 @@ from typing import Mapping
 import torch
 from torch import nn
 
-from src.data.labels import contact_bin_count
+from src.data.labels import contact_bin_count, distance_bin_spec
 from src.model.components.embedder import ResidueEmbedder
 from src.model.components.inter_pair import InterPairBlock
 from src.model.components.transformer import (
@@ -18,7 +18,7 @@ from src.model.components.transformer import (
     SwiGLU,
     Transition,
 )
-from src.model.loss import noisy_or_contact_logit
+from src.model.loss import protein_contact_logit
 
 
 @dataclass
@@ -26,7 +26,7 @@ class SurpassOutput:
     """Model outputs.
 
     ``pair_logits`` and ``pair_mask`` are rectangular [B,L1,L2,...] tensors.
-    ``protein_logit`` is the noisy-OR training logit. Inference and checkpoint
+    ``protein_logit`` uses the configured training pooling rule. Inference and checkpoint
     selection use the maximum valid contact probability from ``pair_logits``.
     """
 
@@ -113,6 +113,8 @@ class ResOnly(nn.Module):
         distance_bin_count: int = 16,
         contact_threshold: float = 8.0,
         contact_prior: float = 1e-4,
+        protein_pooling: str = "noisy_or",
+        distance_bin_convention: str = "legacy",
         **embedder_kwargs: object,
     ):
         super().__init__()
@@ -121,6 +123,10 @@ class ResOnly(nn.Module):
         n_heads = int(n_heads)
         if dim_token % n_heads:
             raise ValueError("n_heads must divide dim_token")
+        self.protein_pooling = protein_pooling
+        if protein_pooling not in {"max", "noisy_or"}:
+            raise ValueError("protein_pooling must be max or noisy_or")
+        self.bin_spec = distance_bin_spec(distance_bin_start, distance_bin_end, distance_bin_count, distance_bin_convention)
         self.dim_token = dim_token
         self.dim_pair = dim_pair
         self.distance_bin_count = int(distance_bin_count)
@@ -129,6 +135,7 @@ class ResOnly(nn.Module):
             distance_bin_start,
             distance_bin_end,
             self.distance_bin_count,
+            convention=distance_bin_convention,
         )
         if not 0 < self.contact_bins < self.distance_bin_count:
             raise ValueError("The distance bins must include non-contact distances")
@@ -216,10 +223,10 @@ class ResOnly(nn.Module):
         )
 
     def cross_pair_update(
-        self, 
-        chain_1: torch.Tensor, 
-        chain_2: torch.Tensor, 
-        pair: torch.Tensor, 
+        self,
+        chain_1: torch.Tensor,
+        chain_2: torch.Tensor,
+        pair: torch.Tensor,
         pair_mask: torch.Tensor,
         layer: int,
     ) -> torch.Tensor:
@@ -295,10 +302,10 @@ class ResOnly(nn.Module):
 
         pair_logits = self.pair_head(pair)
 
-        protein_logit = noisy_or_contact_logit(
+        protein_logit = protein_contact_logit(
             pair_logits,
             pair_mask,
-            self.contact_bins,
+            self.contact_bins, self.protein_pooling,
         )
 
         mean_1 = _masked_mean(chain_1, mask_1)

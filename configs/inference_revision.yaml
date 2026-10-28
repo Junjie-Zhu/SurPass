@@ -1,0 +1,4 @@
+# Compatibility alias. Keep all current settings in inference.yaml.
+defaults:
+  - inference
+  - _self_

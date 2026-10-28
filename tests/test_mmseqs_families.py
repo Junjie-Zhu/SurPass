@@ -8,11 +8,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.build_mmseqs_families import main, read_benchmark_hits, read_clusters, read_fasta
+from scripts.build_mmseqs_families import (
+    distinct_search_sequences, expand_search_hits, main, read_benchmark_hits,
+    read_clusters, read_fasta, resolve_threads,
+)
 from src.data.splits import build_dataset_splits, read_records
 
 
 class MMseqsFamiliesTest(unittest.TestCase):
+    def test_exact_duplicate_queries_expand_to_every_original_id(self):
+        sequences = {"z": "ACDE", "a": "ACDE", "b": "ACDF", "c": "GGGG"}
+        self.assertEqual(distinct_search_sequences(sequences), {"a": "ACDE", "b": "ACDF", "c": "GGGG"})
+        self.assertEqual(expand_search_hits({"a"}, sequences), {"a", "z"})
+        self.assertEqual(expand_search_hits(set(), sequences), set())
+
+    def test_auto_threads_respects_job_allocation_and_cpu_affinity(self):
+        with patch("scripts.build_mmseqs_families.os.process_cpu_count", return_value=128, create=True), patch(
+            "scripts.build_mmseqs_families.os.sched_getaffinity", return_value=set(range(32)), create=True
+        ), patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_threads(None), 32)
+            with patch.dict("os.environ", {"SLURM_CPUS_PER_TASK": "8"}):
+                self.assertEqual(resolve_threads(0), 8)
+                self.assertEqual(resolve_threads(64), 64)
+                with patch.dict("os.environ", {"NSLOTS": "4"}):
+                    self.assertEqual(resolve_threads(None), 4)
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                resolve_threads(-1)
+
     def test_fasta_multiline_case_and_conflicting_duplicate_headers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "input.fasta"
@@ -27,7 +49,12 @@ class MMseqsFamiliesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hits.tsv"
             path.write_text("a\ttest\t0.3\t0.8\t0.8\nb\ttest\t0.299\t1\t1\nc\ttest\t0.8\t0.79\t1\n")
-            self.assertEqual(read_benchmark_hits(path, {"a", "b", "c"}, {"test"}, 0), {"a", "c"})
+            audit = {}
+            self.assertEqual(read_benchmark_hits(path, {"a", "b", "c"}, {"test"}, 0, audit=audit), {"a", "c"})
+            self.assertEqual(audit["saved_qualifying_alignment_rows"], 2)
+            self.assertEqual(audit["matched_benchmark_reference_entity_count"], 1)
+            self.assertEqual(audit["saved_hits_training_coverage_below_0_8"], 1)
+            self.assertEqual(audit["saved_hits_both_coverages_at_least_0_8"], 1)
             self.assertEqual(read_benchmark_hits(path, {"a", "b", "c"}, {"test"}, 0.8), {"a"})
             path.write_text("a\ttest\t30\t1\t1\n")
             with self.assertRaisesRegex(ValueError, "fractional"):
@@ -36,6 +63,11 @@ class MMseqsFamiliesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected"):
                 read_benchmark_hits(path, {"a"}, {"test"}, 0)
 
+    def test_cli_rejects_identity_only_or_other_coverage_values(self):
+        for coverage in ("0", "0.5", "1.0"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["--fasta", "unused.fa", "--output-dir", "unused", "--coverage", coverage])
+
     def test_incomplete_clusters_fail_instead_of_silent_singleton_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "clusters.tsv"
@@ -43,7 +75,7 @@ class MMseqsFamiliesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 read_clusters(path, {"a": "AC", "b": "DE"})
 
-    def test_coverage_fallback_preserves_identity_and_surviving_negatives(self):
+    def test_coverage_is_required_from_first_search_without_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "train.fa").write_text(">a\nACDE\n>b\nGGGG\n")
@@ -53,9 +85,8 @@ class MMseqsFamiliesTest(unittest.TestCase):
             def run(command, **kwargs):
                 commands.append(command)
                 if command[1] == "easy-search":
-                    # A short local match removes the only negative at c=0,
-                    # but does not meet bidirectional 80% coverage.
-                    Path(command[4]).write_text("a\ttest\t0.5\t1\t0.5\n" if command[command.index("-c") + 1] == "0.0" else "")
+                    self.assertEqual(command[command.index("-c") + 1], "0.8")
+                    Path(command[4]).write_text("")
                 else:
                     Path(command[3] + "_cluster.tsv").write_text("a\ta\nb\tb\n")
             argv = ["--fasta", str(root / "train.fa"), "--benchmark-fasta", str(root / "test.fa"),
@@ -64,27 +95,27 @@ class MMseqsFamiliesTest(unittest.TestCase):
                 "scripts.build_mmseqs_families.subprocess.check_output", return_value="test-version"
             ), patch("scripts.build_mmseqs_families.subprocess.run", side_effect=run), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(main(argv), 0)
-                self.assertEqual([cmd[cmd.index("-c") + 1] for cmd in commands], ["0.0", "0.8", "0.8"])
+                self.assertEqual([cmd[cmd.index("-c") + 1] for cmd in commands], ["0.8", "0.8"])
                 self.assertTrue(all(cmd[cmd.index("--min-seq-id") + 1] == "0.3" for cmd in commands))
                 stats = json.loads((root / "out/filter_stats.json").read_text())
                 self.assertEqual(stats["effective_coverage"], 0.8)
                 self.assertEqual(stats["negative_pair_counts"][str(root / "neg.tsv")]["kept_after_sequence_filter"], 1)
                 self.assertEqual(main(argv), 0)
-                self.assertEqual(len(commands), 3)
+                self.assertEqual(len(commands), 2)
 
     def test_direct_filtering_pipeline_and_cache_invalidation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fasta = root / "train.fasta"
             benchmark = root / "benchmark.fasta"
-            fasta.write_text(">a\nACDE\n>b\nACDF\n>c\nGGGG\n>d\nGGGA\n")
+            fasta.write_text(">a\nACDE\n>alias_a\nACDE\n>b\nACDF\n>c\nGGGG\n>d\nGGGA\n")
             # Same ID, different sequence: benchmark namespace is independent.
             benchmark.write_text(">a\nTTTT\n")
             negatives = root / "negatives.tsv"
             negatives.write_text("chain1\tchain2\na\tc\nb\td\n")
             output = root / "output"
             argv = ["--fasta", str(fasta), "--benchmark-fasta", str(benchmark),
-                    "--negative-pair-table", str(negatives), "--output-dir", str(output)]
+                    "--negative-pair-table", str(negatives), "--output-dir", str(output), "--threads", "23"]
             calls = []
 
             def run(command, **kwargs):
@@ -93,7 +124,7 @@ class MMseqsFamiliesTest(unittest.TestCase):
                     Path(command[4]).write_text("a\ta\t0.3\t0.8\t0.8\n")
                 elif command[1] == "easy-cluster":
                     # b shares a family with the hit, but has NO direct hit.
-                    Path(command[3] + "_cluster.tsv").write_text("a\ta\na\tb\nc\tc\nd\td\n")
+                    Path(command[3] + "_cluster.tsv").write_text("a\ta\na\talias_a\na\tb\nc\tc\nd\td\n")
                 else:
                     raise AssertionError(command)
 
@@ -102,16 +133,25 @@ class MMseqsFamiliesTest(unittest.TestCase):
             ), patch("scripts.build_mmseqs_families.subprocess.run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(argv), 0)
                 for command in calls:
-                    for flag, value in (("--min-seq-id", "0.3"), ("--alignment-mode", "3"), ("--seq-id-mode", "0"), ("-c", "0.0")):
+                    for flag, value in (("--min-seq-id", "0.3"), ("--alignment-mode", "3"), ("--seq-id-mode", "0"), ("-c", "0.8"), ("--threads", "23")):
                         self.assertEqual(command[command.index(flag) + 1], value)
                 self.assertEqual(main(argv), 0)
                 self.assertEqual(len(calls), 2)
                 stats = json.loads((output / "filter_stats.json").read_text())
-                self.assertEqual(stats["effective_coverage"], 0.0)
+                self.assertEqual(stats["effective_coverage"], 0.8)
                 self.assertEqual(stats["negative_pair_counts"][str(negatives)]["kept_after_sequence_filter"], 1)
                 mapping = read_records(output / "family_mapping.tsv")
                 excluded = read_records(output / "benchmark_entities.tsv")
-                self.assertEqual(excluded, [{"entity_id": "a"}])
+                self.assertEqual(excluded, [{"entity_id": "a"}, {"entity_id": "alias_a"}])
+                self.assertEqual(stats["training_entity_count"], 5)
+                self.assertEqual(stats["distinct_search_sequence_count"], 4)
+                self.assertEqual(stats["benchmark_reference_entity_count"], 1)
+                self.assertEqual(stats["benchmark_matching_training_entity_count"], 2)
+                self.assertEqual(stats["saved_hit_audit"]["saved_qualifying_alignment_rows"], 1)
+                self.assertNotIn("alias_a", read_fasta(output / "training_search_sequences.fasta"))
+                self.assertIn("alias_a", read_fasta(output / "training_sequences.fasta"))
+                search_command = next(command for command in calls if command[1] == "easy-search")
+                self.assertEqual(search_command[search_command.index("--max-accept") + 1], "1")
                 manifests = build_dataset_splits(mapping, [[
                     {"chain1": "a", "chain2": "c"},
                     {"chain1": "b", "chain2": "d", "source_is_positive": False, "CLUSTER": "1"},
@@ -119,9 +159,15 @@ class MMseqsFamiliesTest(unittest.TestCase):
                 self.assertEqual(len(manifests["train"]), 1)
                 self.assertFalse(manifests["train"][0]["source_is_positive"])
                 self.assertTrue(manifests["leakage"]["passed"])
+                # Old identity-only outputs must not be silently reused.
+                metadata_path = output / "run_metadata.json"
+                legacy = json.loads(metadata_path.read_text())
+                legacy["effective_coverage"] = 0.0
+                legacy["request"]["coverage"] = 0.0
+                metadata_path.write_text(json.dumps(legacy))
                 with self.assertRaisesRegex(SystemExit, "changed"):
-                    main(argv + ["--coverage", "0.8"])
-                self.assertEqual(main(argv + ["--coverage", "0.8", "--overwrite"]), 0)
+                    main(argv)
+                self.assertEqual(main(argv + ["--overwrite"]), 0)
                 self.assertEqual(len(calls), 4)
                 self.assertEqual(json.loads((output / "run_metadata.json").read_text())["effective_coverage"], 0.8)
                 fasta.write_text(fasta.read_text().replace("GGGA", "GGGT"))

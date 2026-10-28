@@ -1,0 +1,48 @@
+# Legacy ResPair settings retained for old checkpoints; normal inference uses inference.yaml.
+task_prefix: infer
+logging_dir: logs
+seed: 42
+deterministic: false
+ckpt_dir: null
+data:
+  root_dir: /groups/sbinlab/clschf/datasets/PDB_PPI
+  test_set_tsv: ${data.root_dir}/test_set.tsv
+  fasta_path: ${data.root_dir}/test_set.fasta
+  embedding_dir: ${data.root_dir}/test_embeddings
+  batch_size: 1
+  num_workers: 0
+  embedding_cache_mb: 256
+  pin_memory: true
+  maximum_length: 2048
+  distance_bin_start: 2.0
+  distance_bin_end: 22.0
+  distance_bin_count: 20
+  contact_threshold: 8.0
+  ppi_score_threshold: 0.5
+metrics:
+  positive_weight: 0.01
+model:
+  name: ResPair
+  n_layers: 12
+  dim_token: 384
+  dim_pair: 96
+  n_heads: 8
+  dropout: 0.0
+  expansion_factor: 2
+  plm_in_dim: 2560
+  plm_out_dim: 384
+  index_emb_dim: 64
+  contact_prior: 0.0001
+  allow_missing_physics: false
+  triangle_hidden_dim: 64
+  triangle_chunk_size: 64
+  triangle_checkpoint: true
+  recycle_passes: 2
+  pair_update_every: 2
+runtime:
+  precision: bfloat16
+  checkpoint_weights: legacy
+hydra:
+  run:
+    dir: .
+  output_subdir: null

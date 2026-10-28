@@ -7,10 +7,9 @@ from torch.utils.data import Subset
 
 from src.data.balancing import build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
-from src.model.surpass import ResOnly
 from src.model.loss import max_contact_probability, pair_contact_probability
 from src.runtime.checkpoint import load_checkpoint
-from src.runtime.config import build_model_kwargs, cfg_get
+from src.runtime.config import create_model, cfg_get
 from src.runtime.device import autocast_context, resolve_cuda_device, to_device
 from src.utils.ddp_utils import seed_everything
 
@@ -39,6 +38,7 @@ def build_preview_loader(args: DictConfig):
             "distance_bin_end": args.data.distance_bin_end,
             "distance_bin_count": args.data.distance_bin_count,
             "crop_size": args.data.crop_size,
+            "distance_bin_convention": cfg_get(args, "data.distance_bin_convention", "legacy"),
             "contact_threshold": args.data.contact_threshold,
         },
         split_dir=cfg_get(args, "data.split_dir"),
@@ -64,8 +64,9 @@ def build_model(args: DictConfig, device: torch.device) -> torch.nn.Module:
             "ckpt_dir is required. Example: "
             "python -m src.preview ckpt_dir=logs/<run>/checkpoints/epoch_N.pth"
         )
-    model = ResOnly(**build_model_kwargs(args)).to(device)
-    load_checkpoint(args.ckpt_dir, model, map_location=device)
+    model = create_model(args).to(device)
+    load_checkpoint(args.ckpt_dir, model, map_location=device,
+                    weights=str(cfg_get(args, "runtime.checkpoint_weights", "ema")))
     model.eval()
     return model
 

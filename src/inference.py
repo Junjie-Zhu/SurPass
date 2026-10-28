@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +22,11 @@ from tqdm import tqdm
 from src.common.residue_constants import restype_order, unk_restype_index
 from src.data.collate import collate_concatenated_pairs, get_dataloader
 from src.model.loss import pair_contact_probability, max_contact_probability
-from src.model.surpass import ResOnly
 from src.runtime.checkpoint import load_checkpoint
-from src.runtime.config import build_model_kwargs, cfg_get
+from src.runtime.config import create_model, cfg_get
 from src.runtime.device import (
     autocast_context,
+    normalize_precision,
     resolve_cuda_device,
     resolve_dist_backend,
     to_device,
@@ -108,6 +110,10 @@ def load_plm_embedding(path: str | Path) -> torch.Tensor:
     tensor = torch.as_tensor(payload, dtype=torch.float32)
     if tensor.ndim != 2:
         raise ValueError(f"Expected [L,D] embedding in {path}")
+    # torch.save preserves backing storage, including unused rows of a view.
+    # Keep only the embedding's own values alive after loading an older file.
+    if tensor.untyped_storage().nbytes() > tensor.numel() * tensor.element_size():
+        tensor = tensor.clone(memory_format=torch.contiguous_format)
     return tensor
 
 
@@ -141,7 +147,11 @@ class InferencePairDataset(Dataset):
         embedding_dir: str | Path,
         *,
         maximum_length: int = 2048,
+        embedding_cache_mb: float = 256,
     ):
+        cache_mb = float(embedding_cache_mb)
+        if not math.isfinite(cache_mb) or cache_mb < 0:
+            raise ValueError("embedding_cache_mb must be finite and non-negative")
         frame = pd.read_csv(test_set_tsv, sep="\t")
         label_column = resolve_label_column(frame.columns)
         sequences = load_fasta_sequences(fasta_path)
@@ -149,7 +159,12 @@ class InferencePairDataset(Dataset):
         self.maximum_length = int(maximum_length)
         self.items: list[dict[str, Any]] = []
         self.unsupported_rows: list[dict[str, Any]] = []
-        self._feature_cache: dict[str, dict[str, torch.Tensor]] = {}
+        # Each distributed rank / DataLoader worker owns its own cache.
+        self._feature_cache_limit_bytes = int(cache_mb * 1024**2)
+        self._feature_cache_bytes = 0
+        self._feature_cache: OrderedDict[
+            str, tuple[dict[str, torch.Tensor], int]
+        ] = OrderedDict()
 
         for index, row in frame.iterrows():
             pair = str(row["Protein pairs"]).strip()
@@ -188,15 +203,24 @@ class InferencePairDataset(Dataset):
         return len(self.items)
 
     def _features(self, identifier: str, sequence: str):
-        if identifier not in self._feature_cache:
-            path = self.embedding_dir / f"{identifier}.pt"
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing embedding: {path}")
-            self._feature_cache[identifier] = build_residue_features(
-                sequence,
-                load_plm_embedding(path),
-            )
-        return self._feature_cache[identifier]
+        cached = self._feature_cache.get(identifier)
+        if cached is not None:
+            self._feature_cache.move_to_end(identifier)
+            return cached[0]
+
+        path = self.embedding_dir / f"{identifier}.pt"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing embedding: {path}")
+        features = build_residue_features(sequence, load_plm_embedding(path))
+        size = sum(value.numel() * value.element_size() for value in features.values())
+        # Oversized entries and a zero budget bypass the cache entirely.
+        if 0 < size <= self._feature_cache_limit_bytes:
+            while self._feature_cache_bytes + size > self._feature_cache_limit_bytes:
+                _, (_, evicted_bytes) = self._feature_cache.popitem(last=False)
+                self._feature_cache_bytes -= evicted_bytes
+            self._feature_cache[identifier] = (features, size)
+            self._feature_cache_bytes += size
+        return features
 
     def __getitem__(self, index: int):
         item = self.items[index]
@@ -254,7 +278,7 @@ def pair_contact_summary(
 
 
 def evaluate_ppi(
-    model: ResOnly,
+    model: torch.nn.Module,
     loader,
     device: torch.device,
     *,
@@ -360,6 +384,7 @@ def main(args: DictConfig) -> None:
         args.data.fasta_path,
         args.data.embedding_dir,
         maximum_length=int(args.data.maximum_length),
+        embedding_cache_mb=float(cfg_get(args, "data.embedding_cache_mb", 256)),
     )
     indices = list(
         range(DIST_WRAPPER.rank, len(dataset), DIST_WRAPPER.world_size)
@@ -372,8 +397,9 @@ def main(args: DictConfig) -> None:
         num_workers=int(args.data.num_workers),
         pin_memory=bool(args.data.pin_memory),
     )
-    model = ResOnly(**build_model_kwargs(args)).to(device)
-    load_checkpoint(args.ckpt_dir, model, map_location=device)
+    model = create_model(args).to(device)
+    load_checkpoint(args.ckpt_dir, model, map_location=device,
+                    weights=str(cfg_get(args, "runtime.checkpoint_weights", "ema")))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -404,7 +430,7 @@ def main(args: DictConfig) -> None:
 
     if DIST_WRAPPER.rank == 0:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_dir = Path(args.logging_dir) / f"{str(args.task_prefix).upper()}_{timestamp}"
+        output_dir = Path(cfg_get(args, "output_dir", Path(args.logging_dir) / f"{str(args.task_prefix).upper()}_{timestamp}"))
         output_dir.mkdir(parents=True, exist_ok=True)
         OmegaConf.save(args, output_dir / "config.yaml")
         pd.DataFrame(rows, columns=PREDICTION_COLUMNS).to_csv(
@@ -419,6 +445,9 @@ def main(args: DictConfig) -> None:
         )
         supported = sum(row["status"] == "scored" for row in rows)
         runtime = {
+            "device": str(device),
+            "precision": normalize_precision(str(cfg_get(args, "runtime.precision", "bfloat16")), device),
+            "torch": torch.__version__, "cuda": torch.version.cuda,
             "n_total": len(rows),
             "n_scored": supported,
             "coverage": supported / max(1, len(rows)),

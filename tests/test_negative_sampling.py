@@ -104,6 +104,21 @@ class NegativeSamplingTest(unittest.TestCase):
             parallel = generate_hard_negative_candidates(rows, families, workers=2, **kwargs)
         self.assertEqual(serial, parallel)
 
+    def test_unique_family_pair_seeds_match_between_serial_and_workers(self):
+        families = {f"{family}{i}": family for family in "ABCD" for i in range(2)}
+        rows = [{"pair_id": f"{a}{b}{i}", "chain1": f"{a}{i}", "chain2": f"{b}{i}",
+                 "family1": a, "family2": b, "source_is_positive": True,
+                 "source_table": "pdb_ppi", "split": "train"}
+                for a, b in (("A", "B"), ("C", "D")) for i in range(2)]
+        kwargs = dict(count=100, entity_lengths={entity: 100 for entity in families},
+                      unique_family_pairs=True, seed=11)
+        serial = generate_hard_negative_candidates(rows, families, **kwargs)
+        parallel = generate_hard_negative_candidates(rows, families, workers=2, **kwargs)
+        self.assertEqual(serial, parallel)
+        pairs = {tuple(sorted((row["family1"], row["family2"]))) for row in serial}
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(len(serial), 4)
+
     def test_cli_progress_stays_on_stderr_and_can_be_disabled(self):
         mapping, rows = self._fixture()
         with tempfile.TemporaryDirectory() as directory:
@@ -120,8 +135,13 @@ class NegativeSamplingTest(unittest.TestCase):
                 with redirect_stdout(out), redirect_stderr(err):
                     main(args + (["--no-progress"] if quiet else []))
                 self.assertTrue(json.loads(out.getvalue())["leakage"]["passed"])
+                self.assertIn("Final subset sizes", err.getvalue())
+                self.assertIn("Clusters", err.getvalue())
+                self.assertIn("Samples", err.getvalue())
                 if quiet:
-                    self.assertEqual(err.getvalue(), "")
+                    self.assertNotIn("Negatives pdb_neg/train", err.getvalue())
+                    self.assertNotIn("Write train.tsv", err.getvalue())
+                    self.assertNotIn("pairs/s", err.getvalue())
                 else:
                     self.assertIn("Negatives pdb_neg/train", err.getvalue())
                     self.assertIn("Write train.tsv", err.getvalue())

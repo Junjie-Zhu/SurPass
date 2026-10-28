@@ -94,15 +94,19 @@ class CosineAnnealingWithWarmup(LRScheduler):
         min_lr: float,
         last_epoch: int = -1,
     ):
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
+        if min_lr is None or not 0 <= min_lr <= lr:
+            raise ValueError("cosine requires 0 <= min_lr <= lr")
+        if warmup_steps < 0 or decay_steps <= warmup_steps:
+            raise ValueError("cosine horizon must exceed warmup steps")
+        self.warmup_steps = int(warmup_steps)
+        self.decay_steps = int(decay_steps)
         self.lr = lr
         self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
 
     def _get_step_lr(self, step):
-        if step <= self.warmup_steps:
-            return (step + 1) / (self.warmup_steps + 1) * self.lr
+        if self.warmup_steps and step < self.warmup_steps:
+            return (step + 1) / self.warmup_steps * self.lr
         elif step >= self.decay_steps:
             return self.min_lr
         else:
@@ -190,7 +194,7 @@ def get_lr_scheduler(
         lr_scheduler = CosineAnnealingWithWarmup(
             optimizer,
             warmup_steps=warmup_steps,
-            decay_steps=decay_every_n_steps,
+            decay_steps=max_steps,
             lr=lr,
             min_lr=min_lr,
         )

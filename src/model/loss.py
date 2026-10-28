@@ -7,6 +7,7 @@ from typing import Mapping
 import torch
 import torch.nn.functional as F
 from torch import nn
+from src.data.labels import distance_bin_boundaries
 
 
 def distance_bin_centers(
@@ -17,7 +18,7 @@ def distance_bin_centers(
     bin_count = int(bin_count)
     if bin_count < 2:
         raise ValueError("bin_count must be at least 2")
-    limits = torch.linspace(float(bin_start), float(bin_end), bin_count - 1)
+    limits = distance_bin_boundaries(bin_start, bin_end, bin_count)
     centers = torch.empty(bin_count, dtype=torch.float32)
     if bin_count == 2:
         width = float(bin_end) - float(bin_start)
@@ -83,6 +84,17 @@ def noisy_or_contact_logit(
     hazard = hazard.flatten(1).sum(dim=1)
     hazard = hazard.clamp_min(torch.finfo(hazard.dtype).tiny)
     return hazard + torch.log(-torch.expm1(-hazard))
+
+
+def protein_contact_logit(pair_logits, pair_mask, contact_bins, pooling="max"):
+    if pooling == "noisy_or":
+        return noisy_or_contact_logit(pair_logits, pair_mask, contact_bins)
+    if pooling != "max":
+        raise ValueError("protein_pooling must be max or noisy_or")
+    logits = pair_contact_logit(pair_logits, contact_bins)
+    valid = pair_mask.bool().flatten(1)
+    maximum = logits.masked_fill(~pair_mask.bool(), -torch.inf).flatten(1).amax(1)
+    return torch.where(valid.any(1), maximum, torch.full_like(maximum, -80.0))
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -185,7 +197,7 @@ class InterDistanceLoss(nn.Module):
 
 
 class SurpassLoss(nn.Module):
-    """Noisy-OR protein supervision plus direct contact/distance supervision."""
+    """Configured protein supervision plus direct contact/distance supervision."""
 
     def __init__(
         self,

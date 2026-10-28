@@ -23,6 +23,7 @@ class NegativeQuery:
     pair_id: str | None
     reverse: bool
     blocked: frozenset[str]
+    blocked_families: frozenset[str] = frozenset()
 
 
 # Each degree has sorted length buckets. Candidates in a bucket share exactly
@@ -77,7 +78,7 @@ class CandidateIndex:
                 family = self.families[candidate]
                 if candidate == query.anchor or family == anchor_family:
                     continue
-                if family in positive_neighbors:
+                if family in positive_neighbors or family in query.blocked_families:
                     continue
                 if candidate in original_neighbors or candidate in query.blocked:
                     continue

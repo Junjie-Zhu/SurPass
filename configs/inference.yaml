@@ -1,9 +1,9 @@
+# Current inference defaults, matching the current training model and EMA checkpoints.
 task_prefix: infer
 logging_dir: logs
 seed: 42
 deterministic: false
 ckpt_dir: null
-
 data:
   root_dir: /groups/sbinlab/clschf/datasets/PDB_PPI
   test_set_tsv: ${data.root_dir}/test_set.tsv
@@ -11,19 +11,20 @@ data:
   embedding_dir: ${data.root_dir}/test_embeddings
   batch_size: 1
   num_workers: 0
-  pin_memory: true
+  embedding_cache_mb: 256
+  pin_memory: false
   maximum_length: 2048
   distance_bin_start: 2.0
   distance_bin_end: 22.0
-  distance_bin_count: 16
+  distance_bin_count: 22
   contact_threshold: 8.0
   ppi_score_threshold: 0.5
-
+  distance_bin_convention: left_closed
 metrics:
   positive_weight: 0.01
-
 model:
-  n_layers: 2
+  name: ResPair
+  n_layers: 12
   dim_token: 384
   dim_pair: 96
   n_heads: 8
@@ -34,10 +35,15 @@ model:
   index_emb_dim: 64
   contact_prior: 0.0001
   allow_missing_physics: false
-
+  triangle_hidden_dim: 64
+  triangle_chunk_size: 64
+  triangle_checkpoint: true
+  recycle_passes: 1
+  pair_update_every: 2
+  protein_pooling: max
 runtime:
   precision: bfloat16
-
+  checkpoint_weights: ema
 hydra:
   run:
     dir: .

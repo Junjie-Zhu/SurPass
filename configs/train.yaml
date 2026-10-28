@@ -1,50 +1,54 @@
-task_prefix: surpass
+# Current training defaults. Edit this file or use command-line overrides for experiments.
+task_prefix: surpass_revision
 logging_dir: logs
 seed: 42
 deterministic: false
-epochs: 200
+epochs: 30
 checkpoint_interval: 10
 ckpt_dir: null
 ema_dir: null
 load_model_only: false
-
 ema:
   decay: 0.999
-  mutable_param_keywords: [""]
-
+  mutable_param_keywords:
+  - ''
 data:
   root_dir: /groups/sbinlab/clschf/datasets
   split_dir: ${data.root_dir}/splits
   epoch_size: 30000
+  validation_samples: 3000
+  validation_negative_ratio: 10.0
   datasets:
-    - name: pdb_ppi
-      subdir: PDB_PPI
-      require_labels: true
-      weight: 25
-    - name: pdb_neg
-      subdir: PDB_PPI
-      require_labels: false
-      weight: 25
-    - name: afdb_pos
-      subdir: AFDB_DDI
-      require_labels: true
-      weight: 25
-    - name: afdb_neg
-      subdir: AFDB_DDI
-      require_labels: false
-      weight: 25
-  batch_size: 2
-  num_workers: 16
+  - name: pdb_ppi
+    subdir: PDB_PPI
+    require_labels: true
+    weight: 25
+  - name: pdb_neg
+    subdir: PDB_PPI
+    require_labels: false
+    weight: 25
+  - name: afdb_pos
+    subdir: AFDB_DDI
+    require_labels: true
+    weight: 25
+  - name: afdb_neg
+    subdir: AFDB_DDI
+    require_labels: false
+    weight: 25
+  batch_size: 8
+  num_workers: 8
   pin_memory: true
   distance_bin_start: 2.0
   distance_bin_end: 22.0
-  distance_bin_count: 16
+  distance_bin_count: 22
   contact_threshold: 8.0
-  # One total budget shared by both proteins.
   crop_size: 256
-
+  distance_bin_convention: left_closed
+  fixed_validation: true
+  validation_manifest: null
 model:
-  n_layers: 2
+  name: ResPair
+  n_layers: 12
   dim_token: 384
   dim_pair: 96
   n_heads: 8
@@ -55,39 +59,42 @@ model:
   index_emb_dim: 64
   contact_prior: 0.0001
   allow_missing_physics: false
-
+  triangle_hidden_dim: 64
+  triangle_chunk_size: 64
+  triangle_checkpoint: true
+  recycle_passes: 1
+  pair_update_every: 2
+  protein_pooling: max
 loss:
   protein:
-    weight: 1.0
+    weight: 0.0
   contact:
     weight: 1.0
     gamma: 1.5
     positive_weight: 4.0
     negatives_per_positive: 8.0
   distance:
-    weight: 0.1
+    weight: 1.0
   aux_protein:
     weight: 0.1
-
 runtime:
   precision: bfloat16
-
+  checkpoint_weights: ema
 optimizer:
-  lr: 0.0005
-  weight_decay: 1e-6
+  lr: 0.0001
+  weight_decay: 1.0e-06
   beta1: 0.9
   beta2: 0.999
   use_adamw: true
-  lr_scheduler: af3
-  warmup_steps: 500
+  lr_scheduler: cosine_annealing
+  warmup_steps: 1000
   decay_every_n_steps: 15000
   decay_factor: 0.95
   grad_accum_steps: 1
-  max_grad_norm: 1.0
-
+  max_grad_norm: 0.0
+  min_lr: 1.0e-05
 metrics:
-  positive_weight: 1.0
-
+  positive_weight: 0.01
 wandb:
   enabled: true
   project: surpass
@@ -98,9 +105,40 @@ wandb:
   id: null
   resume: allow
   tags: []
-
+epoch_inference:
+  enabled: true
+  every_n_epochs: ${checkpoint_interval}
+  run_on_final: true
+  weights: ema
+  config:
+    model: ${model}
+    data:
+      root_dir: /groups/sbinlab/clschf/datasets/PDB_PPI
+      test_set_tsv: ${epoch_inference.config.data.root_dir}/test_set.tsv
+      fasta_path: ${epoch_inference.config.data.root_dir}/test_set.fasta
+      embedding_dir: ${epoch_inference.config.data.root_dir}/test_embeddings
+      batch_size: 1
+      num_workers: 0
+      embedding_cache_mb: 256
+      pin_memory: false
+      maximum_length: 2048
+      distance_bin_start: ${data.distance_bin_start}
+      distance_bin_end: ${data.distance_bin_end}
+      distance_bin_count: ${data.distance_bin_count}
+      distance_bin_convention: ${data.distance_bin_convention}
+      contact_threshold: ${data.contact_threshold}
+      ppi_score_threshold: 0.5
+    runtime:
+      precision: ${runtime.precision}
+      checkpoint_weights: ema
+    metrics:
+      positive_weight: 0.01
+precision_check:
+  output_dir: precision_check
+  samples: 128
+  training_updates: 100
+  train_batches: 4
 hydra:
   run:
     dir: .
   output_subdir: null
-

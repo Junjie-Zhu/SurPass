@@ -1,0 +1,4 @@
+# Compatibility alias. Keep all current settings in train.yaml.
+defaults:
+  - train
+  - _self_

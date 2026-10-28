@@ -180,6 +180,50 @@ class SplitManifestTest(unittest.TestCase):
         self.assertEqual(manifests["stats"]["source_cluster_counts"]["train"]["afdb_neg"], 2)
         self.assertEqual(manifests["stats"]["source_counts"]["train"]["afdb_neg"], 3)
 
+    def test_benchmark_report_separates_references_unused_ids_and_partial_clusters(self):
+        manifests = build_dataset_splits(self.mapping, [[
+            {"chain1": "a", "chain2": "b", "ppi_cluster_id": "partial"},
+            {"chain1": "c", "chain2": "d", "ppi_cluster_id": "partial"},
+            {"chain1": "e", "chain2": "e", "ppi_cluster_id": "fully-excluded"},
+        ]], source_names=["afdb_pos"], benchmark_entities={"a", "e", "f"},
+            benchmark_filter_stats={"benchmark_reference_entity_count": 2, "identity_threshold": 0.3, "effective_coverage": 0.8},
+            validation_fraction=0)
+        stats = manifests["stats"]
+        self.assertEqual(stats["benchmark_reference_entity_count"], 2)
+        self.assertEqual(stats["benchmark_matching_training_entity_count"], 3)
+        self.assertEqual(stats["benchmark_matching_pair_referenced_entity_count"], 2)
+        self.assertEqual(stats["benchmark_matching_unreferenced_entity_count"], 1)
+        self.assertEqual(stats["benchmark_matching_training_family_count"], 3)
+        self.assertEqual(stats["benchmark_family_count"], 0)
+        self.assertEqual(stats["source_benchmark_filter_counts"]["afdb_pos"]["pairs_after_benchmark_filter"], 1)
+        self.assertEqual(stats["source_cluster_retention_counts"]["afdb_pos"], {
+            "input_clusters": 2, "retained_clusters": 1,
+            "fully_excluded_clusters": 1, "partially_excluded_clusters": 1,
+        })
+        self.assertEqual(stats["source_validation_fractions"]["afdb_pos"], {"sample_fraction": 0, "cluster_fraction": 0})
+
+    def test_benchmark_filter_sidecar_checks_count_and_file_checksum(self):
+        import hashlib
+        from scripts.build_dataset_splits import _read_filter_stats
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entities = root / "benchmark_entities.tsv"
+            entities.write_text("entity_id\na\n")
+            metadata = {"benchmark_reference_entity_count": 17, "benchmark_matching_training_entity_count": 1,
+                        "benchmark_entities_sha256": hashlib.sha256(entities.read_bytes()).hexdigest()}
+            sidecar = root / "filter_stats.json"
+            sidecar.write_text(json.dumps(metadata))
+            self.assertEqual(_read_filter_stats(None, entities, {"a"}), metadata)
+            with self.assertRaisesRegex(ValueError, "count"):
+                _read_filter_stats(None, entities, {"a", "b"})
+            entities.write_text("entity_id\nb\n")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                _read_filter_stats(None, entities, {"b"})
+            metadata["effective_coverage"] = 0.0
+            sidecar.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError, "required coverage 0.8"):
+                _read_filter_stats(None, entities, {"b"})
+
     def test_raw_pdb_pairs_group_by_unordered_30_percent_families(self):
         mapping = self.mapping + [{"entity_id": "a2", "family_id": "A", "length": 100}]
         manifests = build_dataset_splits(mapping, [[
@@ -337,14 +381,113 @@ class SplitManifestTest(unittest.TestCase):
             self.assertTrue(all(row["source_is_positive"] == "false" for row in rows))
             self.assertTrue((root / "sources/table_0.synthetic.validation.tsv").is_file())
 
+    def test_cli_size_report_matches_final_source_manifests(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from src.data.splits import write_tsv
+        import io
+
+        mapping, pdb_pairs = self._pdb_fixture()
+        mapping.extend(
+            {"entity_id": f"p{i}", "family_id": f"F{i}", "length": 4}
+            for i in range(18, 22)
+        )
+        # Two pair rows from the same PDB cluster must count as two samples.
+        pdb_pairs.append({**pdb_pairs[0], "pair_id": "duplicate-cluster-member"})
+        afdb_pos = [{"chain1": "p18", "chain2": "p19", "CLUSTER": "shared"}]
+        afdb_neg = [
+            {"chain1": "p20", "chain2": "p21", "CLUSTER": "shared"},
+            {"chain1": "p16", "chain2": "p18", "CLUSTER": "excluded"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_tsv(root / "mapping.tsv", mapping)
+            write_tsv(root / "benchmark.tsv", [{"entity_id": "p16"}])
+            tables = (
+                ("verified_pdb_pairs.tsv", pdb_pairs),
+                ("verified_positive_pairs.dissimilar.tsv", afdb_pos),
+                ("verified_negative_pairs.dissimilar.tsv", afdb_neg),
+            )
+            args = [
+                "--family-mapping", str(root / "mapping.tsv"),
+                "--benchmark-entities", str(root / "benchmark.tsv"),
+                "--validation-fraction", "0.4", "--hard-negative-count", "1",
+                "--output-dir", str(root / "splits"), "--no-progress",
+            ]
+            for filename, rows in tables:
+                write_tsv(root / filename, rows)
+                args.extend(("--pair-table", str(root / filename)))
+            output, report = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(report):
+                self.assertEqual(build_splits_cli(args), 0)
+            payload = json.loads(output.getvalue())
+            sizes = read_records(payload["manifests"]["subset_sizes"])
+            self.assertIn("Final subset sizes", report.getvalue())
+            self.assertIn("clusters = PPI clusters; samples = pair rows", report.getvalue())
+            self.assertTrue(any(row["source"].endswith(".synthetic") for row in sizes))
+            for split in ("train", "validation", "excluded"):
+                source_sizes = [row for row in sizes if row["split"] == split and row["source"] != "TOTAL"]
+                for size in source_sizes:
+                    rows = read_records(root / "splits/sources" / f"{size['source']}.{split}.tsv")
+                    self.assertEqual(int(size["sample_count"]), len(rows))
+                    self.assertEqual(int(size["cluster_count"]), len({row["ppi_cluster_id"] for row in rows}))
+                total = next(row for row in sizes if row["split"] == split and row["source"] == "TOTAL")
+                self.assertEqual(int(total["sample_count"]), sum(int(row["sample_count"]) for row in source_sizes))
+                self.assertEqual(int(total["cluster_count"]), sum(int(row["cluster_count"]) for row in source_sizes))
+            self.assertTrue(any(int(row["sample_count"]) > int(row["cluster_count"]) for row in sizes))
+            self.assertTrue(any(int(row["sample_count"]) == 0 for row in sizes))
+
     def test_pdb_negative_shortage_is_reported_without_crossing_splits(self):
         mapping, pairs = self._pdb_fixture()
         with self.assertWarnsRegex(RuntimeWarning, "generated 0/1"):
             manifests = build_dataset_splits(
                 mapping[:2], [pairs[:1]], source_names=["pdb_ppi"], validation_fraction=0,
             )
-        self.assertEqual(manifests["stats"]["pdb_negative_counts"]["train"], {"positive_pairs": 1, "positive_clusters": 1, "requested": 1, "generated": 0, "negative_clusters": 0})
+        self.assertEqual(manifests["stats"]["pdb_negative_counts"]["train"], {"positive_pairs": 1, "positive_clusters": 1, "requested": 1, "generated": 0, "negative_clusters": 0,
+                         "negative_pairs": 0, "target_pairs_per_cluster": 1, "requested_pairs": 1})
         self.assertEqual(manifests["stats"]["generated_pdb_negatives"], 0)
+
+    def test_pdb_negative_family_clusters_are_enriched_to_positive_density(self):
+        mapping = [{"entity_id": f"{family}{i}", "family_id": family, "length": 4}
+                   for family in "ABCD" for i in range(2)]
+        mapping.append({"entity_id": "blocked", "family_id": "A", "length": 4})
+        positives = [{"chain1": f"{a}{i}", "chain2": f"{b}{j}"}
+                     for a, b in (("A", "B"), ("C", "D")) for i in range(2) for j in range(2)]
+        positives.append({"chain1": "blocked", "chain2": "B0"})
+        result = build_dataset_splits(mapping, [positives], source_names=["pdb_ppi"],
+                                      benchmark_entities={"blocked"}, validation_fraction=0)
+        negatives = [row for row in result["train"] if row["source_table"] == "pdb_neg"]
+        groups = {}
+        for row in negatives:
+            groups.setdefault(row["ppi_cluster_id"], []).append(row)
+            self.assertNotIn("blocked", (row["chain1"], row["chain2"]))
+            self.assertNotIn(canonical_family_pair(row["family1"], row["family2"]), {("A", "B"), ("C", "D")})
+        self.assertEqual(len(groups), 2)
+        self.assertEqual([len(rows) for rows in groups.values()], [4, 4])
+        self.assertEqual(len({tuple(sorted((row["chain1"], row["chain2"]))) for row in negatives}), 8)
+        self.assertTrue(all(len({canonical_family_pair(row["family1"], row["family2"]) for row in rows}) == 1 for rows in groups.values()))
+        self.assertEqual(result["stats"]["pdb_negative_counts"]["train"]["target_pairs_per_cluster"], 4)
+        self.assertEqual(result["stats"]["generated_pdb_negative_clusters"], 2)
+        self.assertEqual(result["stats"]["generated_pdb_negatives"], 8)
+        with tempfile.TemporaryDirectory() as directory:
+            write_split_manifests(directory, result)
+            source_path = Path(directory) / "sources/pdb_neg.train.tsv"
+            from src.data.dataset import PepoTrainDataset
+            dataset = PepoTrainDataset(directory, source_path, require_labels=False)
+            self.assertEqual(len(dataset), 2)
+            self.assertEqual([len(rows) for rows in dataset.cluster_to_rows.values()], [4, 4])
+
+    def test_negative_cluster_enrichment_excludes_existing_pairs_and_caps_capacity(self):
+        from src.data.splits import enrich_pdb_negative_clusters
+        families = {f"{family}{i}": family for family in "ABCD" for i in range(2)}
+        positives = [{"chain1": f"{a}{i}", "chain2": f"{b}{i}"}
+                     for a, b in (("A", "C"), ("B", "D")) for i in range(2)]
+        seeds = [{"pair_id": "seed", "chain1": "A0", "chain2": "B0",
+                  "family1": "A", "family2": "B", "source_table": "pdb_neg", "split": "train"}]
+        existing = [{"chain1": "B1", "chain2": "A1"}]
+        rows = enrich_pdb_negative_clusters(seeds, positives, existing, families,
+                                           {entity: 100 for entity in families}, pairs_per_cluster=10, seed=3)
+        pairs = {tuple(sorted((row["chain1"], row["chain2"]))) for row in rows}
+        self.assertEqual(pairs, {("A0", "B0"), ("A0", "B1"), ("A1", "B0")})
 
     def test_empty_validation_source_has_loadable_headers(self):
         from src.data.dataset import PepoTrainDataset

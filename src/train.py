@@ -1,14 +1,17 @@
 """SurPass training entrypoint.
 
 The primary complex score is derived from the rectangular inter-chain contact
-map. The protein loss uses noisy-OR; validation ranking and checkpoint
+map. The protein loss uses configured pooling; validation ranking and checkpoint
 selection use the same maximum-contact score as inference.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
+import math
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +20,6 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -28,12 +30,15 @@ except Exception:
 
 from src.data.balancing import DistributedWeightedSampler, build_multi_source_split
 from src.data.collate import collate_fn, get_dataloader
+from src.data.validation_sampling import DistributedValidationSampler, validation_pools
+from src.data.fixed_validation import FrozenValidationDataset, UnpaddedShardSampler
+from src.runtime.state import capture_rng, restore_rng, preserve_rng
+from src.runtime.epoch_inference import inference_due, run_epoch_inference
 from src.model.ema import EMAWrapper
 from src.model.loss import SurpassLoss, max_contact_probability, pair_contact_probability
 from src.model.optimizer import get_lr_scheduler, get_optimizer
-from src.model.surpass import ResOnly
 from src.runtime.checkpoint import load_checkpoint, save_checkpoint
-from src.runtime.config import build_model_kwargs, cfg_get
+from src.runtime.config import create_model, cfg_get
 from src.runtime.device import (
     autocast_context,
     resolve_cuda_device,
@@ -45,7 +50,7 @@ from src.utils.ddp_utils import DIST_WRAPPER, seed_everything
 
 
 TRAIN_KEYS = ("total", "protein", "contact", "distance", "aux_protein")
-VALID_KEYS = ("total", "pair_auroc", "pair_auprc")
+VALID_KEYS = ("total", "protein", "contact", "distance", "aux_protein", "pair_auroc", "pair_auprc", "pair_auprc_unweighted", "samples", "positive_samples", "negative_samples")
 
 
 def log_info(message: str) -> None:
@@ -118,7 +123,10 @@ def train_epoch(
         with autocast_context(device, precision):
             output = model(residue_batch)
             raw_loss, terms = loss_module(output, labels)
-            loss = raw_loss / accumulation
+            group_size = min(accumulation, len(loader) - (step // accumulation) * accumulation)
+            loss = raw_loss / group_size
+        if not bool(torch.isfinite(raw_loss)):
+            raise FloatingPointError("Nonfinite training loss")
         loss.backward()
 
         should_step = (step + 1) % accumulation == 0 or step + 1 == len(loader)
@@ -140,6 +148,8 @@ def train_epoch(
                 contact=f"{floats['contact']:.3f}",
             )
         if step_logger is not None:
+            floats["lr"] = float(optimizer.param_groups[0]["lr"])
+            floats["optimizer_updates"] = int(scheduler.last_epoch)
             step_logger(floats)
     return _mean_terms(totals, steps)
 
@@ -165,8 +175,10 @@ def evaluate_epoch(
             with autocast_context(device, precision):
                 output = model(residue_batch)
                 _, terms = loss_module(output, labels)
-            _add_terms(totals, terms)
-            steps += 1
+            batch_samples = int(labels["crop_is_positive"].numel())
+            for name, value in terms.items():
+                totals[name] = totals.get(name, 0.0) + float(value.detach().item()) * batch_samples
+            steps += batch_samples
             scores.extend(
                 max_contact_probability(
                     pair_contact_probability(output.pair_logits, loss_module.contact.contact_bins),
@@ -182,9 +194,13 @@ def evaluate_epoch(
         positive_weight=float(positive_weight),
     )
     return {
-        "total": means.get("total", float("nan")),
+        **{key: means.get(key, float("nan")) for key in TRAIN_KEYS},
+        "pair_auprc_unweighted": binary_classification_metrics(scores, targets, positive_weight=1.0)["auprc"],
         "pair_auroc": metrics["auroc"],
         "pair_auprc": metrics["auprc"],
+        "samples": len(targets),
+        "positive_samples": sum(targets),
+        "negative_samples": len(targets) - sum(targets),
     }
 
 
@@ -215,6 +231,7 @@ def _build_datasets(args: DictConfig):
                 "distance_bin_end": float(args.data.distance_bin_end),
                 "distance_bin_count": int(args.data.distance_bin_count),
                 "crop_size": int(args.data.crop_size),
+                "distance_bin_convention": str(cfg_get(args, "data.distance_bin_convention", "legacy")),
                 "contact_threshold": float(args.data.contact_threshold),
             },
             split_dir=cfg_get(args, "data.split_dir"),
@@ -259,9 +276,17 @@ def main(args: DictConfig) -> None:
     _init_distributed(use_cuda)
     seed_everything(int(args.seed), bool(args.deterministic))
     precision = str(cfg_get(args, "runtime.precision", "bfloat16"))
+    if int(args.checkpoint_interval) < 1:
+        raise ValueError("checkpoint_interval must be positive")
+    if bool(cfg_get(args, "epoch_inference.enabled", False)) and float(cfg_get(args, "ema.decay", 0)) <= 0:
+        raise ValueError("Periodic EMA inference requires EMA to be enabled")
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = Path(args.logging_dir) / f"{str(args.task_prefix).upper()}_{timestamp}"
+    if dist.is_initialized():
+        shared = [str(output_dir) if DIST_WRAPPER.rank == 0 else None]
+        dist.broadcast_object_list(shared, src=0)
+        output_dir = Path(shared[0])
     if DIST_WRAPPER.rank == 0:
         (output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         OmegaConf.save(args, output_dir / "config.yaml")
@@ -290,12 +315,6 @@ def main(args: DictConfig) -> None:
             seed=int(args.seed),
         )
 
-    validation_indices = range(
-        DIST_WRAPPER.rank,
-        len(validation_dataset),
-        DIST_WRAPPER.world_size,
-    )
-    validation_shard = Subset(validation_dataset, list(validation_indices))
     train_loader = get_dataloader(
         train_dataset,
         collate_fn=collate_fn,
@@ -305,21 +324,13 @@ def main(args: DictConfig) -> None:
         sampler=train_sampler,
         pin_memory=bool(args.data.pin_memory),
     )
-    validation_loader = get_dataloader(
-        validation_shard,
-        collate_fn=collate_fn,
-        batch_size=int(args.data.batch_size),
-        shuffle=False,
-        num_workers=int(args.data.num_workers),
-        pin_memory=bool(args.data.pin_memory),
-    )
     for info in source_info:
         log_info(
             f"source={info['name']} train={info['train_length']} "
             f"validation={info['validation_length']}"
         )
 
-    model = ResOnly(**build_model_kwargs(args)).to(device)
+    model = create_model(args).to(device)
     if DIST_WRAPPER.world_size > 1:
         model = DDP(
             model,
@@ -363,7 +374,8 @@ def main(args: DictConfig) -> None:
         optimizer,
         lr_scheduler=str(args.optimizer.lr_scheduler),
         lr=float(args.optimizer.lr),
-        max_steps=int(args.epochs) * len(train_loader) + 100,
+        max_steps=int(args.epochs) * math.ceil(len(train_loader) / max(1, int(args.optimizer.grad_accum_steps))),
+        min_lr=cfg_get(args, "optimizer.min_lr"),
         warmup_steps=int(args.optimizer.warmup_steps),
         decay_every_n_steps=int(args.optimizer.decay_every_n_steps),
         decay_factor=float(args.optimizer.decay_factor),
@@ -371,24 +383,63 @@ def main(args: DictConfig) -> None:
     ema = None
     ema_decay = float(cfg_get(args, "ema.decay", 0.0))
     if ema_decay > 0:
-        ema = EMAWrapper(model, ema_decay, _ema_keywords(args))
-        ema.register()
-
+        ema = EMAWrapper(live_model, ema_decay, _ema_keywords(args))
     start_epoch = 1
+    resume_state = {}
+    if args.ema_dir:
+        raise ValueError("ema_dir is superseded by complete EMA checkpoints; use ckpt_dir")
     if args.ckpt_dir:
-        payload = load_checkpoint(
-            args.ckpt_dir,
-            live_model,
-            map_location=device,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            load_training_state=not bool(args.load_model_only),
-        )
+        payload = load_checkpoint(args.ckpt_dir, live_model, map_location="cpu",
+                                  optimizer=optimizer, scheduler=scheduler, ema=ema,
+                                  load_training_state=not bool(args.load_model_only))
         if not bool(args.load_model_only):
             start_epoch = int(payload["epoch"]) + 1
-    if args.ema_dir and ema is not None:
-        load_checkpoint(args.ema_dir, live_model, map_location=device)
+            resume_state = payload.get("training_state", {})
+            if not resume_state:
+                raise ValueError("Complete resume requires checkpoint training_state")
+            if int(resume_state.get("world_size", DIST_WRAPPER.world_size)) != DIST_WRAPPER.world_size:
+                raise ValueError("Training resume requires the saved world size")
+        del payload
+    if ema is not None and not ema.shadow:
         ema.register()
+
+    fixed = bool(cfg_get(args, "data.fixed_validation", False))
+    if fixed:
+        panel = resume_state.get("validation_panel")
+        panel_path = cfg_get(args, "data.validation_manifest")
+        if panel is None and panel_path:
+            panel = json.loads(Path(panel_path).read_text())
+        if panel is None and DIST_WRAPPER.rank == 0:
+            with preserve_rng():
+                panel = FrozenValidationDataset.build(
+                    validation_dataset, sources,
+                    OmegaConf.select(args, "data.validation_samples", default=3000),
+                    float(cfg_get(args, "data.validation_negative_ratio", 10.0)),
+                    int(args.seed) + 100000).manifest
+        if dist.is_initialized():
+            objects = [panel]
+            dist.broadcast_object_list(objects, src=0)
+            panel = objects[0]
+        validation_dataset = FrozenValidationDataset(validation_dataset, panel)
+        validation_info = validation_dataset
+        validation_sampler = UnpaddedShardSampler(validation_dataset, DIST_WRAPPER.rank, DIST_WRAPPER.world_size)
+        if DIST_WRAPPER.rank == 0:
+            (output_dir / "validation_manifest.json").write_text(json.dumps(panel, indent=2))
+    else:
+        validation_sampler = DistributedValidationSampler(
+            validation_pools(validation_dataset, sources),
+            num_samples=OmegaConf.select(args, "data.validation_samples", default=3000),
+            negative_ratio=float(cfg_get(args, "data.validation_negative_ratio", 1.0)),
+            num_replicas=DIST_WRAPPER.world_size, rank=DIST_WRAPPER.rank, seed=int(args.seed)+100000)
+        validation_info = validation_sampler
+    validation_loader = get_dataloader(validation_dataset, collate_fn=collate_fn,
+        batch_size=int(args.data.batch_size), shuffle=False, sampler=validation_sampler,
+        num_workers=int(args.data.num_workers), pin_memory=bool(args.data.pin_memory))
+    if resume_state.get("rng_states"):
+        restore_rng(resume_state["rng_states"][DIST_WRAPPER.rank])
+    log_info(f"optimizer updates={scheduler.last_epoch} horizon="
+             f"{int(args.epochs) * math.ceil(len(train_loader) / max(1, int(args.optimizer.grad_accum_steps)))} "
+             f"warmup={args.optimizer.warmup_steps} lr={optimizer.param_groups[0]['lr']}")
 
     csv_path = output_dir / "metrics.csv"
     if DIST_WRAPPER.rank == 0:
@@ -402,8 +453,16 @@ def main(args: DictConfig) -> None:
             encoding="utf-8",
         )
 
-    best_auprc = float("-inf")
-    global_step = 0
+    # A job may stop after saving an epoch but before its full inference ends.
+    # Replay that event against the original output directory; completed events
+    # are skipped by checkpoint/config identity before any model evaluation.
+    if resume_state and inference_due(args, start_epoch - 1):
+        source_checkpoint = Path(args.ckpt_dir).resolve()
+        source_run = source_checkpoint.parent.parent if source_checkpoint.parent.name == "checkpoints" else output_dir
+        run_epoch_inference(args, start_epoch - 1, source_checkpoint, source_run, live_model, ema, device)
+
+    best_auprc = float(resume_state.get("best_auprc", float("-inf")))
+    global_step = int(resume_state.get("global_step", 0))
     for epoch in range(start_epoch, int(args.epochs) + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -435,18 +494,37 @@ def main(args: DictConfig) -> None:
             ema=ema,
             step_logger=log_step,
         )
-        if ema is not None:
-            ema.apply_shadow()
-        validation_metrics = evaluate_epoch(
-            model,
-            validation_loader,
-            loss_module,
-            device,
-            precision=precision,
-            positive_weight=float(cfg_get(args, "metrics.positive_weight", 1.0)),
-        )
-        if ema is not None:
-            ema.restore()
+        if not fixed:
+            validation_sampler.set_epoch(epoch)
+        log_info(f"validation epoch={epoch} samples={validation_info.total_size} "
+                 f"positive={validation_info.positive_samples} negative={validation_info.negative_samples}")
+        with preserve_rng(), (ema.average_parameters() if ema is not None else nullcontext()):
+            validation_metrics = evaluate_epoch(live_model, validation_loader, loss_module, device,
+                precision=precision, positive_weight=float(cfg_get(args, "metrics.positive_weight", 1.0)))
+        improved = validation_metrics["pair_auprc"] > best_auprc
+        if improved:
+            best_auprc = validation_metrics["pair_auprc"]
+        should_save = epoch % int(args.checkpoint_interval) == 0 or epoch == int(args.epochs)
+        checkpoint_path = output_dir / "checkpoints" / f"epoch_{epoch}.pth"
+        if should_save or improved:
+            rng_states = DIST_WRAPPER.all_gather_object(capture_rng())
+            training_state = {"best_auprc": best_auprc, "global_step": global_step,
+                "optimizer_updates": int(scheduler.last_epoch), "world_size": DIST_WRAPPER.world_size,
+                "rng_states": rng_states,
+                "validation_panel": validation_dataset.manifest if fixed else None}
+            if DIST_WRAPPER.rank == 0:
+                options = dict(epoch=epoch, optimizer=optimizer, scheduler=scheduler, ema=ema,
+                               training_state=training_state, config=OmegaConf.to_container(args, resolve=True))
+                if should_save:
+                    save_checkpoint(checkpoint_path, live_model, **options)
+                if improved:
+                    save_checkpoint(output_dir / "checkpoints" / "best_pair_auprc.pth", live_model, **options)
+        if dist.is_initialized():
+            dist.barrier()
+        if inference_due(args, epoch):
+            inference_metrics = run_epoch_inference(args, epoch, checkpoint_path, output_dir, live_model, ema, device)
+            if wandb_run is not None:
+                wandb.log({f"inference/{key}": value for key, value in inference_metrics.items()}, step=max(global_step, 1))
 
         if DIST_WRAPPER.rank == 0:
             row = [str(epoch)]
@@ -467,28 +545,6 @@ def main(args: DictConfig) -> None:
                     step=max(global_step, 1),
                 )
 
-            should_save = epoch % int(args.checkpoint_interval) == 0 or epoch == int(
-                args.epochs
-            )
-            if should_save:
-                save_checkpoint(
-                    output_dir / "checkpoints" / f"epoch_{epoch}.pth",
-                    live_model,
-                    epoch=epoch,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                )
-            if validation_metrics["pair_auprc"] > best_auprc:
-                best_auprc = validation_metrics["pair_auprc"]
-                if ema is not None:
-                    ema.apply_shadow()
-                save_checkpoint(
-                    output_dir / "checkpoints" / "best_pair_auprc.pth",
-                    live_model,
-                    epoch=epoch,
-                )
-                if ema is not None:
-                    ema.restore()
 
     if wandb_run is not None:
         wandb.finish()

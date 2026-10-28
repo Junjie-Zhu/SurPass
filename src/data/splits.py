@@ -13,6 +13,7 @@ import multiprocessing
 import random
 import sys
 import warnings
+from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
@@ -426,6 +427,7 @@ def generate_hard_negative_candidates(
     template_source: str | None = None,
     template_split: str | None = None,
     output_source: str | None = None,
+    unique_family_pairs: bool = False,
     workers: int = 1,
     progress: bool = False,
 ) -> list[Record]:
@@ -528,6 +530,7 @@ def generate_hard_negative_candidates(
 
     generated: list[Record] = []
     added_neighbors: dict[str, set[str]] = defaultdict(set)
+    added_family_neighbors: dict[str, set[str]] = defaultdict(set)
     exhausted_templates: set[tuple[str, bool]] = set()
 
     def make_query(template, reverse):
@@ -542,11 +545,12 @@ def generate_hard_negative_candidates(
         return NegativeQuery(
             anchor, target, str(template.get("source_table", "unknown")), split,
             template.get("pair_id"), reverse, frozenset(added_neighbors.get(anchor, ())),
+            frozenset(added_family_neighbors.get(str(entity_to_family[anchor]), ())) if unique_family_pairs else frozenset(),
         )
 
     with ExitStack() as stack:
         bar = stack.enter_context(_progress(
-            progress=True, total=count, desc=description, unit="pairs",
+            progress=True, total=count, desc=description, unit="clusters" if unique_family_pairs else "pairs",
         )) if progress else None
         pool = stack.enter_context(multiprocessing.Pool(
             processes=int(workers), initializer=init_candidate_worker, initargs=(index,),
@@ -589,7 +593,10 @@ def generate_hard_negative_candidates(
                             if proposals is None or (reverse and proposals[0] is not None)
                             else proposals[int(reverse)]
                         )
-                        if proposal is not None and proposal[1] in added_neighbors.get(query.anchor, ()):
+                        if proposal is not None and (
+                            proposal[1] in added_neighbors.get(query.anchor, ())
+                            or str(entity_to_family[proposal[1]]) in query.blocked_families
+                        ):
                             # Earlier commits in this batch may have consumed the
                             # worker's proposal. Requery in the parent, in order.
                             proposal = index.best(query)
@@ -600,6 +607,11 @@ def generate_hard_negative_candidates(
                         anchor = query.anchor
                         added_neighbors[anchor].add(candidate)
                         added_neighbors[candidate].add(anchor)
+                        if unique_family_pairs:
+                            anchor_family = str(entity_to_family[anchor])
+                            candidate_family = str(entity_to_family[candidate])
+                            added_family_neighbors[anchor_family].add(candidate_family)
+                            added_family_neighbors[candidate_family].add(anchor_family)
                         generated.append({
                             "pair_id": f"synthetic_{len(generated):06d}",
                             "ppi_cluster_id": f"synthetic_{len(generated):06d}",
@@ -625,6 +637,79 @@ def generate_hard_negative_candidates(
                         break
             if not made_progress:
                 break
+    return generated
+
+
+def enrich_pdb_negative_clusters(
+    seeds: Sequence[Record],
+    positive_rows: Sequence[Record],
+    pair_records: Sequence[Record],
+    entity_to_family: Mapping[str, str],
+    entity_lengths: Mapping[str, int],
+    *,
+    pairs_per_cluster: int,
+    seed: int,
+) -> list[Record]:
+    """Sample homologous members of each negative family pair without a Cartesian expansion."""
+    if not seeds:
+        return []
+    lengths = _collect_entity_lengths(positive_rows, entity_lengths)
+    members: dict[str, set[str]] = defaultdict(set)
+    for row in positive_rows:
+        for key in ("chain1", "chain2"):
+            entity = str(row[key])
+            members[str(entity_to_family[entity])].add(entity)
+    pools = {family: sorted(entities) for family, entities in members.items()}
+    positions = {family: {entity: i for i, entity in enumerate(entities)} for family, entities in pools.items()}
+    selected = {canonical_family_pair(row["family1"], row["family2"]) for row in seeds}
+    forbidden: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for row in pair_records:
+        a, b = str(row["chain1"]), str(row["chain2"])
+        fa, fb = str(entity_to_family[a]), str(entity_to_family[b])
+        key = canonical_family_pair(fa, fb)
+        if key not in selected:
+            continue
+        if fa != key[0]:
+            a, b = b, a
+        if a in positions[key[0]] and b in positions[key[1]]:
+            forbidden[key].add(positions[key[0]][a] * len(pools[key[1]]) + positions[key[1]][b])
+
+    generated = []
+    for cluster_index, template in enumerate(seeds):
+        key = canonical_family_pair(template["family1"], template["family2"])
+        first, second = pools[key[0]], pools[key[1]]
+        a, b = str(template["chain1"]), str(template["chain2"])
+        if str(entity_to_family[a]) != key[0]:
+            a, b = b, a
+        blocked = sorted(forbidden[key] | {positions[key[0]][a] * len(second) + positions[key[1]][b]})
+        capacity = len(first) * len(second)
+        available = capacity - len(blocked)
+        rng = random.Random(f"{seed}|{template['split']}|{key[0]}|{key[1]}")
+        ranks = rng.sample(range(available), min(max(0, pairs_per_cluster - 1), available))
+        pairs = [(str(template["chain1"]), str(template["chain2"]))]
+        for rank in ranks:
+            # Map a rank in the allowed complement to a Cartesian index in
+            # logarithmic time, without enumerating family-member products.
+            low, high = rank, rank + len(blocked)
+            while low < high:
+                middle = (low + high) // 2
+                if middle - bisect_right(blocked, middle) < rank:
+                    low = middle + 1
+                else:
+                    high = middle
+            i, j = divmod(low, len(second))
+            pairs.append((first[i], second[j]))
+        cluster_id = f"pdb_neg:{template['split']}:{cluster_index:06d}"
+        for member_index, (a, b) in enumerate(pairs):
+            row = dict(template)
+            if member_index:
+                row.pop("match_score", None)
+            row.update(
+                pair_id=f"{cluster_id}:{member_index:04d}", ppi_cluster_id=cluster_id,
+                chain1=a, chain2=b, family1=str(entity_to_family[a]), family2=str(entity_to_family[b]),
+                length1=lengths[a], length2=lengths[b],
+            )
+            generated.append(row)
     return generated
 
 
@@ -669,6 +754,7 @@ def build_dataset_splits(
     *,
     benchmark_families: Iterable[str] = (),
     benchmark_entities: Iterable[str] = (),
+    benchmark_filter_stats: Mapping[str, Any] | None = None,
     validation_fraction: float = 0.1,
     seed: int = 42,
     hard_negative_count: int = 0,
@@ -682,12 +768,15 @@ def build_dataset_splits(
     length2_column: str = "length2",
     source_names: Sequence[str] | None = None,
     pdb_negative_ratio: float = 1.0,
+    pdb_negative_pairs_per_cluster: int = 0,
     workers: int = 1,
     progress: bool = False,
 ) -> dict[str, Any]:
     """Build all pair, family, component, leakage, and statistics manifests."""
     if not math.isfinite(float(pdb_negative_ratio)) or float(pdb_negative_ratio) < 0:
         raise ValueError("pdb_negative_ratio must be finite and non-negative")
+    if int(pdb_negative_pairs_per_cluster) < 0:
+        raise ValueError("pdb_negative_pairs_per_cluster must be non-negative (0 matches the positive mean)")
     if int(workers) < 1:
         raise ValueError("workers must be at least 1")
     _status(progress, "Normalize family mapping and annotate input pairs")
@@ -820,8 +909,12 @@ def build_dataset_splits(
             for row in positive_rows
         })
         requested = int(math.ceil(positive_cluster_count * float(pdb_negative_ratio)))
-        generated = generate_hard_negative_candidates(
-            [*partitions["train"], *partitions["validation"], *partitions["excluded"]],
+        pairs_per_cluster = int(pdb_negative_pairs_per_cluster) or max(
+            1, math.ceil(len(positive_rows) / max(positive_cluster_count, 1)),
+        )
+        all_pair_rows = [*partitions["train"], *partitions["validation"], *partitions["excluded"]]
+        cluster_seeds = generate_hard_negative_candidates(
+            all_pair_rows,
             entity_to_family,
             count=requested,
             entity_lengths=entity_lengths,
@@ -830,25 +923,29 @@ def build_dataset_splits(
             template_source="pdb_ppi",
             template_split=split,
             output_source="pdb_neg",
+            unique_family_pairs=True,
             workers=workers,
             progress=progress,
         )
-        # Include split in IDs because each generator call starts at zero.
-        for row in generated:
-            row["pair_id"] = f"pdb_neg:{split}:{row['pair_id']}"
-            row["ppi_cluster_id"] = row["pair_id"]
+        generated = enrich_pdb_negative_clusters(
+            cluster_seeds, positive_rows, all_pair_rows, entity_to_family, entity_lengths,
+            pairs_per_cluster=pairs_per_cluster, seed=seed,
+        )
         partitions[split].extend(generated)
         pdb_synthetic.extend(generated)
         pdb_negative_counts[split] = {
             "positive_pairs": len(positive_rows),
             "positive_clusters": positive_cluster_count,
             "requested": requested,
-            "generated": len(generated),
-            "negative_clusters": len(generated),
+            "generated": len(cluster_seeds),
+            "negative_clusters": len(cluster_seeds),
+            "negative_pairs": len(generated),
+            "target_pairs_per_cluster": pairs_per_cluster,
+            "requested_pairs": requested * pairs_per_cluster,
         }
-        if len(generated) < requested:
+        if len(cluster_seeds) < requested:
             warnings.warn(
-                f"PDB {split}: generated {len(generated)}/{requested} negatives; "
+                f"PDB {split}: generated {len(cluster_seeds)}/{requested} negatives; "
                 "no more within-split, source-matched family pairs are available.",
                 RuntimeWarning,
             )
@@ -920,6 +1017,15 @@ def build_dataset_splits(
         raise RuntimeError(f"Family leakage detected: {leakage}")
 
     all_sources = sorted({row["source_table"] for split_rows in partitions.values() for row in split_rows} | {"pdb_neg"})
+    source_entities: dict[str, set[str]] = defaultdict(set)
+    benchmark_pair_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        source = row["source_table"]
+        endpoints = (row["chain1"], row["chain2"])
+        source_entities[source].update(endpoints)
+        benchmark_pair_counts[source] += bool(blocked_entities.intersection(endpoints))
+    referenced_entities = set().union(*source_entities.values())
+    filter_info = dict(benchmark_filter_stats or {})
     stats = {
         "seed": int(seed),
         "validation_fraction": float(validation_fraction),
@@ -927,7 +1033,25 @@ def build_dataset_splits(
         "family_count": len(all_families),
         "component_count": len(components),
         "benchmark_family_count": len(benchmark),
+        "benchmark_family_count_note": "Size of the explicit family exclusion list, not the number of training families with benchmark matches.",
         "benchmark_entity_count": len(blocked_entities),
+        "benchmark_entity_count_note": "Legacy alias: excluded TRAINING IDs, not benchmark reference sequences.",
+        "benchmark_reference_entity_count": filter_info.get("benchmark_reference_entity_count"),
+        "benchmark_matching_training_entity_count": len(blocked_entities),
+        "benchmark_matching_training_family_count": len({entity_to_family[entity] for entity in blocked_entities}),
+        "benchmark_matching_pair_referenced_entity_count": len(blocked_entities & referenced_entities),
+        "benchmark_matching_unreferenced_entity_count": len(blocked_entities - referenced_entities),
+        "benchmark_filter": filter_info or None,
+        "source_benchmark_filter_counts": {
+            source: {
+                "pair_referenced_entities": len(entities),
+                "benchmark_matching_pair_referenced_entities": len(entities & blocked_entities),
+                "input_pairs": sum(row["source_table"] == source for row in rows),
+                "pairs_containing_benchmark_match": benchmark_pair_counts[source],
+                "pairs_after_benchmark_filter": sum(row["source_table"] == source for row in rows) - benchmark_pair_counts[source],
+            }
+            for source, entities in sorted(source_entities.items())
+        },
         "source_input_counts": {
             source: sum(row["source_table"] == source for row in rows)
             for source in sorted({row["source_table"] for row in rows})
@@ -1000,21 +1124,48 @@ def build_dataset_splits(
         "requested_hard_negatives": int(hard_negative_count),
         "generated_hard_negatives": len(synthetic),
         "pdb_negative_ratio": float(pdb_negative_ratio),
+        "pdb_negative_pairs_per_cluster": int(pdb_negative_pairs_per_cluster),
         "pdb_negative_counts": pdb_negative_counts,
         "generated_pdb_negatives": len(pdb_synthetic),
+        "generated_pdb_negative_clusters": sum(counts["negative_clusters"] for counts in pdb_negative_counts.values()),
         "conflicting_negative_count": sum(
             row.get("exclusion_reason")
             == "negative_conflicts_known_positive_entity_pair"
             for row in partitions["excluded"]
         ),
     }
+    stats["source_validation_fractions"] = {}
+    for source in all_sources:
+        total_samples = stats["source_counts"]["train"][source] + stats["source_counts"]["validation"][source]
+        total_clusters = stats["source_cluster_counts"]["train"][source] + stats["source_cluster_counts"]["validation"][source]
+        stats["source_validation_fractions"][source] = {
+            "sample_fraction": stats["source_counts"]["validation"][source] / total_samples if total_samples else None,
+            "cluster_fraction": stats["source_cluster_counts"]["validation"][source] / total_clusters if total_clusters else None,
+        }
+    stats["source_cluster_retention_counts"] = {}
+    for source in source_entities:
+        input_clusters = set()
+        retained_clusters = set()
+        excluded_clusters = set()
+        for row in rows:
+            if row["source_table"] != source:
+                continue
+            cluster = str(row["ppi_cluster_id"])
+            input_clusters.add(cluster)
+            (excluded_clusters if row["split"] == "excluded" else retained_clusters).add(cluster)
+        stats["source_cluster_retention_counts"][source] = {
+            "input_clusters": len(input_clusters),
+            "retained_clusters": len(retained_clusters),
+            "fully_excluded_clusters": len(input_clusters - retained_clusters),
+            "partially_excluded_clusters": len(retained_clusters & excluded_clusters),
+        }
     for source in {"afdb_neg"}.intersection(row["source_table"] for row in rows):
         if not any(not row["source_is_positive"] and row["source_table"] == source
                    for split in ("train", "validation") for row in partitions[split]):
             warnings.warn(
                 f"No {source} negatives survived. Inspect source_exclusion_counts; "
-                "if sequence_matches_benchmark removed them all with identity-only filtering, "
-                "rerun build_mmseqs_families.py with --coverage 0.8 (identity stays 0.3).",
+                "check the recorded benchmark filter policy and split exclusions. "
+                "Identity 0.3 and coverage 0.8 are not relaxed automatically.",
                 RuntimeWarning,
             )
     return {

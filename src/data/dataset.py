@@ -54,11 +54,13 @@ class PepoTrainDataset(Dataset):
         crop_size: int | None = DEFAULT_CROP_SIZE,
         contact_threshold: float = DEFAULT_CONTACT_THRESHOLD_A,
         require_labels: bool = True,
+        distance_bin_convention: str = "legacy",
     ):
         self.root_dir = Path(root_dir)
         self.cluster_tsv_path = Path(cluster_tsv_path)
         self.transform = transform
         self.require_labels = bool(require_labels)
+        self.distance_bin_convention = distance_bin_convention
         self.distance_bin_start = float(distance_bin_start)
         self.distance_bin_end = float(distance_bin_end)
         self.distance_bin_count = int(distance_bin_count)
@@ -104,18 +106,24 @@ class PepoTrainDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx):
-        row = self._sample_row(idx)
+        return self.sample(idx)
+
+    def sample(self, idx, *, rng=random, row_index=None):
+        cluster_rows = self.cluster_to_rows[self.items[idx]]
+        row_index = rng.randrange(len(cluster_rows)) if row_index is None else row_index
+        row = cluster_rows.iloc[row_index]
         if "source_is_positive" not in self.metadata.columns:
-            sample = self._positive_sample_from_row(row)
+            sample = self._positive_sample_from_row(row, rng=rng)
             return self.transform(sample) if self.transform is not None else sample
         if self._as_bool(row["source_is_positive"]):
-            sample = self._positive_sample_from_row(row)
+            sample = self._positive_sample_from_row(row, rng=rng)
             return self.transform(sample) if self.transform is not None else sample
         p1_features, p2_features = self._load_pair_features(row)
         return self._finalize_negative_sample(
             p1_features,
             p2_features,
             negative_kind=str(self._row_value(row, "negative_kind", "curated")),
+            rng=rng,
         )
 
     def _sample_row(self, idx):
@@ -128,7 +136,7 @@ class PepoTrainDataset(Dataset):
         p2_features = self._process_complex(self._load_chain_features(row["chain2"]))
         return p1_features, p2_features
 
-    def _positive_sample_from_row(self, row):
+    def _positive_sample_from_row(self, row, *, rng=random):
         p1_features, p2_features = self._load_pair_features(row)
         label_path = self.root_dir / "labels" / Path(row["label_path"]).name
         pairwise_dist, pairwise_mask = self._load_pair_distance_and_mask(
@@ -148,6 +156,7 @@ class PepoTrainDataset(Dataset):
             pairwise_mask,
             crop_size=self.crop_size,
             contact_threshold=self.contact_threshold,
+            rng=rng,
         )
         p1_length = int(p1_features["mask"].shape[0])
         label_inter_dist = pairwise_dist[:p1_length, p1_length:]
@@ -157,6 +166,7 @@ class PepoTrainDataset(Dataset):
             bin_start=self.distance_bin_start,
             bin_end=self.distance_bin_end,
             bin_count=self.distance_bin_count,
+            convention=self.distance_bin_convention,
         )
         crop_metadata.update(
             {
@@ -197,11 +207,13 @@ class PepoTrainDataset(Dataset):
         p2_features: dict,
         *,
         negative_kind: str,
+        rng=random,
     ):
         p1_features, p2_features, crop_metadata = crop_negative_pair(
             p1_features,
             p2_features,
             crop_size=self.crop_size,
+            rng=rng,
         )
         p1_mask = p1_features["mask"].to(dtype=torch.bool)
         p2_mask = p2_features["mask"].to(dtype=torch.bool)

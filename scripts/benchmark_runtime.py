@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Reproducible, model-only SurPass length and memory benchmark.
 
-Synthetic PLM/residue features are constructed before timing. The measured wall
-time therefore covers only ``ResOnly.forward`` for batch size one.
+Synthetic PLM/residue features are constructed before timing. By default,
+measure the configured ResPair model at 2,048 total residues, batch size one.
+Training mode also measures loss, backward, clipping, and an optimizer step.
 """
 
 from __future__ import annotations
@@ -11,8 +12,8 @@ import argparse
 import csv
 import dataclasses
 import json
-import os
 import platform
+import statistics
 import sys
 import time
 from collections.abc import Mapping
@@ -23,8 +24,15 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LENGTHS = (256, 512, 1024, 2048)
+DEFAULT_LENGTHS = (2048,)
 CSV_FIELDS = (
+    "model_name",
+    "architecture",
+    "mode",
+    "n_layers",
+    "pair_update_every",
+    "pair_update_layers",
+    "recycle_passes",
     "combined_length",
     "p1_length",
     "p2_length",
@@ -37,26 +45,35 @@ CSV_FIELDS = (
     "trainable_parameter_count",
     "success",
     "error",
+    "error_stage",
     "wall_time_seconds",
     "total_wall_time_seconds",
+    "median_wall_time_seconds",
+    "min_wall_time_seconds",
+    "max_wall_time_seconds",
+    "seconds_per_sample",
+    "samples_per_second",
+    "iteration_times_seconds",
+    "warmup_times_seconds",
     "peak_allocated_cuda_bytes",
     "peak_reserved_cuda_bytes",
     "output_shapes",
+    "last_loss",
 )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark model-only SurPass forwards at combined protein lengths. "
-            "Inputs are prepared outside the timed region; batch size is fixed at 1."
+            "Check ResPair time and memory at 2,048 total residues by default. "
+            "Synthetic PLM inputs exclude embedding generation and data loading."
         )
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=ROOT / "configs" / "inference.yaml",
-        help="SurPass YAML config (default: configs/inference.yaml).",
+        help="Hydra YAML config (default: configs/inference.yaml).",
     )
     parser.add_argument(
         "--checkpoint",
@@ -70,7 +87,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         metavar="N",
-        help="Combined lengths (default: 256 512 1024 2048).",
+        help="Combined chain lengths (default: 2048 = 1024 + 1024).",
+    )
+    parser.add_argument("--p1-length", type=int, help="First-chain length; default: half of each total.")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--mode", choices=("inference", "training"), default="inference",
+        help="Forward only, or forward/loss/backward/clipping/optimizer (default: inference).",
+    )
+    parser.add_argument(
+        "--override", action="append", default=[], metavar="KEY=VALUE",
+        help="Repeat for Hydra overrides, e.g. --override model.triangle_chunk_size=32.",
     )
     parser.add_argument(
         "--device",
@@ -81,9 +108,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument(
         "--precision",
-        choices=("fp32", "bf16"),
-        default="fp32",
-        help="Forward precision. BF16 requires CUDA.",
+        choices=("auto", "fp32", "bf16"),
+        default="auto",
+        help="Auto follows the config on CUDA and uses FP32 on CPU. BF16 requires CUDA.",
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -115,7 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    lengths = args.lengths if args.lengths is not None else DEFAULT_LENGTHS
+    lengths = args.lengths if args.lengths is not None else ([16] if args.cpu_smoke else DEFAULT_LENGTHS)
     if any(length < 2 for length in lengths):
         raise SystemExit("Every combined length must be at least 2.")
     if args.warmup < 0:
@@ -124,16 +151,19 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--repeats must be positive.")
     if args.gpu_id < 0:
         raise SystemExit("--gpu-id must be non-negative.")
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be positive.")
+    if args.p1_length is not None and any(not 0 < args.p1_length < length for length in lengths):
+        raise SystemExit("--p1-length must leave at least one residue in each chain.")
 
 
 def _load_model_api():
     """Import change-prone SurPass APIs only when a benchmark is executed."""
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from src.model.surpass import ResOnly
-    from src.runtime.config import build_model_kwargs
+    from src.runtime.config import build_model_kwargs, create_model
 
-    return ResOnly, build_model_kwargs
+    return create_model, build_model_kwargs
 
 
 def _load_config(args: argparse.Namespace):
@@ -147,12 +177,19 @@ def _load_config(args: argparse.Namespace):
     if not args.config.is_file():
         raise SystemExit(f"Missing SurPass config: {args.config}")
     cfg = OmegaConf.load(args.config)
+    if "defaults" in cfg:
+        from hydra import compose, initialize_config_dir
+
+        with initialize_config_dir(config_dir=str(args.config.resolve().parent), version_base="1.3"):
+            cfg = compose(config_name=args.config.stem, overrides=args.override)
+    elif args.override:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(args.override))
     if args.cpu_smoke:
         cfg = OmegaConf.merge(
             cfg,
             {
                 "model": {
-                    "n_layers": 1,
+                    "n_layers": 2,
                     "dim_token": 32,
                     "dim_pair": 16,
                     "n_heads": 4,
@@ -163,6 +200,9 @@ def _load_config(args: argparse.Namespace):
                 }
             },
         )
+        if str(cfg.model.get("name", "ResOnly")) == "ResPair":
+            cfg.model.triangle_hidden_dim = 8
+            cfg.model.triangle_chunk_size = 8
     return cfg
 
 
@@ -196,7 +236,10 @@ def _checkpoint_state(payload: Any) -> Mapping[str, Any]:
 def _load_checkpoint(model, checkpoint: Path, device, torch) -> None:
     if not checkpoint.is_file():
         raise SystemExit(f"Missing SurPass checkpoint: {checkpoint}")
-    payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    architecture = payload.get("architecture") if isinstance(payload, Mapping) else None
+    if architecture and architecture != getattr(model, "architecture", None):
+        raise ValueError(f"Checkpoint architecture {architecture!r} does not match {model.architecture!r}")
     state = _checkpoint_state(payload)
     if state and all(str(key).startswith("module.") for key in state):
         state = {str(key)[7:]: value for key, value in state.items()}
@@ -209,14 +252,17 @@ def _synthetic_batch(
     seed: int,
     device,
     torch,
+    *,
+    batch_size: int = 1,
+    p1_length: int | None = None,
 ) -> dict[str, Any]:
-    p1_length = combined_length // 2
+    p1_length = combined_length // 2 if p1_length is None else p1_length
     p2_length = combined_length - p1_length
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) + int(combined_length))
     batch = {
         "plm_emb": torch.randn(
-            1,
+            batch_size,
             combined_length,
             plm_in_dim,
             generator=generator,
@@ -225,23 +271,21 @@ def _synthetic_batch(
         "residue_type": torch.randint(
             0,
             20,
-            (1, combined_length),
+            (batch_size, combined_length),
             generator=generator,
             dtype=torch.long,
         ),
-        "residue_index": torch.arange(combined_length, dtype=torch.long).unsqueeze(0),
-        "residue_position": torch.zeros(
-            1, combined_length, 3, dtype=torch.float32
-        ),
+        "residue_index": torch.arange(combined_length, dtype=torch.long)[None].expand(batch_size, -1),
         "chain_index": torch.cat(
             [
                 torch.zeros(p1_length, dtype=torch.long),
                 torch.ones(p2_length, dtype=torch.long),
             ]
-        ).unsqueeze(0),
-        "mask": torch.ones(1, combined_length, dtype=torch.bool),
-        "p1_length": torch.tensor([p1_length], dtype=torch.long),
-        "p2_length": torch.tensor([p2_length], dtype=torch.long),
+        )[None].expand(batch_size, -1),
+        "mask": torch.ones(batch_size, combined_length, dtype=torch.bool),
+        "padding_mask": torch.ones(batch_size, combined_length, dtype=torch.bool),
+        "p1_length": torch.full((batch_size,), p1_length, dtype=torch.long),
+        "p2_length": torch.full((batch_size,), p2_length, dtype=torch.long),
     }
     return {key: value.to(device) for key, value in batch.items()}
 
@@ -292,9 +336,9 @@ def _write_results(
         writer.writeheader()
         for row in rows:
             csv_row = dict(row)
-            csv_row["output_shapes"] = json.dumps(
-                row["output_shapes"], sort_keys=True, separators=(",", ":")
-            )
+            for key, value in csv_row.items():
+                if isinstance(value, (dict, list, tuple)):
+                    csv_row[key] = json.dumps(value, sort_keys=True, separators=(",", ":"))
             writer.writerow(csv_row)
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(
@@ -312,31 +356,97 @@ def _autocast_context(precision: str, device, torch):
     return nullcontext()
 
 
+def _training_components(model, cfg, device, torch):
+    from src.model.loss import SurpassLoss
+    from src.model.optimizer import get_adamw, get_optimizer
+    from src.runtime.config import cfg_get
+
+    weights = {name: float(cfg_get(cfg, f"loss.{name}.weight", default)) for name, default in (
+        ("protein", 1.0), ("contact", 1.0), ("distance", 0.1), ("aux_protein", 0.1),
+    )}
+    criterion = SurpassLoss(
+        model.contact_bins, weights,
+        focal_gamma=float(cfg_get(cfg, "loss.contact.gamma", 1.5)),
+        contact_positive_weight=float(cfg_get(cfg, "loss.contact.positive_weight", 4.0)),
+        negatives_per_positive=float(cfg_get(cfg, "loss.contact.negatives_per_positive", 8.0)),
+    ).to(device)
+    lr = float(cfg_get(cfg, "optimizer.lr", 0.0005))
+    weight_decay = float(cfg_get(cfg, "optimizer.weight_decay", 1e-6))
+    betas = (float(cfg_get(cfg, "optimizer.beta1", 0.9)), float(cfg_get(cfg, "optimizer.beta2", 0.999)))
+    if bool(cfg_get(cfg, "optimizer.use_adamw", True)):
+        optimizer = get_adamw(model, weight_decay, lr, betas, device.type)
+    else:
+        optimizer = get_optimizer(model, lr, weight_decay, betas, use_adamw=False)
+    return criterion, optimizer, float(cfg_get(cfg, "optimizer.max_grad_norm", 1.0))
+
+
+def _synthetic_labels(batch, bin_count, torch):
+    batch_size = batch["plm_emb"].shape[0]
+    first, second = int(batch["p1_length"][0]), int(batch["p2_length"][0])
+    device = batch["plm_emb"].device
+    positive = torch.arange(batch_size, device=device) % 2 == 0
+    bins = torch.full((batch_size, first, second), bin_count - 1, dtype=torch.long, device=device)
+    bins[positive, 0, 0] = 0
+    return {
+        "label_inter_bins": bins,
+        "label_inter_mask": torch.ones_like(bins, dtype=torch.bool),
+        "crop_is_positive": positive, "source_is_positive": positive,
+        "sample_confidence": torch.ones(batch_size, device=device),
+    }
+
+
+def _run_iteration(model, batch, labels, criterion, optimizer, max_grad_norm, precision, device, torch):
+    if optimizer is None:
+        with torch.inference_mode(), _autocast_context(precision, device, torch):
+            return model(batch), None
+    optimizer.zero_grad(set_to_none=True)
+    with _autocast_context(precision, device, torch):
+        output = model(batch)
+        loss, _ = criterion(output, labels)
+    loss.backward()
+    if max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    optimizer.step()
+    return output, loss.detach()
+
+
+def _synchronize(device, torch):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _capture_memory(row, device, torch):
+    if device.type == "cuda":
+        row["peak_allocated_cuda_bytes"] = torch.cuda.max_memory_allocated(device)
+        row["peak_reserved_cuda_bytes"] = torch.cuda.max_memory_reserved(device)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     _validate_args(args)
-
     try:
         import torch
     except ImportError as exc:
-        raise SystemExit(
-            "PyTorch is required. Install the SurPass environment before benchmarking."
-        ) from exc
+        raise SystemExit("PyTorch is required. Install the SurPass environment before benchmarking.") from exc
 
-    if args.cpu_smoke:
-        args.precision = "fp32"
+    cfg = _load_config(args)
     device = _resolve_device(args, torch)
-    if args.precision == "bf16":
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    if args.cpu_smoke:
+        precision = "fp32"
+    elif args.precision == "auto":
+        configured = str(cfg.get("runtime", {}).get("precision", "float32"))
+        precision = "bf16" if device.type == "cuda" and configured == "bfloat16" else "fp32"
+    else:
+        precision = args.precision
+    if precision == "bf16":
         if device.type != "cuda":
             raise SystemExit("BF16 benchmarking is supported only with --device cuda.")
-        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+        if not torch.cuda.is_bf16_supported():
             raise SystemExit("The selected CUDA device does not support BF16.")
 
-    lengths = (
-        list(args.lengths)
-        if args.lengths is not None
-        else ([16] if args.cpu_smoke else list(DEFAULT_LENGTHS))
-    )
+    lengths = list(args.lengths) if args.lengths is not None else ([16] if args.cpu_smoke else list(DEFAULT_LENGTHS))
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -345,117 +455,140 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = False
 
-    cfg = _load_config(args)
-    ResOnly, build_model_kwargs = _load_model_api()
+    create_model, build_model_kwargs = _load_model_api()
     model_kwargs = build_model_kwargs(cfg)
-    model = ResOnly(**model_kwargs).to(device)
+    print(f"Creating {cfg.model.get('name', 'ResOnly')} from {args.config} on {device} ({precision})...", flush=True)
+    model = create_model(cfg).to(device)
     if args.checkpoint is not None:
         _load_checkpoint(model, args.checkpoint, device, torch)
-    model.eval()
+    model.train(args.mode == "training")
+    criterion = optimizer = None
+    max_grad_norm = 0.0
+    if args.mode == "training":
+        criterion, optimizer, max_grad_norm = _training_components(model, cfg, device, torch)
 
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    trainable_parameter_count = sum(
-        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
-    )
-    precision = "fp32" if args.cpu_smoke else args.precision
+    pair_update_layers = [int(key) + 1 for key in model.pair_blocks] if hasattr(model.pair_blocks, "keys") else list(range(1, model.n_layers + 1))
+    model_info = {
+        "model_name": type(model).__name__, "architecture": model.architecture,
+        "mode": args.mode, "n_layers": model.n_layers,
+        "pair_update_every": getattr(model, "pair_update_every", 1),
+        "pair_update_layers": pair_update_layers,
+        "recycle_passes": getattr(model, "recycle_passes", 1),
+    }
+    print(f"Model ready: parameters={parameter_count:,}, layers={model.n_layers}, "
+          f"pair updates={pair_update_layers}, passes={model_info['recycle_passes']}, "
+          f"mode={args.mode}, batch={args.batch_size}", flush=True)
     metadata = {
+        **model_info,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "command": [str(Path(__file__).resolve()), *sys.argv[1:]],
+        "command": [str(Path(__file__).resolve()), *(sys.argv[1:] if argv is None else argv)],
         "config": str(args.config.resolve()),
-        "checkpoint": (
-            str(args.checkpoint.resolve()) if args.checkpoint is not None else None
-        ),
-        "seed": args.seed,
-        "deterministic": bool(args.deterministic),
-        "batch_size": 1,
-        "lengths": lengths,
-        "precision": precision,
-        "device": str(device),
-        "parameter_count": parameter_count,
-        "python_version": platform.python_version(),
-        "torch_version": torch.__version__,
+        "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint is not None else None,
+        "seed": args.seed, "deterministic": bool(args.deterministic),
+        "cpu_smoke": bool(args.cpu_smoke), "overrides": args.override,
+        "batch_size": args.batch_size, "lengths": lengths, "precision": precision,
+        "device": str(device), "parameter_count": parameter_count,
+        "python_version": platform.python_version(), "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
-        "cuda_device_name": (
-            torch.cuda.get_device_name(device) if device.type == "cuda" else None
+        "cuda_device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "cuda_total_memory_bytes": torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else None,
+        "measurement_scope": (
+            "forward + loss + backward + gradient clipping + optimizer step; excludes EMA, DDP, scheduler and data preparation"
+            if args.mode == "training" else "model forward only; excludes PLM generation and data preparation"
         ),
-        "model_kwargs": {
-            str(key): value
-            for key, value in model_kwargs.items()
-            if isinstance(value, (str, int, float, bool, type(None)))
-        },
+        "memory_scope": "CUDA process peaks include model, inputs and warmup; CPU peaks are unavailable",
+        "model_kwargs": {str(key): value for key, value in model_kwargs.items()
+                         if isinstance(value, (str, int, float, bool, type(None)))},
     }
 
-    rows: list[dict[str, Any]] = []
-    plm_in_dim = int(model_kwargs.get("plm_in_dim", 1280))
+    rows = []
     for combined_length in lengths:
-        p1_length = combined_length // 2
-        row: dict[str, Any] = {
-            "combined_length": combined_length,
-            "p1_length": p1_length,
-            "p2_length": combined_length - p1_length,
-            "batch_size": 1,
-            "precision": precision,
-            "device": str(device),
-            "repeats": args.repeats,
-            "warmup": args.warmup,
-            "parameter_count": parameter_count,
-            "trainable_parameter_count": trainable_parameter_count,
-            "success": False,
-            "error": "",
-            "wall_time_seconds": None,
-            "total_wall_time_seconds": None,
-            "peak_allocated_cuda_bytes": None,
-            "peak_reserved_cuda_bytes": None,
-            "output_shapes": None,
-        }
-        batch = None
-        output = None
+        p1_length = args.p1_length if args.p1_length is not None else combined_length // 2
+        row = {key: None for key in CSV_FIELDS}
+        row.update({
+            **model_info,
+            "combined_length": combined_length, "p1_length": p1_length,
+            "p2_length": combined_length - p1_length, "batch_size": args.batch_size,
+            "precision": precision, "device": str(device), "repeats": args.repeats,
+            "warmup": args.warmup, "parameter_count": parameter_count,
+            "trainable_parameter_count": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "success": False, "error": "", "error_stage": "",
+            "iteration_times_seconds": [], "warmup_times_seconds": [],
+        })
+        batch = labels = output = loss = None
+        stage = "input allocation"
+        print(f"Testing total length={combined_length} ({p1_length} + {combined_length - p1_length})...", flush=True)
         try:
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
             batch = _synthetic_batch(
-                combined_length,
-                plm_in_dim,
-                args.seed,
-                device,
-                torch,
+                combined_length, int(model_kwargs.get("plm_in_dim", 2560)), args.seed, device, torch,
+                batch_size=args.batch_size, p1_length=p1_length,
             )
-            with torch.inference_mode(), _autocast_context(precision, device, torch):
-                for _ in range(args.warmup):
-                    output = model(batch)
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                    torch.cuda.reset_peak_memory_stats(device)
-                start = time.perf_counter()
-                for _ in range(args.repeats):
-                    output = model(batch)
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                elapsed = time.perf_counter() - start
-
-            row["success"] = True
-            row["wall_time_seconds"] = elapsed / args.repeats
-            row["total_wall_time_seconds"] = elapsed
-            row["output_shapes"] = _output_shapes(output, torch)
-            if device.type == "cuda":
-                row["peak_allocated_cuda_bytes"] = torch.cuda.max_memory_allocated(device)
-                row["peak_reserved_cuda_bytes"] = torch.cuda.max_memory_reserved(device)
-        except Exception as exc:  # Keep later, potentially smaller/diagnostic rows.
+            if args.mode == "training":
+                labels = _synthetic_labels(batch, model.distance_bin_count, torch)
+            for phase, count in (("warmup", args.warmup), ("timed", args.repeats)):
+                for index in range(count):
+                    stage = f"{phase} iteration {index + 1}/{count}"
+                    print(f"  {stage} starting...", flush=True)
+                    # Release the previous outputs before measuring another pass.
+                    output = loss = None
+                    _synchronize(device, torch)
+                    start = time.perf_counter()
+                    output, loss = _run_iteration(
+                        model, batch, labels, criterion, optimizer, max_grad_norm, precision, device, torch,
+                    )
+                    _synchronize(device, torch)
+                    elapsed = time.perf_counter() - start
+                    key = "warmup_times_seconds" if phase == "warmup" else "iteration_times_seconds"
+                    row[key].append(elapsed)
+                    print(f"  {stage}: {elapsed:.4f} s", flush=True)
+            _capture_memory(row, device, torch)
+            stage = "output validation"
+            if not bool(torch.isfinite(output.protein_logit).all()) or not bool(torch.isfinite(output.aux_protein_logit).all()):
+                raise FloatingPointError("Model produced non-finite protein logits")
+            if loss is not None:
+                row["last_loss"] = float(loss)
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("Training loss is non-finite")
+            times = row["iteration_times_seconds"]
+            mean = statistics.mean(times)
+            row.update({
+                "success": True, "wall_time_seconds": mean, "total_wall_time_seconds": sum(times),
+                "median_wall_time_seconds": statistics.median(times),
+                "min_wall_time_seconds": min(times), "max_wall_time_seconds": max(times),
+                "seconds_per_sample": mean / args.batch_size, "samples_per_second": args.batch_size / mean,
+                "output_shapes": _output_shapes(output, torch),
+            })
+        except Exception as exc:
             row["error"] = f"{type(exc).__name__}: {exc}"
-            if device.type == "cuda":
-                row["peak_allocated_cuda_bytes"] = torch.cuda.max_memory_allocated(device)
-                row["peak_reserved_cuda_bytes"] = torch.cuda.max_memory_reserved(device)
+            row["error_stage"] = stage
+            _capture_memory(row, device, torch)
         finally:
-            del output
-            del batch
+            output = loss = batch = labels = None
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         rows.append(row)
         _write_results(rows, metadata, args.output_csv, args.output_json)
-        status = "ok" if row["success"] else row["error"]
-        print(f"length={combined_length} status={status}")
+        if row["success"]:
+            print(f"PASS length={combined_length}: mean={row['wall_time_seconds']:.4f} s/batch, "
+                  f"median={row['median_wall_time_seconds']:.4f} s, "
+                  f"per sample={row['seconds_per_sample']:.4f} s", flush=True)
+        else:
+            print(f"FAIL length={combined_length} during {row['error_stage']}: {row['error']}", flush=True)
+        if device.type == "cuda":
+            print(f"  Peak CUDA allocated={row['peak_allocated_cuda_bytes'] / 2**30:.3f} GiB, "
+                  f"reserved={row['peak_reserved_cuda_bytes'] / 2**30:.3f} GiB", flush=True)
 
-    print(f"Wrote {args.output_csv}")
-    print(f"Wrote {args.output_json}")
+    print(f"Wrote {args.output_csv}", flush=True)
+    print(f"Wrote {args.output_json}", flush=True)
     return 0 if all(row["success"] for row in rows) else 1
 
 

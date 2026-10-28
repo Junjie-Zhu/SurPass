@@ -1,0 +1,106 @@
+# Legacy ResPair settings retained for existing runs; normal training uses train.yaml.
+task_prefix: surpass
+logging_dir: logs
+seed: 42
+deterministic: false
+epochs: 200
+checkpoint_interval: 10
+ckpt_dir: null
+ema_dir: null
+load_model_only: false
+ema:
+  decay: 0.999
+  mutable_param_keywords:
+  - ''
+data:
+  root_dir: /groups/sbinlab/clschf/datasets
+  split_dir: ${data.root_dir}/splits
+  epoch_size: 30000
+  validation_samples: 3000
+  validation_negative_ratio: 1.0
+  datasets:
+  - name: pdb_ppi
+    subdir: PDB_PPI
+    require_labels: true
+    weight: 25
+  - name: pdb_neg
+    subdir: PDB_PPI
+    require_labels: false
+    weight: 25
+  - name: afdb_pos
+    subdir: AFDB_DDI
+    require_labels: true
+    weight: 25
+  - name: afdb_neg
+    subdir: AFDB_DDI
+    require_labels: false
+    weight: 25
+  batch_size: 2
+  num_workers: 16
+  pin_memory: true
+  distance_bin_start: 2.0
+  distance_bin_end: 22.0
+  distance_bin_count: 16
+  contact_threshold: 8.0
+  crop_size: 256
+model:
+  name: ResPair
+  n_layers: 12
+  dim_token: 384
+  dim_pair: 96
+  n_heads: 8
+  dropout: 0.0
+  expansion_factor: 2
+  plm_in_dim: 2560
+  plm_out_dim: 384
+  index_emb_dim: 64
+  contact_prior: 0.0001
+  allow_missing_physics: false
+  triangle_hidden_dim: 64
+  triangle_chunk_size: 64
+  triangle_checkpoint: true
+  recycle_passes: 2
+  pair_update_every: 2
+loss:
+  protein:
+    weight: 1.0
+  contact:
+    weight: 1.0
+    gamma: 1.5
+    positive_weight: 4.0
+    negatives_per_positive: 8.0
+  distance:
+    weight: 0.1
+  aux_protein:
+    weight: 0.1
+runtime:
+  precision: bfloat16
+  checkpoint_weights: legacy
+optimizer:
+  lr: 0.0005
+  weight_decay: 1.0e-06
+  beta1: 0.9
+  beta2: 0.999
+  use_adamw: true
+  lr_scheduler: af3
+  warmup_steps: 500
+  decay_every_n_steps: 15000
+  decay_factor: 0.95
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+metrics:
+  positive_weight: 1.0
+wandb:
+  enabled: true
+  project: surpass
+  entity: null
+  name: null
+  mode: online
+  log_interval: 1
+  id: null
+  resume: allow
+  tags: []
+hydra:
+  run:
+    dir: .
+  output_subdir: null

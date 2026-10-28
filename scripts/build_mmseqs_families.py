@@ -11,12 +11,15 @@ import csv
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 IDENTITY_THRESHOLD = 0.3
+COVERAGE_THRESHOLD = 0.8
 
 
 def read_fasta(path: Path) -> dict[str, str]:
@@ -73,9 +76,51 @@ def write_fasta(path: Path, sequences: dict[str, str]) -> None:
             handle.write(f">{identifier}\n{sequence}\n")
 
 
-def read_benchmark_hits(path: Path, training_ids: set[str], benchmark_ids: set[str], coverage: float) -> set[str]:
+def distinct_search_sequences(sequences: dict[str, str]) -> dict[str, str]:
+    """Search exact duplicates once; retain every original ID for clustering."""
+    seen = set()
+    distinct = {}
+    for identifier in sorted(sequences):
+        sequence = sequences[identifier]
+        if sequence not in seen:
+            seen.add(sequence)
+            distinct[identifier] = sequence
+    return distinct
+
+
+def expand_search_hits(hits: set[str], sequences: dict[str, str]) -> set[str]:
+    hit_sequences = {sequences[identifier] for identifier in hits}
+    return {identifier for identifier, sequence in sequences.items() if sequence in hit_sequences}
+
+
+def resolve_threads(requested: int | None) -> int:
+    """Use CPUs visible to this process, capped by the job's CPU allocation."""
+    if requested is not None and requested < 0:
+        raise ValueError("--threads must be non-negative (0 selects automatically).")
+    if requested:
+        return requested
+    process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
+    limits = [process_cpu_count() or 1]
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            limits.append(len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    for variable in ("SLURM_CPUS_PER_TASK", "NSLOTS"):
+        value = os.environ.get(variable, "")
+        if value.isdecimal() and int(value) > 0:
+            limits.append(int(value))
+    return max(1, min(limits))
+
+
+def read_benchmark_hits(
+    path: Path, training_ids: set[str], benchmark_ids: set[str], coverage: float,
+    *, audit: dict | None = None,
+) -> set[str]:
     """Read explicit fractional fident/qcov/tcov, including exact 0.3 hits."""
     excluded = set()
+    matched_references = set()
+    saved_rows = training_below80 = benchmark_below80 = either_below80 = 0
     with path.open(encoding="utf-8") as handle:
         for line_number, fields in enumerate(csv.reader(handle, delimiter="\t"), 1):
             if len(fields) != 5:
@@ -88,6 +133,21 @@ def read_benchmark_hits(path: Path, training_ids: set[str], benchmark_ids: set[s
                 raise ValueError(f"{path}:{line_number}: expected fractional identity and coverage in [0, 1]")
             if identity >= IDENTITY_THRESHOLD and min(qcov, tcov) >= coverage:
                 excluded.add(query)
+                matched_references.add(target)
+                saved_rows += 1
+                training_below80 += qcov < 0.8
+                benchmark_below80 += tcov < 0.8
+                either_below80 += min(qcov, tcov) < 0.8
+    if audit is not None:
+        audit.update({
+            "saved_qualifying_alignment_rows": saved_rows,
+            "matched_benchmark_reference_entity_count": len(matched_references),
+            "saved_hits_training_coverage_below_0_8": training_below80,
+            "saved_hits_benchmark_coverage_below_0_8": benchmark_below80,
+            "saved_hits_either_coverage_below_0_8": either_below80,
+            "saved_hits_both_coverages_at_least_0_8": saved_rows - either_below80,
+            "interpretation": "Saved hits only: --max-accept 1 does not retain alternative alignments. Changing coverage requires a new search.",
+        })
     return excluded
 
 
@@ -135,11 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-fasta", type=Path, action="append", default=[])
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--min-seq-id", type=float, choices=(IDENTITY_THRESHOLD,), default=IDENTITY_THRESHOLD)
-    parser.add_argument("--coverage", type=float, default=0.0,
-                        help="Alignment coverage for benchmark filtering AND family clustering; default 0 (identity only). If no AFDB negatives survive, rerun with 0.8.")
+    parser.add_argument("--coverage", type=float, choices=(COVERAGE_THRESHOLD,), default=COVERAGE_THRESHOLD,
+                        help="Required 0.8 coverage of both sequences for benchmark filtering AND family clustering (--cov-mode 0).")
     parser.add_argument("--negative-pair-table", type=Path, action="append", default=[],
-                        help="AFDB negative TSV with chain1/chain2. If identity-only search removes every negative pair, automatically retry with coverage 0.8 at identity 0.3.")
-    parser.add_argument("--threads", type=int, default=8)
+                        help="AFDB negative TSV with chain1/chain2; records the exact number surviving the required identity/coverage filter.")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="Worker threads; default/0 uses available CPUs, respecting CPU affinity and SLURM_CPUS_PER_TASK/NSLOTS.")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -151,22 +212,25 @@ def file_sha256(path: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not math.isfinite(args.coverage) or not 0 <= args.coverage <= 1:
-        raise SystemExit("--coverage must be in [0, 1].")
-    if args.threads < 1:
-        raise SystemExit("--threads must be positive.")
+    try:
+        threads = resolve_threads(args.threads)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     executable = shutil.which("mmseqs")
     if executable is None:
         raise SystemExit("MMseqs2 is required but was not found on PATH.")
     # Separate namespaces allow a benchmark ID to also appear in training.
     sequences = merge_fastas(args.fasta)
     benchmarks = merge_fastas(args.benchmark_fasta)
+    search_sequences = distinct_search_sequences(sequences)
     version = subprocess.check_output([executable, "version"], text=True).strip()
     signature = {
-        "schema": 2, "mmseqs_version": version,
+        "schema": 4, "mmseqs_version": version,
         "identity": IDENTITY_THRESHOLD, "coverage": args.coverage,
         "alignment_mode": 3, "seq_id_mode": 0, "cov_mode": 0,
-        "automatic_coverage_fallback": bool(args.negative_pair_table),
+        "coverage_required": True,
+        "search_exact_duplicates_once": True,
+        "search_sensitivity": 7.5, "search_max_accept": 1,
         "inputs": [
             {"role": role, "path": str(path.resolve()),
              "sha256": file_sha256(path)}
@@ -178,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
     metadata = args.output_dir / "run_metadata.json"
     previous = json.loads(metadata.read_text()) if metadata.is_file() else {}
     reusable = previous.get("request") == signature
-    coverage = previous["effective_coverage"] if reusable and not args.overwrite else args.coverage
+    reusable = reusable and previous.get("effective_coverage") == COVERAGE_THRESHOLD
+    coverage = COVERAGE_THRESHOLD
     if any(args.output_dir.iterdir()) and not reusable and not args.overwrite:
         raise SystemExit("MMseqs inputs/settings changed or old outputs lack provenance; use a new --output-dir or --overwrite.")
     if args.overwrite:
@@ -188,47 +253,57 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("cluster_tmp", "search_tmp"):
             shutil.rmtree(args.output_dir / name, ignore_errors=True)
     combined = args.output_dir / "training_sequences.fasta"
+    search_fasta = args.output_dir / "training_search_sequences.fasta"
     benchmark_fasta = args.output_dir / "benchmark_sequences.fasta"
     write_fasta(combined, sequences)
+    write_fasta(search_fasta, search_sequences)
     write_fasta(benchmark_fasta, benchmarks)
     alignment_args = [
         "--min-seq-id", str(IDENTITY_THRESHOLD), "--alignment-mode", "3",
         "--seq-id-mode", "0", "-c", str(coverage), "--cov-mode", "0",
-        "--threads", str(args.threads),
+        "--threads", str(threads),
     ]
+    print(
+        f"MMseqs: {threads} threads; {len(sequences):,} training IDs, "
+        f"{len(search_sequences):,} distinct query sequences, {len(benchmarks):,} benchmark targets. "
+        "Identity 0.3; coverage 0.8 on both sequences; search sensitivity 7.5.", file=sys.stderr, flush=True,
+    )
     hits = args.output_dir / "benchmark_hits.tsv"
+    hit_audit: dict = {}
+
     def search_benchmarks() -> None:
         if benchmarks:
+            started = time.monotonic()
+            print(f"Starting benchmark search (coverage {coverage}); prefilter progress follows.", file=sys.stderr, flush=True)
             subprocess.run([
-                executable, "easy-search", str(combined), str(benchmark_fasta),
+                executable, "easy-search", str(search_fasta), str(benchmark_fasta),
                 str(hits), str(args.output_dir / "search_tmp"),
-                *alignment_args, "-s", "7.5",
+                *alignment_args, "-s", "7.5", "--max-accept", "1",
                 "--format-output", "query,target,fident,qcov,tcov",
             ], check=True)
+            print(f"Benchmark search finished in {time.monotonic() - started:.1f}s.", file=sys.stderr, flush=True)
         else:
             hits.write_text("")
 
+    def excluded_training_entities() -> set[str]:
+        representative_hits = read_benchmark_hits(
+            hits, set(search_sequences), set(benchmarks), coverage, audit=hit_audit,
+        )
+        return expand_search_hits(representative_hits, sequences)
+
     if not hits.is_file():
         search_benchmarks()
-    excluded = read_benchmark_hits(hits, set(sequences), set(benchmarks), coverage)
+    excluded = excluded_training_entities()
     negative_counts = count_negative_pairs(args.negative_pair_table, set(sequences), excluded)
-    if coverage == 0 and negative_counts and not any(
-        counts["kept_after_sequence_filter"] for counts in negative_counts.values()
-    ):
-        print("Identity-only filtering removed all supplied negatives; retrying at identity 0.3, coverage 0.8.", file=sys.stderr)
-        coverage = 0.8
-        alignment_args[alignment_args.index("-c") + 1] = str(coverage)
-        hits.unlink()
-        shutil.rmtree(args.output_dir / "search_tmp", ignore_errors=True)
-        search_benchmarks()
-        excluded = read_benchmark_hits(hits, set(sequences), set(benchmarks), coverage)
-        negative_counts = count_negative_pairs(args.negative_pair_table, set(sequences), excluded)
     cluster_tsv = args.output_dir / "families_cluster.tsv"
     if not cluster_tsv.is_file():
+        started = time.monotonic()
+        print(f"Starting family clustering of all {len(sequences):,} training IDs.", file=sys.stderr, flush=True)
         subprocess.run([
             executable, "easy-cluster", str(combined), str(args.output_dir / "families"),
             str(args.output_dir / "cluster_tmp"), *alignment_args,
         ], check=True)
+        print(f"Family clustering finished in {time.monotonic() - started:.1f}s.", file=sys.stderr, flush=True)
     assignments = read_clusters(cluster_tsv, sequences)
     mapping = args.output_dir / "family_mapping.tsv"
     with mapping.open("w", encoding="utf-8", newline="") as handle:
@@ -244,6 +319,13 @@ def main(argv: list[str] | None = None) -> int:
     (args.output_dir / "filter_stats.json").write_text(json.dumps({
         "identity_threshold": IDENTITY_THRESHOLD, "requested_coverage": args.coverage,
         "effective_coverage": coverage, "direct_benchmark_hit_count": len(excluded),
+        "coverage_mode": 0,
+        "benchmark_reference_entity_count": len(benchmarks),
+        "benchmark_matching_training_entity_count": len(excluded),
+        "saved_hit_audit": hit_audit,
+        "benchmark_entities_sha256": file_sha256(excluded_path),
+        "threads": threads, "training_entity_count": len(sequences),
+        "distinct_search_sequence_count": len(search_sequences),
         "negative_pair_counts": negative_counts,
     }, indent=2, sort_keys=True) + "\n")
     print(f"Wrote {mapping} ({len(sequences)} training sequences)")

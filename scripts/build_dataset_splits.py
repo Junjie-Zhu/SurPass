@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -17,6 +18,7 @@ from src.data.splits import (  # noqa: E402
     build_dataset_splits,
     read_records,
     write_split_manifests,
+    write_tsv,
 )
 
 
@@ -81,12 +83,20 @@ def _parser() -> argparse.ArgumentParser:
         "--benchmark-entities", type=Path,
         help="Direct training-sequence hits from build_mmseqs_families.py; excludes only pairs containing these entities.",
     )
+    parser.add_argument(
+        "--benchmark-filter-stats", type=Path,
+        help="Filtering policy/provenance JSON; defaults to filter_stats.json beside --benchmark-entities when available.",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hard-negative-count", type=int, default=0)
     parser.add_argument(
         "--pdb-negative-ratio", type=float, default=1.0,
-        help="Negative clusters per positive PPI cluster in each pdb_ppi split (default: 1). Each generated negative is one cluster; written separately as pdb_neg.",
+        help="Distinct negative family-pair clusters per positive PPI cluster in each pdb_ppi split (default: 1); written separately as pdb_neg.",
+    )
+    parser.add_argument(
+        "--pdb-negative-pairs-per-cluster", type=int, default=0,
+        help="Candidate pairs per PDB negative family-pair cluster; 0 (default) matches the positive split's mean pairs per cluster, subject to available distinct member pairs.",
     )
     parser.add_argument(
         "--workers", type=int, default=1,
@@ -94,7 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-progress", action="store_true",
-        help="Disable progress bars/status messages on stderr; stdout always contains the JSON summary.",
+        help="Disable progress bars/status messages; the final size report remains on stderr and stdout contains the JSON summary.",
     )
 
     parser.add_argument("--entity-column", default="entity_id")
@@ -140,6 +150,102 @@ def _default_source_name(path: Path) -> str:
     return standard.get(path.name, f"{path.parent.name}.{path.stem}")
 
 
+def _read_filter_stats(path: Path | None, entities_path: Path | None, entities: set[str]) -> dict | None:
+    if path is None and entities_path is not None:
+        candidate = entities_path.parent / "filter_stats.json"
+        if candidate.is_file():
+            path = candidate
+    if path is None:
+        return None
+    stats = json.loads(path.read_text())
+    if not isinstance(stats, dict):
+        raise ValueError(f"Benchmark filter stats must be a JSON object: {path}")
+    if stats.get("effective_coverage") not in (None, 0.8) or stats.get("coverage_mode") not in (None, 0):
+        raise ValueError(f"{path}: benchmark hits were not generated with required coverage 0.8 on both sequences; rerun build_mmseqs_families.py and rebuild splits.")
+    if stats.get("identity_threshold") not in (None, 0.3):
+        raise ValueError(f"{path}: benchmark identity threshold must be 0.3; rerun build_mmseqs_families.py and rebuild splits.")
+    expected_count = stats.get("benchmark_matching_training_entity_count", stats.get("direct_benchmark_hit_count"))
+    if expected_count is not None and expected_count != len(entities):
+        raise ValueError(f"{path}: matched training-ID count does not match --benchmark-entities; supply files from the same run.")
+    if stats.get("benchmark_entities_sha256"):
+        if entities_path is None:
+            raise ValueError("Benchmark filter provenance requires --benchmark-entities.")
+        with entities_path.open("rb") as handle:
+            checksum = hashlib.file_digest(handle, "sha256").hexdigest()
+        if checksum != stats["benchmark_entities_sha256"]:
+            raise ValueError(f"{path}: benchmark exclusion file checksum mismatch; supply files from the same run.")
+    return stats
+
+
+def _report_benchmark_filter(stats: dict) -> None:
+    references = stats["benchmark_reference_entity_count"]
+    print("\nBenchmark reference sequences: " + (f"{references:,}" if references is not None else "not recorded in supplied filter metadata"), file=sys.stderr)
+    print(
+        f"Benchmark-matching training IDs: {stats['benchmark_matching_training_entity_count']:,} "
+        f"({stats['benchmark_matching_pair_referenced_entity_count']:,} referenced in pair tables; "
+        f"{stats['benchmark_matching_unreferenced_entity_count']:,} unreferenced).",
+        file=sys.stderr,
+    )
+    policy = stats["benchmark_filter"]
+    if policy is not None:
+        print(
+            f"Benchmark filter policy: identity >= {policy.get('identity_threshold', 'unknown')}; "
+            f"effective coverage {policy.get('effective_coverage', 'unknown')}.", file=sys.stderr,
+        )
+    else:
+        print("Benchmark filter policy: unavailable; exclusion IDs alone do not record identity/coverage.", file=sys.stderr)
+    print("Validation fraction targets components; per-source sample/cluster fractions are reported in stats.json.", file=sys.stderr)
+
+
+def _write_size_report(output_dir: Path, stats: dict) -> Path:
+    """Report final pair rows and source-scoped PPI clusters, including zeros."""
+    source_counts = stats["source_counts"]
+    cluster_counts = stats["source_cluster_counts"]
+    sources = sorted({source for counts in source_counts.values() for source in counts})
+    standard_order = ("pdb_ppi", "pdb_neg", "afdb_pos", "afdb_neg")
+    sources = [source for source in standard_order if source in sources] + [
+        source for source in sources if source not in standard_order
+    ]
+    rows = []
+    for split in ("train", "validation", "excluded"):
+        split_rows = [
+            {
+                "split": split,
+                "source": source,
+                "cluster_count": cluster_counts[split].get(source, 0),
+                "sample_count": source_counts[split].get(source, 0),
+            }
+            for source in sources
+        ]
+        rows.extend(split_rows)
+        rows.append({
+            "split": split,
+            "source": "TOTAL",
+            "cluster_count": sum(row["cluster_count"] for row in split_rows),
+            "sample_count": sum(row["sample_count"] for row in split_rows),
+        })
+
+    path = write_tsv(
+        output_dir / "subset_sizes.tsv", rows,
+        preferred_columns=("split", "source", "cluster_count", "sample_count"),
+    )
+    table = [("Split", "Source", "Clusters", "Samples")] + [
+        (row["split"], row["source"], f"{row['cluster_count']:,}", f"{row['sample_count']:,}")
+        for row in rows
+    ]
+    widths = [max(len(row[index]) for row in table) for index in range(4)]
+    print("\nFinal subset sizes (clusters = PPI clusters; samples = pair rows):", file=sys.stderr)
+    for split, source, clusters, samples in table:
+        print(
+            f"{split:<{widths[0]}}  {source:<{widths[1]}}  "
+            f"{clusters:>{widths[2]}}  {samples:>{widths[3]}}",
+            file=sys.stderr,
+        )
+    print(f"Saved size report: {path}", file=sys.stderr)
+    print("Excluded cluster counts include partially excluded clusters; see source_cluster_retention_counts in stats.json.", file=sys.stderr)
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -162,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--workers must be at least 1")
     if not math.isfinite(args.pdb_negative_ratio) or args.pdb_negative_ratio < 0:
         parser.error("--pdb-negative-ratio must be finite and non-negative")
+    if args.pdb_negative_pairs_per_cluster < 0:
+        parser.error("--pdb-negative-pairs-per-cluster must be non-negative")
 
     progress = not args.no_progress
     family_tables = [read_records(path, progress=progress) for path in args.family_mapping]
@@ -192,11 +300,14 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_families = _read_benchmark_values(
         args.benchmark_families, args.benchmark_column, progress=progress,
     )
+    benchmark_entities = _read_benchmark_values(args.benchmark_entities, "entity_id", progress=progress)
+    benchmark_filter_stats = _read_filter_stats(args.benchmark_filter_stats, args.benchmark_entities, benchmark_entities)
     manifests = build_dataset_splits(
         family_rows,
         pair_tables,
         benchmark_families=benchmark_families,
-        benchmark_entities=_read_benchmark_values(args.benchmark_entities, "entity_id", progress=progress),
+        benchmark_entities=benchmark_entities,
+        benchmark_filter_stats=benchmark_filter_stats,
         validation_fraction=args.validation_fraction,
         seed=args.seed,
         hard_negative_count=args.hard_negative_count,
@@ -217,10 +328,13 @@ def main(argv: list[str] | None = None) -> int:
             ]
         ),
         pdb_negative_ratio=args.pdb_negative_ratio,
+        pdb_negative_pairs_per_cluster=args.pdb_negative_pairs_per_cluster,
         workers=args.workers,
         progress=progress,
     )
     paths = write_split_manifests(args.output_dir, manifests, progress=progress)
+    _report_benchmark_filter(manifests["stats"])
+    paths["subset_sizes"] = _write_size_report(args.output_dir, manifests["stats"])
     print(
         json.dumps(
             {
