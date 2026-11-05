@@ -3,7 +3,7 @@ task_prefix: surpass_revision
 logging_dir: logs
 seed: 42
 deterministic: false
-epochs: 30
+epochs: 100
 checkpoint_interval: 10
 ckpt_dir: null
 ema_dir: null
@@ -60,8 +60,8 @@ model:
   contact_prior: 0.0001
   allow_missing_physics: false
   triangle_hidden_dim: 64
-  triangle_chunk_size: 64
-  triangle_checkpoint: true
+  triangle_chunk_size: 0
+  triangle_checkpoint: false
   recycle_passes: 1
   pair_update_every: 2
   protein_pooling: max
@@ -69,7 +69,7 @@ loss:
   protein:
     weight: 0.0
   contact:
-    weight: 1.0
+    weight: 0.0
     gamma: 1.5
     positive_weight: 4.0
     negatives_per_positive: 8.0
