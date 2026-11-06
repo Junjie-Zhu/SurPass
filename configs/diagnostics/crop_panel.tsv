@@ -1,0 +1,16 @@
+Protein pairs	Category	combined_length	selection_reason	genes
+P49450_P62805	True	243	low SurPass score	CENPA-H4C1
+P51808_P63172	True	229	high SurPass score	DYNLT3-DYNLT1
+P62277_Q9NYJ1	False	238	high-scoring labeled negative	RPS13-COA4
+O75531_P50402	True	343	low SurPass score	BANF1-EMD
+O75817_Q8N5L8	True	303	high SurPass score	POP7-RPP25L
+Q7Z7C7_Q9NQ33	False	511	high-scoring labeled negative	STRA8-ASCL3
+P19438_Q969G6	True	610	low SurPass score	TNFRSF1A-RFK
+O60256_Q14558	True	725	high SurPass score	PRPSAP2-PRPSAP1
+O00421_O95154	False	675	high-scoring labeled negative	CCRL2-AKR7A3
+P23396_Q04206	True	794	low SurPass score	RPS3-RELA
+Q8NEJ9_Q9NY61	True	875	high SurPass score	NGDN-AATF
+O60810_Q8N5Z5	False	792	high-scoring labeled negative	PRAMEF4-KCTD17
+P25445_Q9UER7	True	1075	low SurPass score	FAS-DAXX
+O95198_Q53G59	True	1161	high SurPass score	KLHL2-KLHL12
+Q8TCE6_Q96T68	False	1076	high-scoring labeled negative	DENND10-SETDB2

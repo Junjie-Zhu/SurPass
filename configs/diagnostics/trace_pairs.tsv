@@ -1,0 +1,5 @@
+Protein pairs	Category	combined_length	selection_reason	genes
+P23396_Q04206	True	794	low SurPass score	RPS3-RELA
+O60810_Q8N5Z5	False	792	high-scoring labeled negative	PRAMEF4-KCTD17
+P25445_Q9UER7	True	1075	low SurPass score	FAS-DAXX
+Q8TCE6_Q96T68	False	1076	high-scoring labeled negative	DENND10-SETDB2
