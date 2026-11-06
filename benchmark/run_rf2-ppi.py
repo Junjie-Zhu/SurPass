@@ -3,7 +3,9 @@
 
 This adapter resolves precomputed paired MSAs, writes RF2-PPI's native input
 list, invokes the sibling repository in a subprocess, then converts its output
-to the shared SurPass benchmark prediction and metric files.
+to the shared SurPass benchmark prediction and metric files. Pairs above the
+combined-length limit are left out. If a later pair still runs out of memory,
+that pair is skipped and the remaining pairs are retried.
 """
 
 from __future__ import annotations
@@ -287,6 +289,35 @@ def _run_rf2(
     return process.returncode, elapsed, monitor_result.get("peak_gpu_memory_mib")
 
 
+def _subprocess_out_of_memory(output_text: str, returncode: int) -> bool:
+    from common import is_out_of_memory_message
+
+    if is_out_of_memory_message(output_text):
+        return True
+    # 137 is the usual Linux OOM-killer status (128 + SIGKILL).
+    return returncode in {137, -9}
+
+
+def classify_rf2_attempt(
+    returncode: int,
+    output_text: str,
+    *,
+    log_written: bool,
+) -> str:
+    """Classify one RF2-PPI subprocess.
+
+    ``complete`` means the process exited cleanly. ``skip_oom`` means a pair
+    ran out of memory after RF2 had opened its log, so the first unfinished
+    pair can be dropped and the rest retried. ``fatal`` means the failure
+    happened before that log existed, or was not an out-of-memory failure.
+    """
+    if returncode == 0:
+        return "complete"
+    if log_written and _subprocess_out_of_memory(output_text, returncode):
+        return "skip_oom"
+    return "fatal"
+
+
 def _parse_rf2_log(
     log_path: Path,
     msa_to_item: dict[str, dict[str, Any]],
@@ -331,10 +362,13 @@ def main(argv: list[str] | None = None) -> int:
     rf2_python = _resolve_python(args.python)
 
     from common import (
+        is_out_of_memory_message,
         load_test_pairs,
         prepare_logging_dir,
         require_file,
+        skip_row,
         write_benchmark_results,
+        write_skipped_pairs,
     )
 
     test_set = require_file(args.test_set_tsv, "test set TSV")
@@ -344,7 +378,6 @@ def main(argv: list[str] | None = None) -> int:
     native_input_path = (logging_dir / "rf2_input.tsv").resolve()
     runtime_json_path = logging_dir / "runtime.json"
     runtime_csv_path = logging_dir / "runtime.csv"
-    stdout_path = logging_dir / "rf2_stdout.log"
 
     preprocess_started = time.perf_counter()
     all_items = load_test_pairs(test_set, fasta)
@@ -418,11 +451,16 @@ def main(argv: list[str] | None = None) -> int:
     }
     _write_json(runtime_json_path, metadata)
 
+    if not items:
+        raise SystemExit(
+            "No pairs are within the combined-length limit of "
+            f"{args.maximum_combined_length}."
+        )
     if not covered:
-        expected = paired_msa_dir / f"{items[0]['pair']}{args.msa_suffix}" if items else None
+        expected = paired_msa_dir / f"{items[0]['pair']}{args.msa_suffix}"
         raise SystemExit(
             "No paired MSAs matched the test set. "
-            + (f"For example, expected: {expected}" if expected is not None else "")
+            f"For example, expected: {expected}"
         )
     if missing and args.require_complete_coverage:
         sample = ", ".join(missing[:5])
@@ -438,40 +476,109 @@ def main(argv: list[str] | None = None) -> int:
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
-    returncode, subprocess_seconds, peak_gpu_memory_mib = _run_rf2(
-        command,
-        cwd=args.rf2_root.expanduser().resolve(),
-        env=env,
-        stdout_path=stdout_path,
-        poll_seconds=args.gpu_poll_seconds,
-    )
-    metadata.update(
-        {
-            "status": "rf2_failed" if returncode else "rf2_finished",
-            "rf2_returncode": returncode,
-            "subprocess_wall_time_seconds": subprocess_seconds,
-            "process_peak_gpu_memory_mib": peak_gpu_memory_mib,
-        }
-    )
-    _write_json(runtime_json_path, metadata)
-    if returncode != 0:
-        output_lines = stdout_path.read_text(encoding="utf-8").splitlines()
-        excerpt = "\n".join(output_lines[-12:])
-        raise SystemExit(
+    msa_to_item = {str(item["msa_path"].resolve()): item for item in covered}
+    pending = list(covered)
+    predictions: dict[str, tuple[float, float]] = {}
+    rf2_errors: dict[str, str] = {}
+    shapes: dict[str, list[int]] = {}
+    attempts: list[dict[str, Any]] = []
+    subprocess_seconds = 0.0
+    peak_gpu_memory_mib: float | None = None
+    fatal_error: str | None = None
+    native_log_path: Path | None = None
+    native_npz_path: Path | None = None
+    rf2_cwd = args.rf2_root.expanduser().resolve()
+
+    while pending:
+        attempt = len(attempts) + 1
+        attempt_input = (logging_dir / f"rf2_input_{attempt}.tsv").resolve()
+        with attempt_input.open("w", encoding="utf-8") as handle:
+            for item in pending:
+                handle.write(f"{item['msa_path']}\t{len(item['sequence_1'])}\n")
+        attempt_command = [
+            rf2_python,
+            str(predict_script),
+            "-list_fn",
+            str(attempt_input),
+            "-model_file",
+            str(model_file),
+            "-number_seqs",
+            str(args.number_seqs),
+        ]
+        stdout_path = logging_dir / f"rf2_stdout_{attempt}.log"
+        returncode, elapsed, peak = _run_rf2(
+            attempt_command,
+            cwd=rf2_cwd,
+            env=env,
+            stdout_path=stdout_path,
+            poll_seconds=args.gpu_poll_seconds,
+        )
+        subprocess_seconds += elapsed
+        if peak is not None:
+            peak_gpu_memory_mib = (
+                peak if peak_gpu_memory_mib is None else max(peak_gpu_memory_mib, peak)
+            )
+        log_path = Path(f"{attempt_input}.log")
+        npz_path = Path(f"{attempt_input}.npz")
+        native_log_path = log_path
+        native_npz_path = npz_path
+        attempt_predictions: dict[str, tuple[float, float]] = {}
+        attempt_errors: dict[str, str] = {}
+        if log_path.is_file():
+            attempt_predictions, attempt_errors = _parse_rf2_log(log_path, msa_to_item)
+        shapes.update(_npz_shapes(npz_path))
+        predictions.update(attempt_predictions)
+        rf2_errors.update(attempt_errors)
+        finished = set(attempt_predictions) | set(attempt_errors)
+        pending = [item for item in pending if item["pair"] not in finished]
+        output_text = (
+            stdout_path.read_text(encoding="utf-8") if stdout_path.is_file() else ""
+        )
+        outcome = classify_rf2_attempt(
+            returncode,
+            output_text,
+            log_written=log_path.is_file(),
+        )
+        skipped_pair = None
+        if outcome == "skip_oom" and pending:
+            failed = pending.pop(0)
+            skipped_pair = failed["pair"]
+            rf2_errors[skipped_pair] = "out of memory"
+            print(
+                f"Skipping {skipped_pair}: out of memory; "
+                f"continuing with {len(pending)} remaining pairs.",
+                flush=True,
+            )
+        attempts.append(
+            {
+                "attempt": attempt,
+                "returncode": returncode,
+                "command": attempt_command,
+                "stdout": str(stdout_path),
+                "log": str(log_path) if log_path.is_file() else None,
+                "n_scored": len(attempt_predictions),
+                "skipped_oom": skipped_pair,
+                "outcome": "skip_oom" if skipped_pair else outcome,
+            }
+        )
+        if skipped_pair:
+            continue
+        if outcome == "skip_oom":
+            # Every pending pair was already recorded; the process died afterward.
+            break
+        if outcome == "complete":
+            if not log_path.is_file():
+                fatal_error = (
+                    "RF2-PPI completed but did not write its expected log: "
+                    f"{log_path}"
+                )
+            break
+        excerpt = "\n".join(output_text.splitlines()[-12:])
+        fatal_error = (
             f"RF2-PPI exited with code {returncode}. Full output: {stdout_path}\n"
             f"{excerpt}"
         )
-
-    native_log_path = Path(f"{native_input_path}.log")
-    native_npz_path = Path(f"{native_input_path}.npz")
-    if not native_log_path.is_file():
-        raise SystemExit(
-            f"RF2-PPI completed but did not write its expected log: {native_log_path}"
-        )
-
-    msa_to_item = {str(item["msa_path"].resolve()): item for item in covered}
-    predictions, rf2_errors = _parse_rf2_log(native_log_path, msa_to_item)
-    shapes = _npz_shapes(native_npz_path)
+        break
     prediction_rows: list[dict[str, Any]] = []
     runtime_rows: list[dict[str, Any]] = []
     for item in covered:
@@ -481,7 +588,11 @@ def main(argv: list[str] | None = None) -> int:
         probability = prediction[0] if prediction is not None else None
         latency = prediction[1] if prediction is not None else None
         if prediction is None and not error:
-            error = "RF2-PPI log contained no result for this paired MSA"
+            error = (
+                "RF2-PPI stopped before this pair"
+                if fatal_error is not None
+                else "RF2-PPI log contained no result for this paired MSA"
+            )
         if probability is not None:
             prediction_rows.append(
                 {
@@ -509,42 +620,82 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     _write_runtime_csv(runtime_csv_path, runtime_rows)
+    skipped = [
+        skip_row(
+            item,
+            "unsupported_length",
+            (
+                "combined length "
+                f"{len(item['sequence_1']) + len(item['sequence_2'])} > "
+                f"{args.maximum_combined_length}"
+            ),
+        )
+        for item in all_items
+        if len(item["sequence_1"]) + len(item["sequence_2"])
+        > args.maximum_combined_length
+    ]
+    skipped.extend(
+        skip_row(item, "out_of_memory", rf2_errors[item["pair"]])
+        for item in covered
+        if is_out_of_memory_message(rf2_errors.get(item["pair"], ""))
+    )
     predictions_path, metrics_path = write_benchmark_results(
         logging_dir,
         prediction_rows,
         positive_weight=float(args.positive_weight),
     )
+    skipped_path = write_skipped_pairs(logging_dir, skipped)
     model_latencies = [
         float(row["model_latency_seconds"])
         for row in runtime_rows
         if row["model_latency_seconds"] is not None
     ]
+    oom_skips = sum(row["status"] == "out_of_memory" for row in skipped)
     metadata.update(
         {
-            "status": "complete",
+            "status": "rf2_failed" if fatal_error else "complete",
             "n_scored": len(prediction_rows),
-            "n_rf2_errors": len(covered) - len(prediction_rows),
+            "n_oom": oom_skips,
+            "n_rf2_errors": len(covered) - len(prediction_rows) - oom_skips,
+            "attempts": attempts,
+            "rf2_returncode": attempts[-1]["returncode"] if attempts else None,
+            "subprocess_wall_time_seconds": subprocess_seconds,
+            "process_peak_gpu_memory_mib": peak_gpu_memory_mib,
             "model_latency_seconds_total": sum(model_latencies),
             "model_latency_seconds_mean": (
                 sum(model_latencies) / len(model_latencies)
                 if model_latencies
                 else None
             ),
-            "native_log": str(native_log_path),
-            "native_npz": str(native_npz_path) if native_npz_path.is_file() else None,
+            "native_log": str(native_log_path) if native_log_path is not None else None,
+            "native_npz": (
+                str(native_npz_path)
+                if native_npz_path is not None and native_npz_path.is_file()
+                else None
+            ),
+            "fatal_error": fatal_error,
         }
     )
     _write_json(runtime_json_path, metadata)
 
     print(
         f"[test-metrics] n={len(prediction_rows)} "
+        f"skipped_length={len(unsupported)} skipped_oom={oom_skips} "
         f"supported_coverage={coverage:.3f} overall_coverage={overall_coverage:.3f}"
     )
     print(f"Wrote {predictions_path}")
     print(f"Wrote {metrics_path}")
+    print(f"Wrote {skipped_path}")
     print(f"Wrote {runtime_csv_path}")
     print(f"Wrote {runtime_json_path}")
-    return 0 if len(prediction_rows) == len(covered) else 1
+    if fatal_error:
+        raise SystemExit(fatal_error)
+    unresolved = [
+        row
+        for row in runtime_rows
+        if not row["success"] and not is_out_of_memory_message(str(row["error"]))
+    ]
+    return 0 if not unresolved else 1
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """Score the SurPass test set with MINT.
 
-Each pair is scored on its full sequences in one forward.
+Each pair at or below the combined-length limit is scored in one forward.
+Longer pairs are skipped, and a pair that still runs out of memory is skipped
+so the rest of the benchmark can finish.
 """
 
 from __future__ import annotations
@@ -17,12 +19,14 @@ if BENCHMARK_DIR not in sys.path:
 
 from common import (  # noqa: E402
     DEFAULT_DATA_ROOT,
+    MAX_COMBINED_LENGTH,
     load_test_pairs,
     prepare_logging_dir,
     require_file,
     resolve_device,
     score_test_pairs,
     write_benchmark_results,
+    write_skipped_pairs,
 )
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--positive-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--maximum-combined-length",
+        type=int,
+        default=MAX_COMBINED_LENGTH,
+        help="Skip pairs whose sequences sum to more than this (default: 2048).",
+    )
     parser.add_argument("--logging-dir", default="logs")
     parser.add_argument("--gpu-id", type=int, default=0)
     return parser.parse_args()
@@ -88,6 +98,9 @@ def main() -> None:
     checkpoint_path = require_file(args.checkpoint, "MINT checkpoint")
     mlp_path = require_file(args.mlp_checkpoint, "MINT MLP checkpoint")
 
+    if args.maximum_combined_length < 2:
+        raise SystemExit("--maximum-combined-length must be at least 2.")
+
     device = resolve_device(args.gpu_id)
     wrapper, model, collate = load_mint(
         config_path,
@@ -106,11 +119,12 @@ def main() -> None:
             probability = torch.sigmoid(model(embeddings))
         return float(probability.reshape(-1)[0].detach().float().cpu())
 
-    rows = score_test_pairs(
+    rows, skipped = score_test_pairs(
         items,
         score_sequences=score_sequences,
         threshold=float(args.threshold),
         desc="MINT",
+        maximum_combined_length=args.maximum_combined_length,
     )
     logging_dir = prepare_logging_dir("MINT", args.logging_dir)
     predictions_path, metrics_path = write_benchmark_results(
@@ -118,9 +132,11 @@ def main() -> None:
         rows,
         positive_weight=float(args.positive_weight),
     )
-    print(f"[test-metrics] n={len(rows)}")
+    skipped_path = write_skipped_pairs(logging_dir, skipped)
+    print(f"[test-metrics] n={len(rows)} skipped={len(skipped)}")
     print(f"Wrote {predictions_path}")
     print(f"Wrote {metrics_path}")
+    print(f"Wrote {skipped_path}")
 
 
 if __name__ == "__main__":
